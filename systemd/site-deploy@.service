@@ -1,0 +1,19 @@
+# Auto-deploy one site on git push. Instance name %i == app == service user == /srv/%i.
+# Install once per box, enable per app:  systemctl enable --now site-deploy@<app>.timer
+[Unit]
+Description=Auto-deploy %i (poll origin/master, fast-forward + reload)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+WorkingDirectory=/srv/%i
+# CF_ZONE_ID + CF_CACHE_PURGE_TOKEN (for the edge purge) live here, like the *-build service.
+EnvironmentFile=/etc/%i/env
+Environment=APP=%i
+ExecStart=/srv/site-deploy/bin/auto-deploy.sh
+# A deploy (uv sync + tailwindcss) can take a little while on a small box; the poll is 2 min.
+TimeoutStartSec=10min
+Nice=19

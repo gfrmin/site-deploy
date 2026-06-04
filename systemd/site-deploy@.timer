@@ -1,0 +1,12 @@
+# Poll for new commits every ~2 min. Pairs with site-deploy@.service (same instance).
+[Unit]
+Description=Auto-deploy %i poll (every 2 min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
+# If a deploy is still running when the next tick is due, systemd defers it (no overlap).
+
+[Install]
+WantedBy=timers.target
