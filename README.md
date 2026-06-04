@@ -26,6 +26,12 @@ git push ─▶ origin/master
 `bin/auto-deploy.sh` is byte-identical on every box; per-app differences come from a few `DEPLOY_*`
 vars in `/etc/<app>/env`. The CSS build is auto-detected by the presence of `static/src.css`.
 
+**Snapshot-backed apps:** if a deploy changes `data/build_db.py` and `DEPLOY_BUILD_SERVICE` is set,
+the poller dispatches that build unit (rebuild the snapshot, then reload onto the new code + schema
+together via its `--reload-service`) instead of a bare reload — which would 500 against a stale
+schema. This is gap-free: the running workers keep serving the old code + old snapshot until the
+build's atomic swap.
+
 **Safety:** fast-forward only, with an ancestor check that bails loudly on a drifted or ahead box
 (rather than reload-looping), and it **never reloads if `uv sync` or the CSS build fails** — the old
 workers keep serving.
@@ -43,6 +49,7 @@ example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
 DEPLOY_RELOAD=reload               # or: restart   (apps with no ExecReload)
 DEPLOY_UV_ARGS=--frozen --no-dev   # or just: --frozen
+# DEPLOY_BUILD_SERVICE=<app>-build.service   # snapshot-backed apps only (see above)
 # CF_ZONE_ID=... / CF_CACHE_PURGE_TOKEN=...   # optional edge purge
 ```
 

@@ -11,6 +11,9 @@
 # Per-app knobs come from the unit's EnvironmentFile=/etc/$APP/env:
 #   DEPLOY_RELOAD=reload|restart      (default reload; use restart for apps with no ExecReload)
 #   DEPLOY_UV_ARGS=--frozen [--no-dev]
+#   DEPLOY_BUILD_SERVICE=<app>-build.service  (optional; for apps with a snapshot build — if a
+#                                              deploy changes data/build_db.py, rebuild instead of
+#                                              a bare reload, which would 500 on a stale schema)
 #   CF_ZONE_ID, CF_CACHE_PURGE_TOKEN  (optional; used by bin/cf-purge.sh)
 # Override RELOAD_CMD (default `sudo -n /usr/bin/systemctl`) to `echo` for a no-sudo local dry-run.
 set -uo pipefail
@@ -42,6 +45,13 @@ git merge-base --is-ancestor "$LOCAL" "$REMOTE" \
 
 log "${LOCAL:0:9} -> ${REMOTE:0:9}; deploying"
 
+# Does this deploy change the snapshot builder? If so we rebuild instead of a bare reload (a
+# reload onto a stale-schema snapshot 500s). Detected before the merge from the incoming range.
+SCHEMA_CHANGED=
+if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -n "$(git diff --name-only "$LOCAL" "$REMOTE" -- data/build_db.py)" ]; then
+  SCHEMA_CHANGED=1
+fi
+
 # 2. Fast-forward only (guaranteed by the ancestor check; --ff-only is belt-and-braces).
 git merge --ff-only --quiet '@{u}' || { log "fast-forward merge failed (drift) — manual fix needed"; exit 1; }
 
@@ -55,10 +65,16 @@ if [ -f static/src.css ]; then
     || { log "css build failed; NOT reloading"; exit 1; }
 fi
 
-# 5. Graceful reload (SIGHUP) or restart, per DEPLOY_RELOAD, via the NOPASSWD grant.
-$RELOAD_CMD "$RELOAD" "$APP" || { log "systemctl $RELOAD $APP failed"; exit 1; }
-
-# 6. Purge the Cloudflare edge so cached HTML updates immediately (no-op if CF_* unset in env).
-SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
-
-log "deployed ${REMOTE:0:9} ($RELOAD)"
+# 5. Apply. If the deploy changed the snapshot builder, dispatch a rebuild — its --reload-service
+#    swaps new code + new snapshot together (and runs its own cf-purge). This is gap-free: the
+#    running workers keep serving the OLD code + OLD snapshot until that atomic swap, so we do NOT
+#    reload here. Otherwise (the common case) just reload onto the new code + purge the edge.
+if [ -n "$SCHEMA_CHANGED" ]; then
+  log "data/build_db.py changed -> dispatching $DEPLOY_BUILD_SERVICE (rebuilds snapshot, then reloads + purges)"
+  $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE" || { log "could not start $DEPLOY_BUILD_SERVICE"; exit 1; }
+  log "deployed ${REMOTE:0:9} (snapshot rebuild dispatched)"
+else
+  $RELOAD_CMD "$RELOAD" "$APP" || { log "systemctl $RELOAD $APP failed"; exit 1; }
+  SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
+  log "deployed ${REMOTE:0:9} ($RELOAD)"
+fi
