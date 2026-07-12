@@ -12,8 +12,9 @@
 #   DEPLOY_RELOAD=reload|restart      (default reload; use restart for apps with no ExecReload)
 #   DEPLOY_UV_ARGS=--frozen [--no-dev]
 #   DEPLOY_BUILD_SERVICE=<app>-build.service  (optional; for apps with a snapshot build — if a
-#                                              deploy changes data/build_db.py, rebuild instead of
-#                                              a bare reload, which would 500 on a stale schema)
+#                                              deploy changes data/build_db.py, ALSO dispatch a
+#                                              snapshot rebuild after the reload; new app code must
+#                                              degrade gracefully on the previous snapshot schema)
 #   CF_ZONE_ID, CF_CACHE_PURGE_TOKEN  (optional; used by bin/cf-purge.sh)
 # Override RELOAD_CMD (default `sudo -n /usr/bin/systemctl`) to `echo` for a no-sudo local dry-run.
 set -uo pipefail
@@ -45,8 +46,8 @@ git merge-base --is-ancestor "$LOCAL" "$REMOTE" \
 
 log "${LOCAL:0:9} -> ${REMOTE:0:9}; deploying"
 
-# Does this deploy change the snapshot builder? If so we rebuild instead of a bare reload (a
-# reload onto a stale-schema snapshot 500s). Detected before the merge from the incoming range.
+# Does this deploy change the snapshot builder? If so we ALSO dispatch a rebuild after the
+# reload below. Detected before the merge from the incoming range.
 SCHEMA_CHANGED=
 if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -n "$(git diff --name-only "$LOCAL" "$REMOTE" -- data/build_db.py)" ]; then
   SCHEMA_CHANGED=1
@@ -65,16 +66,20 @@ if [ -f static/src.css ]; then
     || { log "css build failed; NOT reloading"; exit 1; }
 fi
 
-# 5. Apply. If the deploy changed the snapshot builder, dispatch a rebuild — its --reload-service
-#    swaps new code + new snapshot together (and runs its own cf-purge). This is gap-free: the
-#    running workers keep serving the OLD code + OLD snapshot until that atomic swap, so we do NOT
-#    reload here. Otherwise (the common case) just reload onto the new code + purge the edge.
+# 5. Apply: reload onto the new code IMMEDIATELY, even when a snapshot rebuild is coming. Jinja
+#    reads templates from disk, so from the moment the merge landed the old workers were already
+#    rendering the NEW templates — deferring the reload leaves old Python under new templates,
+#    which 500s on any template that needs new Python (live incident, crescira 2026-07-12: new
+#    template kwarg + old templates_config). The app-side contract making this safe: new code
+#    must degrade gracefully on the previous snapshot schema (feature-detect tables/columns).
+$RELOAD_CMD "$RELOAD" "$APP" || { log "systemctl $RELOAD $APP failed"; exit 1; }
+SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
+# If the deploy changed the snapshot builder, also rebuild — its --reload-service swaps the new
+# snapshot in atomically and runs its own cf-purge when done.
 if [ -n "$SCHEMA_CHANGED" ]; then
-  log "data/build_db.py changed -> dispatching $DEPLOY_BUILD_SERVICE (rebuilds snapshot, then reloads + purges)"
+  log "data/build_db.py changed -> dispatching $DEPLOY_BUILD_SERVICE (rebuilds snapshot, then reloads + purges again)"
   $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE" || { log "could not start $DEPLOY_BUILD_SERVICE"; exit 1; }
-  log "deployed ${REMOTE:0:9} (snapshot rebuild dispatched)"
+  log "deployed ${REMOTE:0:9} ($RELOAD + snapshot rebuild dispatched)"
 else
-  $RELOAD_CMD "$RELOAD" "$APP" || { log "systemctl $RELOAD $APP failed"; exit 1; }
-  SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
   log "deployed ${REMOTE:0:9} ($RELOAD)"
 fi

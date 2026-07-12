@@ -27,10 +27,13 @@ git push ─▶ origin/master
 vars in `/etc/<app>/env`. The CSS build is auto-detected by the presence of `static/src.css`.
 
 **Snapshot-backed apps:** if a deploy changes `data/build_db.py` and `DEPLOY_BUILD_SERVICE` is set,
-the poller dispatches that build unit (rebuild the snapshot, then reload onto the new code + schema
-together via its `--reload-service`) instead of a bare reload — which would 500 against a stale
-schema. This is gap-free: the running workers keep serving the old code + old snapshot until the
-build's atomic swap.
+the poller reloads onto the new code **immediately** and *also* dispatches that build unit (rebuild
+the snapshot, then re-reload + re-purge via its `--reload-service`). The reload can't be deferred:
+Jinja reads templates from disk, so once the pull lands the old workers are already rendering the
+new templates — old Python under new templates 500s on any template that needs new Python (live
+incident, crescira 2026-07-12). The app-side contract that makes the early reload safe: new code
+must degrade gracefully on the previous snapshot schema (feature-detect new tables/columns rather
+than assuming them).
 
 **Safety:** fast-forward only, with an ancestor check that bails loudly on a drifted or ahead box
 (rather than reload-looping), and it **never reloads if `uv sync` or the CSS build fails** — the old
