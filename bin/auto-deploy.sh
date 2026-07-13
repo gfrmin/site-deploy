@@ -33,6 +33,19 @@ git -C "$SELF" pull --ff-only --quiet 2>/dev/null || true
 
 cd "$SRV" || { log "no checkout at $SRV"; exit 1; }
 
+# 0b. Retry a queued snapshot rebuild. `systemctl start` on an activating oneshot is a silent
+#     no-op (live miss, crescira 2026-07-13: the nightly was mid-run — on pre-push code — when a
+#     build_db deploy dispatched), so step 5 queues a flag instead and every tick retries here
+#     until the unit is idle. Runs BEFORE the up-to-date early-exit on purpose.
+PENDING_BUILD="$SRV/.site-deploy-build-pending"
+if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -f "$PENDING_BUILD" ]; then
+  STATE=$(systemctl is-active "$DEPLOY_BUILD_SERVICE" 2>/dev/null || true)
+  if [ "$STATE" != "activating" ] && [ "$STATE" != "active" ]; then
+    log "queued snapshot rebuild -> starting $DEPLOY_BUILD_SERVICE"
+    $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE" && rm -f "$PENDING_BUILD"
+  fi
+fi
+
 # 1. Cheap remote check. A transient fetch failure just retries next tick (exit 0, not failed).
 git fetch --quiet origin || { log "fetch failed (transient?); will retry next tick"; exit 0; }
 LOCAL=$(git rev-parse @)
@@ -77,9 +90,17 @@ SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
 # If the deploy changed the snapshot builder, also rebuild — its --reload-service swaps the new
 # snapshot in atomically and runs its own cf-purge when done.
 if [ -n "$SCHEMA_CHANGED" ]; then
-  log "data/build_db.py changed -> dispatching $DEPLOY_BUILD_SERVICE (rebuilds snapshot, then reloads + purges again)"
-  $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE" || { log "could not start $DEPLOY_BUILD_SERVICE"; exit 1; }
-  log "deployed ${REMOTE:0:9} ($RELOAD + snapshot rebuild dispatched)"
+  STATE=$(systemctl is-active "$DEPLOY_BUILD_SERVICE" 2>/dev/null || true)
+  if [ "$STATE" = "activating" ] || [ "$STATE" = "active" ]; then
+    # A build is mid-run on the code it started with; `start` now would be a silent no-op.
+    log "data/build_db.py changed but $DEPLOY_BUILD_SERVICE is $STATE -> queueing rebuild (retried each tick)"
+    touch "$PENDING_BUILD"
+    log "deployed ${REMOTE:0:9} ($RELOAD + snapshot rebuild queued)"
+  else
+    log "data/build_db.py changed -> dispatching $DEPLOY_BUILD_SERVICE (rebuilds snapshot, then reloads + purges again)"
+    $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE" || { log "could not start $DEPLOY_BUILD_SERVICE"; exit 1; }
+    log "deployed ${REMOTE:0:9} ($RELOAD + snapshot rebuild dispatched)"
+  fi
 else
   log "deployed ${REMOTE:0:9} ($RELOAD)"
 fi
