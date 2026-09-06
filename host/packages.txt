@@ -1,0 +1,23 @@
+# System (apt) packages a site host needs, beyond the base image. Python deps
+# are uv's job (pyproject + uv.lock); THIS file is the other half — native
+# libraries and tools uv does not install. provision.sh installs every line.
+#
+# One line = one apt package. '#' comments and blank lines ignored.
+#
+# Deliberately the GENERIC baseline only. An app that needs a native library
+# (dataguru needs libgomp1 for LightGBM, say) adds it in its own repo rather
+# than here, or every box on the fleet installs every other box's dependencies.
+
+# Reverse proxy (TLS termination behind Cloudflare). Installed from the official
+# Caddy apt repo, which provision.sh adds if caddy is absent.
+caddy
+
+# Box-to-box transfer during migrations, and ad-hoc inspection.
+rsync
+sqlite3
+
+# Assumed by the deploy scripts themselves.
+git
+curl
+jq
+ufw
