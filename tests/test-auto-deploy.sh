@@ -76,10 +76,11 @@ git clone -q "$ORIGIN" "$WORK" 2>/dev/null
 ( cd "$WORK"
   mkdir -p static data
   printf '@tailwind base;' > static/src.css
-  printf 'a%.0s' $(seq 1 4000) > static/app.css
+  printf 'static/app.css\n' > .gitignore
   echo "print('x')" > data/build_db.py
   git add -A && git commit -qm init && git branch -M master && git push -q origin master )
 git clone -q "$ORIGIN" "$SRV" 2>/dev/null
+printf 'a%.0s' $(seq 1 4000) > "$SRV/static/app.css"   # the currently-served stylesheet
 
 push_commit() { ( cd "$WORK"; echo "$1" >> notes.txt; git add -A; git commit -qm "$1"; git push -q origin master ); }
 reset_log() { : > "$STUB_LOG"; }
@@ -88,7 +89,7 @@ not_called() { ! grep -qF "$1" "$STUB_LOG"; }
 
 run_deploy() {
   env APP=app APP_DIR="$SRV" SITE_DEPLOY_DIR="$ROOT" UV="$T/bin/uv" CURL="$T/bin/curl" \
-      RELOAD_CMD="$T/bin/systemctl" PORT=8000 \
+      RELOAD_CMD="$T/bin/systemctl" PORT=8000 DEPLOY_HEALTH_TRIES=2 \
       CF_ZONE_ID=zone1 CF_CACHE_PURGE_TOKEN=tok1 \
       "$@" bash "$ROOT/bin/auto-deploy.sh" > "$T/out.txt" 2>&1
   echo $? > "$T/rc.txt"
@@ -158,6 +159,22 @@ check "did not reload"         not_called "systemctl reload"
 check "did not purge"          not_called "purge_cache"
 check "served css untouched"   cmp -s "$SRV/static/app.css" "$T/app.css.before"
 check "said why"               grep -qiE "css|stylesheet" "$T/out.txt"
+
+echo "9b. the size FLOOR alone catches a first build with nothing to compare against"
+rm -f "$SRV/static/app.css"                       # no previous stylesheet -> no ratio to compute
+push_commit c9b; reset_log; run_deploy STUB_CSS_CONTENT="/*tiny*/"
+check "exit non-zero"          [ "$(rc)" != 0 ]
+check "did not reload"         not_called "systemctl reload"
+check "installed nothing"      [ ! -f "$SRV/static/app.css" ]
+check "named the floor"        grep -qi "floor" "$T/out.txt"
+printf 'a%.0s' $(seq 1 4000) > "$SRV/static/app.css"
+
+echo "9c. the RATIO alone catches a collapse that clears the floor"
+reset_log; run_deploy STUB_CSS_CONTENT="$(printf 'c%.0s' $(seq 1 1500))"
+check "exit non-zero"          [ "$(rc)" != 0 ]
+check "did not reload"         not_called "systemctl reload"
+check "kept the old stylesheet" bash -c '[ "$(wc -c < "'"$SRV"'/static/app.css")" -eq 4000 ]'
+check "named the collapse"     grep -qi "collapsed" "$T/out.txt"
 
 echo "10. the half-finished deploy from run 9 resumes, though git is up to date"
 # Run 9 merged and then failed, so the checkout is already at origin/master. Without
