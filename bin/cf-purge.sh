@@ -10,10 +10,13 @@
 # which mangles an inline `{"purge_everything":true}` body into invalid JSON (Cloudflare 400).
 set -uo pipefail
 
+# Absolute path by default (a systemd unit has a minimal PATH); overridable so
+# the test harness can observe the purge without reaching Cloudflare.
+
 [ "${SERVICE_RESULT:-}" = "success" ] || exit 0
 [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_CACHE_PURGE_TOKEN:-}" ] || exit 0
 
-resp=$(/usr/bin/curl -sS -w '\n%{http_code}' -X POST \
+resp=$(${CURL:-/usr/bin/curl} -sS -w '\n%{http_code}' -X POST \
   "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
   -H "Authorization: Bearer ${CF_CACHE_PURGE_TOKEN}" \
   -H "Content-Type: application/json" \
