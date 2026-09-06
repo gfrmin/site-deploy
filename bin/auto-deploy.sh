@@ -30,9 +30,50 @@ APP="${APP:?APP env var required (set by site-deploy@.service)}"
 SELF="${SITE_DEPLOY_DIR:-/srv/site-deploy}"   # override only for local dry-runs
 SRV="${APP_DIR:-/srv/${APP}}"                  # override only for local dry-runs
 UV="${UV:-/usr/local/bin/uv}"
+RELOAD_CMD="${RELOAD_CMD:-sudo -n /usr/bin/systemctl}"   # override to `echo` for a dry-run
+
+cd "$SRV" || { echo "auto-deploy[$APP]: no checkout at $SRV"; exit 1; }
+
+# Per-app config, from the app's own repo. An app with no deploy/site.toml keeps
+# its knobs in /etc/<app>/env exactly as before — this is additive.
+#
+# Called TWICE, and that is not redundancy. The first call arms the knobs needed
+# before anything is fetched (the queued-rebuild retry needs DEPLOY_BUILD_SERVICE).
+# The second runs after the merge, so a commit that changes site.toml governs its
+# OWN deploy rather than the next one — otherwise every config change ships one
+# tick late, which is exactly the kind of off-by-one that gets debugged as a
+# mystery rather than read off the file.
+# $1 = "fatal" to abort on an unreadable file.
+#
+# The pre-merge read must NOT be fatal, or a broken site.toml deadlocks the box:
+# the file that breaks the deploy is the same file the repair commit fixes, and
+# the tick would die reading the old copy before it ever fetched the new one.
+# After the merge it IS fatal — by then it is the config being deployed, and
+# falling back to the environment would mean deploying with knobs nobody wrote.
+load_site_config() {
+  [ -f deploy/site.toml ] || return 0
+  local rendered
+  if rendered=$(python3 "$SELF/bin/site-config.py" deploy/site.toml 2>&1); then
+    eval "$rendered"
+  else
+    echo "auto-deploy[$APP]: $rendered"
+    if [ "${1:-}" = fatal ]; then
+      echo "auto-deploy[$APP]: refusing to deploy blind on an unreadable deploy/site.toml"
+      exit 1
+    fi
+    echo "auto-deploy[$APP]: continuing anyway (pre-merge) so a fix can land"
+    return 0
+  fi
+  RELOAD="${DEPLOY_RELOAD:-reload}"
+  UV_ARGS="${DEPLOY_UV_ARGS:---frozen}"
+  HEALTH_PATH="${DEPLOY_HEALTH_PATH-/health}"
+  HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-10}"
+  CSS_MIN_RATIO="${DEPLOY_CSS_MIN_RATIO:-50}"
+}
+
 RELOAD="${DEPLOY_RELOAD:-reload}"
 UV_ARGS="${DEPLOY_UV_ARGS:---frozen}"
-RELOAD_CMD="${RELOAD_CMD:-sudo -n /usr/bin/systemctl}"   # override to `echo` for a dry-run
+load_site_config
 CURL="${CURL:-curl}"
 HEALTH_PATH="${DEPLOY_HEALTH_PATH-/health}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-10}"
@@ -68,8 +109,6 @@ health_ok() {
 
 # 0. Self-update the toolkit (best-effort + silent; a toolkit change lands on the NEXT tick).
 git -C "$SELF" pull --ff-only --quiet 2>/dev/null || true
-
-cd "$SRV" || { log "no checkout at $SRV"; exit 1; }
 
 # 0b. Retry a queued snapshot rebuild. `systemctl start` on an activating oneshot is a silent
 #     no-op (live miss, crescira 2026-07-13: the nightly was mid-run — on pre-push code — when a
@@ -130,6 +169,9 @@ fi
 # 2. Fast-forward only (guaranteed by the ancestor check; --ff-only is belt-and-braces).
 git merge --ff-only --quiet '@{u}' || { log "fast-forward merge failed (drift) — manual fix needed"; exit 1; }
 touch "$PENDING_RELOAD"   # cleared once the reload is verified healthy (see step 5)
+
+# Re-read: this deploy may have just changed it.
+load_site_config fatal
 
 # 3. Sync deps (frozen). On failure, stop BEFORE the reload.
 # shellcheck disable=SC2086

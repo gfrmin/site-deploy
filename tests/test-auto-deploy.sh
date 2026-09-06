@@ -9,6 +9,13 @@
 #
 # Each numbered run continues from the state the last one left, so idempotence
 # is a real assertion rather than a claim.
+#
+# Every guard here has been verified by mutation — break it, watch the named
+# check fail. One property deliberately is NOT covered: that the stylesheet is
+# installed by an atomic rename rather than an in-place write. Replacing `mv`
+# with `cat >` keeps this suite green, because proving atomicity needs a reader
+# racing the writer, which is flaky in a way that costs more than it catches.
+# The reason for the rename is in the comment at the call site instead.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -187,6 +194,33 @@ check "exit 0"                 [ "$(rc)" = 0 ]
 check "reloaded"               called "systemctl reload app"
 check "css replaced"           bash -c '! cmp -s "'"$SRV"'/static/app.css" "'"$T"'/app.css.before"'
 check "no temp left behind"    bash -c '! ls "'"$SRV"'"/static/.app.css.* >/dev/null 2>&1'
+
+echo "10b. deploy/site.toml supplies the knobs, and overrides a stale env value"
+( cd "$WORK"; mkdir -p deploy
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\n' > deploy/site.toml
+  git add -A; git commit -qm "site.toml"; git push -q origin master )
+reset_log; run_deploy DEPLOY_RELOAD=reload
+check "used site.toml's verb"   called "systemctl restart app"
+check "not the env's verb"      not_called "systemctl reload app"
+check "reported the override"   grep -q "site.toml sets DEPLOY_RELOAD" "$T/out.txt"
+check "health match honoured"   called "127.0.0.1:8000/health"
+
+echo "10c. a body that does not match the declared string is unhealthy"
+push_commit c10c; reset_log; run_deploy STUB_HEALTH_BODY="Internal Server Error"
+check "exit non-zero"           [ "$(rc)" != 0 ]
+check "did not purge"           not_called "purge_cache"
+
+echo "10d. a malformed site.toml refuses to deploy rather than guessing"
+( cd "$WORK"; printf '[deploy\nreload = ' > deploy/site.toml; git commit -qam "break it"; git push -q origin master )
+reset_log; run_deploy
+check "exit non-zero"           [ "$(rc)" != 0 ]
+check "did not reload"          not_called "systemctl restart app"
+check "said why"                grep -qi "site.toml" "$T/out.txt"
+( cd "$WORK"
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\n' > deploy/site.toml
+  git commit -qam "fix it"; git push -q origin master )
+reset_log; run_deploy
+check "recovers once fixed"     [ "$(rc)" = 0 ]
 
 echo "11. idempotent: nothing left to do is silent again"
 reset_log; run_deploy
