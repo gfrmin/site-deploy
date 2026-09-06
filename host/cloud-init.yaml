@@ -1,0 +1,37 @@
+#cloud-config
+# First boot for a site host (DigitalOcean user-data). Deliberately tiny: it
+# creates the admin user and installs Tailscale, and nothing else. Every other
+# decision — packages, uv, the service user, systemd units, Caddy — is made by
+# host/provision.sh from a git checkout, so the source of truth is in git rather
+# than in a droplet's user-data field where nobody will ever find it again.
+#
+# Replace <SSH_PUBKEY> with an operator key. That key is the bootstrap path only:
+# it exists so you can reach the box before the tailnet join, and harden.sh
+# closes public :22 afterwards.
+#
+# Then, on the box:
+#   1. tailscale up --ssh --advertise-tags=tag:<TAG> --hostname=<box>
+#      The tag is per-fleet, not fixed — match what the fleet's siblings and the
+#      tailnet ACLs already use, and check an existing box before guessing.
+#   2. clone the app repo into /srv/<app> (deploy key, core.sshCommand pinned)
+#   3. bash /srv/site-deploy/host/provision.sh <app>
+#   4. drop /etc/<app>/env + certs; systemctl enable --now site-deploy@<app>.timer
+#   5. CONFIRM `ssh g@<box>` works over Tailscale SSH
+#   6. bash /srv/site-deploy/host/harden.sh
+#
+# Step 5 before step 6 is load-bearing, not politeness: harden.sh closes public
+# :22, and doing that before Tailscale SSH is confirmed is a live lockout that
+# needs the provider's recovery console (hit on webbsite-web, 2026-06-05).
+users:
+  - name: g
+    uid: 1000
+    groups: [sudo]
+    shell: /bin/bash
+    # Tailscale SSH is non-interactive, so NOPASSWD is required, not lax.
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - <SSH_PUBKEY>
+package_update: true
+packages: [git, curl, ca-certificates]
+runcmd:
+  - ['sh', '-c', 'curl -fsSL https://tailscale.com/install.sh | sh']
