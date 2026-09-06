@@ -80,7 +80,7 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 ORIGIN="$T/origin.git"; WORK="$T/work"; SRV="$T/srv/app"
 git init -q --bare "$ORIGIN"
 git clone -q "$ORIGIN" "$WORK" 2>/dev/null
-( cd "$WORK"
+( cd "$WORK" || exit 1
   mkdir -p static data
   printf '@tailwind base;' > static/src.css
   printf 'static/app.css\n' > .gitignore
@@ -89,7 +89,7 @@ git clone -q "$ORIGIN" "$WORK" 2>/dev/null
 git clone -q "$ORIGIN" "$SRV" 2>/dev/null
 printf 'a%.0s' $(seq 1 4000) > "$SRV/static/app.css"   # the currently-served stylesheet
 
-push_commit() { ( cd "$WORK"; echo "$1" >> notes.txt; git add -A; git commit -qm "$1"; git push -q origin master ); }
+push_commit() { ( cd "$WORK" || exit 1; echo "$1" >> notes.txt; git add -A; git commit -qm "$1"; git push -q origin master ); }
 reset_log() { : > "$STUB_LOG"; }
 called() { grep -qF "$1" "$STUB_LOG"; }
 not_called() { ! grep -qF "$1" "$STUB_LOG"; }
@@ -130,23 +130,23 @@ check "did NOT purge"          not_called "purge_cache"
 check "said why"               grep -qi "health" "$T/out.txt"
 
 echo "5. local ahead of origin is benign, not fatal"
-( cd "$SRV"; echo local >> local.txt; git add -A; git commit -qm "local-only" )
+( cd "$SRV" || exit 1; echo local >> local.txt; git add -A; git commit -qm "local-only" )
 reset_log; run_deploy
 check "exit 0 (self-healing)"  [ "$(rc)" = 0 ]
 check "did not reload"         not_called "systemctl reload"
 check "said local is ahead"    grep -qi "ahead" "$T/out.txt"
-( cd "$SRV"; git reset -q --hard origin/master )
+( cd "$SRV" || exit 1; git reset -q --hard origin/master )
 
 echo "6. genuinely diverged is still fatal"
-( cd "$SRV"; git reset -q --hard HEAD~1; echo diverge >> d.txt; git add -A; git commit -qm diverged )
+( cd "$SRV" || exit 1; git reset -q --hard HEAD~1; echo diverge >> d.txt; git add -A; git commit -qm diverged )
 push_commit c6; reset_log; run_deploy
 check "exit 1"                 [ "$(rc)" = 1 ]
 check "did not reload"         not_called "systemctl reload"
-( cd "$SRV"; git fetch -q origin; git reset -q --hard origin/master )
+( cd "$SRV" || exit 1; git fetch -q origin; git reset -q --hard origin/master )
 
 echo "7. a build unit in 'deactivating' counts as busy"
 echo deactivating > "$STUB_UNITS/app-build.service.state"
-push_commit "c7 build" ; ( cd "$WORK"; echo "# changed" >> data/build_db.py; git commit -qam "touch builder"; git push -q origin master )
+push_commit "c7 build" ; ( cd "$WORK" || exit 1; echo "# changed" >> data/build_db.py; git commit -qam "touch builder"; git push -q origin master )
 reset_log; run_deploy DEPLOY_BUILD_SERVICE=app-build.service
 check "queued, did not start"  not_called "systemctl start --no-block app-build.service"
 check "wrote the queue flag"   [ -f "$SRV/.site-deploy-build-pending" ]
@@ -196,7 +196,7 @@ check "css replaced"           bash -c '! cmp -s "'"$SRV"'/static/app.css" "'"$T
 check "no temp left behind"    bash -c '! ls "'"$SRV"'"/static/.app.css.* >/dev/null 2>&1'
 
 echo "10b. deploy/site.toml supplies the knobs, and overrides a stale env value"
-( cd "$WORK"; mkdir -p deploy
+( cd "$WORK" || exit 1; mkdir -p deploy
   printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\n' > deploy/site.toml
   git add -A; git commit -qm "site.toml"; git push -q origin master )
 reset_log; run_deploy DEPLOY_RELOAD=reload
@@ -211,12 +211,12 @@ check "exit non-zero"           [ "$(rc)" != 0 ]
 check "did not purge"           not_called "purge_cache"
 
 echo "10d. a malformed site.toml refuses to deploy rather than guessing"
-( cd "$WORK"; printf '[deploy\nreload = ' > deploy/site.toml; git commit -qam "break it"; git push -q origin master )
+( cd "$WORK" || exit 1; printf '[deploy\nreload = ' > deploy/site.toml; git commit -qam "break it"; git push -q origin master )
 reset_log; run_deploy
 check "exit non-zero"           [ "$(rc)" != 0 ]
 check "did not reload"          not_called "systemctl restart app"
 check "said why"                grep -qi "site.toml" "$T/out.txt"
-( cd "$WORK"
+( cd "$WORK" || exit 1
   printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\n' > deploy/site.toml
   git commit -qam "fix it"; git push -q origin master )
 reset_log; run_deploy
