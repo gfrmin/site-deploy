@@ -76,7 +76,8 @@ if [ -n "${STUB_HEALTH_FAIL:-}" ]; then exit 22; fi
 if [ -n "${STUB_HEALTH_STATUS:-}" ] && [ "$STUB_HEALTH_STATUS" -ge 400 ]; then
   if printf '%s\n' "$@" | grep -qxE -- '-f|-fsS|-fs|-sf|-sSf'; then exit 22; fi
 fi
-printf '%s' "${STUB_HEALTH_BODY:-{\"status\":\"ok\"}}"
+body=${STUB_HEALTH_BODY:-}; [ -n "$body" ] || body='{"status":"ok"}'
+printf '%s' "$body"
 exit 0
 STUB
 chmod +x "$T/bin"/*

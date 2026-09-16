@@ -16,7 +16,7 @@ id "$APP" >/dev/null 2>&1 || { echo "error: no service user '$APP'"; exit 1; }
 
 # Per-app knobs from /etc/<app>/env (bare single values — safe to extract without sourcing the
 # systemd-format env file, whose unquoted `KEY=a b c` lines aren't shell-source-safe).
-envval() { sudo grep -m1 "^$1=" "/etc/$APP/env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true; }
+envval() { sudo grep -m1 "^$1=" "/etc/$APP/${2:-env}" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true; }
 RELOAD="$(envval DEPLOY_RELOAD)"; RELOAD="${RELOAD:-reload}"
 BUILD_SVC="$(envval DEPLOY_BUILD_SERVICE)"
 echo "installing auto-deploy for $APP (default verb: systemctl $RELOAD $APP${BUILD_SVC:+; rebuild via $BUILD_SVC})"
@@ -34,6 +34,7 @@ sudo chmod -R u=rwX,go=rX "$HERE"
 sudo cp "$HERE/systemd/site-deploy@.service" "$HERE/systemd/site-deploy@.timer" \
         "$HERE/systemd/site-deploy-update.service" "$HERE/systemd/site-deploy-update.timer" \
         "$HERE/systemd/site-probe@.service" "$HERE/systemd/site-probe@.timer" \
+        "$HERE/systemd/site-checks-armed@.service" "$HERE/systemd/site-checks-armed@.timer" \
         /etc/systemd/system/
 
 # 3. NOPASSWD grants so the service user can reload/restart itself, and (for apps with a snapshot
@@ -68,6 +69,22 @@ else
 fi
 if [ -z "$(envval HEALTHCHECKS_DEPLOY_URL)" ]; then
   echo "WARNING: HEALTHCHECKS_DEPLOY_URL not set in /etc/$APP/env — deploys on this box are UNMONITORED (size the check 600s/900s)" >&2
+fi
+if [ -n "$(envval HEALTHCHECKS_API_KEY ops-env)" ] && [ -n "$(envval HEALTHCHECKS_SWEEP_TAG ops-env)" ]; then
+  sudo systemctl enable --now "site-checks-armed@${APP}.timer"
+  echo "enabled site-checks-armed@${APP}.timer (sweeps tag $(envval HEALTHCHECKS_SWEEP_TAG ops-env) every 15 min; size its check 900s/900s)"
+else
+  sudo systemctl disable --now "site-checks-armed@${APP}.timer" 2>/dev/null || true
+  echo "note: no HEALTHCHECKS_API_KEY/HEALTHCHECKS_SWEEP_TAG in /etc/$APP/ops-env — alarms are not verified from this box" >&2
+fi
+
+# 6. Does the box carry the config the app declares? Names only, never values.
+#    A rebuilt box that is missing half its env file serves 200s all day; this
+#    is the check that says a rebuilt box equals the one it replaced.
+if [ -r "/srv/$APP/deploy/required-env.txt" ]; then
+  sudo "$HERE/bin/env-check.sh" "$APP" || echo "WARNING: env-check reported problems above (exit $?)" >&2
+else
+  echo "note: /srv/$APP/deploy/required-env.txt not found — the app declares no env manifest, so nothing can say whether this box has its config" >&2
 fi
 
 echo

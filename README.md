@@ -68,12 +68,15 @@ bin/self-update.sh   keeps /srv/site-deploy on the toolkit's tested ref (run by 
 bin/cf-purge.sh      Cloudflare edge purge (no-op unless CF_* set in /etc/<app>/env)
 bin/health-probe.sh  active public probe -> its healthchecks check (see Monitoring)
 bin/hc-unit-result.sh ExecStopPost= backstop: /fail when a unit did not end in success
+bin/env-check.sh     does the box carry every env NAME deploy/required-env.txt declares? (see below)
+bin/checks-armed.sh  are the fleet's healthchecks alarms actually armed? (paused = silent)
 lib/hc.sh            the ping leaf + http_probe, sourced by every reporter
 bin/install.sh       root-own the toolkit, install units + sudoers grant, enable timers (admin, once)
 bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
 systemd/site-probe@.service , site-probe@.timer            per-app active probe (every 5 min)
+systemd/site-checks-armed@.service , site-checks-armed@.timer   alarm-armed sweep (every 15 min)
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
@@ -204,6 +207,43 @@ but a dead box also stops pinging, so the check goes DOWN at timeout+grace: both
 are covered. Pings are leaves (`lib/hc.sh`): they never change an exit code and never become a
 dependency of the work they report on.
 
+**The alarm-armed sweep** (`HEALTHCHECKS_API_KEY` + `HEALTHCHECKS_SWEEP_TAG` in a root-only
+`/etc/<app>/ops-env`, `site-checks-armed@<app>.timer`, every 15 min). healthchecks accepts a ping
+to a *paused* check, answers 200, and discards it, so every layer on every box reports success
+while the alarm is gone. This sweeps every check carrying the tag and fails if the sweep is shorter
+than `HEALTHCHECKS_EXPECTED_MIN` (an empty sweep must never pass vacuously), if any check is
+paused, or if a simple-period check is silently stale. A `down` check is *armed and firing*, never
+a violation. Tag its own check with the sweep tag and it asserts over itself. Size 900 s / 900 s.
+
+## `deploy/required-env.txt`: the box has its config, and the app has it too
+
+On a fleet of cattle, "rebuilt from nothing" is the normal case, and a rebuilt box that is missing
+half its env file serves 200s all day: an unset knob usually hides a feature *by design*. The app
+declares the env **names** it needs (values never leave the box), and `bin/env-check.sh <app>`
+asserts them on install and whenever an invariants job asks:
+
+```
+# file        NAME             grade[@fresh]   what breaks without it
+env           SECRET_KEY       required        the app
+env           SENTRY_DSN       blank-ok        opt-in; blank and absent are the same to the code
+env           POOL_SIZE        optional        default applies only when ABSENT; blank is int("")
+env           CF_CACHE_PURGE_TOKEN required@fresh  cf-purge.sh re-reads the file each run
+refresh-env   R2_KEY           required        the loader
+```
+
+- `file` is relative to `/etc/<app>/`; `env` is the app unit's `EnvironmentFile`.
+- **Blank is not absent.** `os.getenv(name, default)` falls back only when the name is *absent*,
+  so `POOL_SIZE=` is `int("")`. `required` must be present and non-blank; `optional` may be
+  absent but blank is reported; `blank-ok` is never reported.
+- **Both directions.** A name on the box that the manifest does not declare is a failure, so a
+  knob cannot exist only in `/etc`.
+- **The file is not the process.** systemd reads `EnvironmentFile=` at unit *start* and a reload
+  is SIGHUP, so a restored file turns the check green while the app keeps serving what it booted
+  with. When `env` is newer than the unit start, `/proc/<MainPID>/environ` is compared
+  variable-by-variable (in-process, never printed), skipping `@fresh` names whose only readers
+  re-read the file each run.
+- Exit 0 clean, 1 config wrong, **2 the checker could not run**. BLIND is never clean.
+
 ## Secrets (`/etc/<app>/env`, box-local — never in this repo)
 ```
 DEPLOY_RELOAD=reload               # or: restart   (apps with no ExecReload)
@@ -237,6 +277,8 @@ when current and loud when it refuses.
 ./tests/test-auto-deploy.sh
 ./tests/test-self-update.sh
 ./tests/test-hc.sh
+./tests/test-env-check.sh
+./tests/test-checks-armed.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,
