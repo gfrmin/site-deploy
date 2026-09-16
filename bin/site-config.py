@@ -35,6 +35,7 @@ KEYS = {
     "css_min_ratio": "DEPLOY_CSS_MIN_RATIO",
     "port": "PORT",
     "cf_zone_id": "CF_ZONE_ID",
+    "converge": "DEPLOY_CONVERGE",
 }
 
 

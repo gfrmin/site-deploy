@@ -227,6 +227,47 @@ reset_log; run_deploy
 check "exit 0"                 [ "$(rc)" = 0 ]
 check "printed nothing"        [ -z "$(out)" ]
 
+# Converging box config is the one step here that runs as root, so its failure
+# modes matter more than most: the thing it can get wrong is reloading the app
+# onto half-applied units.
+echo "12a. converge is opt-in: an undeclared knob never runs the script"
+( cd "$WORK" || exit 1
+  printf '#!/usr/bin/env bash\necho "CONVERGE RAN" >> "$STUB_LOG"\nexit ${FAKE_CONVERGE_RC:-0}\n' > deploy/converge.sh
+  chmod +x deploy/converge.sh
+  git add deploy/converge.sh; git commit -qm "add converge script"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                  [ "$(rc)" = 0 ]
+check "did not converge"        not_called "CONVERGE RAN"
+check "still reloaded"          called "systemctl restart app"
+
+echo "12b. converge = true runs it, then reloads"
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\nconverge = true\n' > deploy/site.toml
+  git commit -qam "converge on"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                  [ "$(rc)" = 0 ]
+check "converged"               called "CONVERGE RAN"
+check "reloaded"                called "systemctl restart app"
+
+echo "12c. a failing converge stops the deploy BEFORE the reload"
+# The point of the whole step: units that did not apply must never get traffic,
+# and the edge must keep serving the old site rather than be purged onto a box
+# in an unknown state.
+push_commit c12c; reset_log; run_deploy CONVERGE_CMD=env FAKE_CONVERGE_RC=1
+check "exit non-zero"           [ "$(rc)" != 0 ]
+check "tried to converge"       called "CONVERGE RAN"
+check "did NOT reload"          not_called "systemctl restart app"
+check "did NOT purge"           not_called "purge_cache"
+check "said why"                grep -qi "converge" "$T/out.txt"
+
+echo "12d. declared but unusable refuses to deploy rather than deploying blind"
+( cd "$WORK" || exit 1; chmod -x deploy/converge.sh; git update-index --chmod=-x deploy/converge.sh
+  git commit -qam "break converge"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit non-zero"           [ "$(rc)" != 0 ]
+check "did NOT reload"          not_called "systemctl restart app"
+check "named the problem"       grep -qi "converge.sh is missing or not executable" "$T/out.txt"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))

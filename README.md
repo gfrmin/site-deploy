@@ -86,7 +86,32 @@ health_path  = "/health"           # probed on 127.0.0.1:$port after the reload
 health_match = '"ok"'              # a 200 from a half-booted worker is not health
 cf_zone_id   = "..."               # non-secret half of the purge
 # build_service = "<app>-build.service"   # snapshot-backed apps only
+# converge      = true                    # apply deploy/ to the box each tick (see below)
 ```
+
+### `converge = true` — keeping a box in step with its repo
+
+`host/provision.sh` builds a box **once**. Nothing afterwards keeps its systemd units, drop-ins or
+vhost in step with what the repo says they are, so "source of truth" headers on committed unit files
+are a claim with nothing behind them. webbsite paid for that on 2026-09-11: Caddy's unit was tracked
+in no repo at all, so nobody noticed it carried no `Restart=`, and one OOM kill became five days of
+Cloudflare 521s while the app underneath answered every health check.
+
+With `converge = true`, `deploy/converge.sh` from the app repo runs **as root**, after `uv sync` and
+**before** the reload. A failure stops the deploy with the old code still serving and the edge cache
+intact, exactly like a failed `uv sync`. Declaring the knob without a usable script is also fatal:
+deploying while believing the config converged is worse than not deploying.
+
+The app owns the script, because only it knows which files it declares. Keep a fixed
+destination allowlist in it so a stray file cannot become a live unit by accident, validate anything
+a daemon has to parse *before* installing it, and make it silent when nothing changed — it runs
+every two minutes.
+
+> **Trust boundary.** A repo-declared unit's `ExecStart` runs as root, so on a converging box
+> **merge access to the app repo is root access on that box.** That is the same bargain
+> `dataguru-converge` makes and it is fine where it is already true, but it must be a deliberate
+> per-app decision — which is why this is opt-in, and why it needs its own sudoers grant
+> (`NOPASSWD: /srv/<app>/deploy/converge.sh`) rather than riding on the `systemctl` one.
 
 `site.toml` wins over the environment, and a disagreement is **reported**, not silently resolved —
 a box quietly behaving differently from the repo is the failure this exists to end. It is read

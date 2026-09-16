@@ -207,6 +207,40 @@ if [ -f static/src.css ]; then
   trap - EXIT
 fi
 
+# 4b. Converge box config from the repo, BEFORE the reload. Opt-in per app via
+#     `converge = true` in deploy/site.toml (declared in the app repo, where a pull
+#     request reviews it — same reasoning as every other knob in that file).
+#
+#     This is the half the host layer does not cover: host/provision.sh builds a box
+#     ONCE, and nothing afterwards keeps its units in step with the repo. webbsite's
+#     2026-09-11 outage is what that costs — Caddy's unit was tracked in no repo at
+#     all, so nobody noticed it carried no Restart=, and a single OOM kill became
+#     five days of 521s while the app underneath stayed healthy.
+#
+#     Failure stops the deploy before the reload, exactly like `uv sync` and the CSS
+#     canary above: converging half the config and then reloading onto it is the
+#     worst of both outcomes.
+#
+#     TRUST BOUNDARY. A repo-declared systemd unit's ExecStart runs as root, so on a
+#     converging box merge access to the app repo IS root on that box. That is the
+#     same bargain dataguru-converge makes and it is fine where it is already true,
+#     but it must be a deliberate per-app choice, which is why this is opt-in and why
+#     it needs its own sudoers grant rather than riding on the systemctl one.
+#     "True" is first because site-config.py renders values with Python's str(), so a
+#     TOML `converge = true` arrives as the capitalised form; the others accept a
+#     hand-set /etc/<app>/env override.
+if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] || [ "${DEPLOY_CONVERGE:-}" = "1" ]; then
+  if [ -x deploy/converge.sh ]; then
+    ${CONVERGE_CMD:-sudo -n} "$SRV/deploy/converge.sh" \
+      || { log "deploy/converge.sh failed; NOT reloading"; exit 1; }
+  else
+    # Declared but unusable is a misconfiguration, not a reason to deploy blind —
+    # the box would keep serving stale units while site.toml claimed otherwise.
+    log "site.toml sets converge but deploy/converge.sh is missing or not executable; NOT reloading"
+    exit 1
+  fi
+fi
+
 # 5. Apply: reload onto the new code IMMEDIATELY, even when a snapshot rebuild is coming. Jinja
 #    reads templates from disk, so from the moment the merge landed the old workers were already
 #    rendering the NEW templates — deferring the reload leaves old Python under new templates,
