@@ -36,6 +36,7 @@ KEYS = {
     "port": "PORT",
     "cf_zone_id": "CF_ZONE_ID",
     "converge": "DEPLOY_CONVERGE",
+    "tailwindcss_version": "TAILWINDCSS_VERSION",
 }
 
 

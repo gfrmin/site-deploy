@@ -19,7 +19,7 @@ id "$APP" >/dev/null 2>&1 || { echo "error: no service user '$APP'"; exit 1; }
 envval() { sudo grep -m1 "^$1=" "/etc/$APP/env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true; }
 RELOAD="$(envval DEPLOY_RELOAD)"; RELOAD="${RELOAD:-reload}"
 BUILD_SVC="$(envval DEPLOY_BUILD_SERVICE)"
-echo "installing auto-deploy for $APP (verb: systemctl $RELOAD $APP${BUILD_SVC:+; rebuild via $BUILD_SVC})"
+echo "installing auto-deploy for $APP (default verb: systemctl $RELOAD $APP${BUILD_SVC:+; rebuild via $BUILD_SVC})"
 
 # 1. The toolkit itself is ROOT-owned and read-only to everyone else: root runs
 #    scripts out of it (deploy/converge.sh via the poller), so the service user
@@ -40,7 +40,10 @@ sudo cp "$HERE/systemd/site-deploy@.service" "$HERE/systemd/site-deploy@.timer" 
 tmp="$(mktemp)"
 {
   echo "# Installed by site-deploy/bin/install.sh — auto-deploy grants."
-  printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl %s %s\n' "$APP" "$RELOAD" "$APP"
+  # Both verbs, whatever DEPLOY_RELOAD says: a deploy that changes uv.lock
+  # restarts instead of reloading (a reload cannot re-exec the arbiter), and a
+  # grant naming only `reload` would have sudo refuse exactly that deploy.
+  printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl reload %s, /usr/bin/systemctl restart %s\n' "$APP" "$APP" "$APP"
   [ -n "$BUILD_SVC" ] && printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block %s\n' "$APP" "$BUILD_SVC"
 } > "$tmp"
 sudo visudo -cf "$tmp" >/dev/null
