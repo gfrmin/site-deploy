@@ -1,0 +1,14 @@
+# Poll the toolkit's tested ref every ~2 min, like the per-app poller. Pairs
+# with site-deploy-update.service. OnBootSec as well as OnUnitActiveSec: a
+# timer with only the latter never fires after a reboot until something else
+# starts the unit once.
+[Unit]
+Description=Update the site-deploy toolkit (every 2 min)
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
+
+[Install]
+WantedBy=timers.target
