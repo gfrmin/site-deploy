@@ -21,3 +21,7 @@ git
 curl
 jq
 ufw
+
+# security upgrades apply themselves (host/apt-auto-upgrades.conf)
+unattended-upgrades
+needrestart

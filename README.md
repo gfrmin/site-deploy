@@ -50,7 +50,7 @@ workers keep serving.
 
 ```
 host/cloud-init.yaml    first boot: admin user + Tailscale, nothing else
-host/provision.sh <app> packages, uv, service user, 4G swap + vm.swappiness=10
+host/provision.sh <app> packages, uv, service user (swap etc. are host-converge's, every tick)
 host/harden.sh          key-only sshd + ufw (tailnet + Cloudflare ranges only)
 ```
 
@@ -71,13 +71,14 @@ bin/hc-unit-result.sh ExecStopPost= backstop: /fail when a unit did not end in s
 bin/env-check.sh     does the box carry every env NAME deploy/required-env.txt declares? (see below)
 bin/checks-armed.sh  are the fleet's healthchecks alarms actually armed? (paused = silent)
 lib/hc.sh            the ping leaf + http_probe, sourced by every reporter
-bin/install.sh       root-own the toolkit, install units + sudoers grant, enable timers (admin, once)
+bin/host-converge.sh converge the box below the app every tick: units, grants, journald, swap, packages, Caddy policy, timers (root)
+bin/install.sh       bootstrap: root-own the toolkit, first host-converge, env-check (admin, once)
 bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
 systemd/site-probe@.service , site-probe@.timer            per-app active probe (every 5 min)
 systemd/site-checks-armed@.service , site-checks-armed@.timer   alarm-armed sweep (every 15 min)
-host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt
+host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt, and the files host-converge installs
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
 
@@ -180,6 +181,34 @@ at the *deep* variant if the app has one.
 - **Pin `tailwindcss_version`.** Unset, `pytailwindcss` fetches `releases/latest` when the venv is
   first created, so each box compiles with whatever upstream had published that day. The pin takes
   effect on a box's next fresh venv (the download is cached by version).
+
+### The box below the app converges too
+
+`converge = true` also runs `bin/host-converge.sh <app>` (root, out of the root-owned toolkit, never
+the app checkout) right before the app's `deploy/converge.sh`. Silent when nothing changed; every
+change is one line; a failed step is counted and the run ends with one greppable
+`HOST-CONVERGE FAILED` line, which stops the deploy before the reload like any other failure. It
+owns, every tick:
+
+- the toolkit's own units in `/etc/systemd/system` (re-installed on change, daemon-reloaded; a
+  changed timer is restarted only if an operator has not stopped it)
+- the service user's scoped `NOPASSWD` grants (`reload` and `restart`, the build unit, the two
+  converge scripts), validated with `visudo -cf` before they replace the live file
+- a journald cap (`SystemMaxUse=1G`, a month of retention), unattended security upgrades, and a
+  `needrestart` rule so an upgrade never restarts a running `<app>-*` batch unit mid-run (the
+  app's own long-lived unit stays eligible on purpose)
+- `host/packages.txt` plus the app's `deploy/packages.txt`, installed on diff only
+- a 4G swapfile and `vm.swappiness=10` (moved here from `provision.sh`)
+- wherever Caddy is installed, a drop-in with `Restart=always` and a memory ceiling, so an OOM
+  kill of the proxy is local and recoverable instead of five days of 521s
+  (`CADDY_MEMORY_HIGH`/`CADDY_MEMORY_MAX` in `/etc/site-deploy/host.env` for a different box size)
+- the timers: the toolkit updater and the poller always; the probe and the alarm sweep iff their
+  env names are set, disarmed when they are removed. A stopped alarm timer is re-armed: to stand
+  a probe down, blank its env pair and pause the check. Missing monitoring is nagged every tick.
+
+`install.sh` is now just the bootstrap: root-own the toolkit, run the first converge, run
+`env-check`. "Installed" and "converged" are one state, which is what makes a rebuilt box
+provably equal to the one it replaced.
 
 ### `converge = true` — keeping a box in step with its repo
 
@@ -308,6 +337,7 @@ when current and loud when it refuses.
 ./tests/test-hc.sh
 ./tests/test-env-check.sh
 ./tests/test-checks-armed.sh
+./tests/test-host-converge.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,
