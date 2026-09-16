@@ -29,12 +29,13 @@ jobs:
           python-version: "3.11"
 
       - name: shellcheck
-        run: shellcheck -S warning bin/*.sh host/*.sh tests/*.sh
+        run: shellcheck -S warning bin/*.sh host/*.sh lib/*.sh tests/*.sh
 
       - name: scenario tests
         run: |
           ./tests/test-auto-deploy.sh
           ./tests/test-self-update.sh
+          ./tests/test-hc.sh
 
   # Advance `ci-green` to this commit once the suite is green on master. The
   # boxes track that ref (bin/self-update.sh), so a red run here means the

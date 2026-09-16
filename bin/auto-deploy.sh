@@ -34,6 +34,59 @@ UV="${UV:-/usr/local/bin/uv}"
 RELOAD_CMD="${RELOAD_CMD:-sudo -n /usr/bin/systemctl}"   # override to `echo` for a dry-run
 
 cd "$SRV" || { echo "auto-deploy[$APP]: no checkout at $SRV"; exit 1; }
+# shellcheck disable=SC1091
+. "$SELF/lib/hc.sh"
+
+# --- the deploy dead-man ------------------------------------------------------
+# HEALTHCHECKS_DEPLOY_URL (from /etc/<app>/env; unset = no pings, and the poller
+# stays silent — install.sh and env-check own the nagging). The subject of the
+# ping is deliberately "this box is AT the ref it should be at", not "a tick
+# ran": a ran-dead-man is green during the failure it most needs to catch. A
+# `git fetch` that fails exits 0 below with one journal line nobody reads, every
+# two minutes, forever — which is what a box gets if its deploy key is revoked.
+#
+# Three edges, none redundant. LEVEL (root ping) fires only when the checkout
+# holds the ref. A non-zero exit sends /fail from ONE EXIT trap, so a new `exit`
+# added later can never silently stop reporting; hc-unit-result.sh on the unit
+# covers the script being killed before its trap. Behind for BEHIND_FAIL_SECONDS
+# sends /fail: a real deploy takes one tick, so behind for ~7 of them is stuck,
+# not busy. And no ping at all means the timer is gone — that is what the
+# check's own timeout+grace (600s+900s) is for.
+HC_DEPLOY="${HEALTHCHECKS_DEPLOY_URL:-}"
+STATE_DIR="${DEPLOY_STATE_DIR:-$SRV/.site-deploy-state}"
+BEHIND_STAMP="$STATE_DIR/behind-since"
+BEHIND_FAIL_SECONDS="${BEHIND_FAIL_SECONDS:-900}"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+RUNLOG=$(mktemp)
+CSS_TMP=""
+on_exit() {
+  local rc=$?
+  [ -n "$CSS_TMP" ] && rm -f "$CSS_TMP"
+  if [ "$rc" -ne 0 ]; then
+    hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: exit $rc
+$(tail -n 60 "$RUNLOG" 2>/dev/null)"
+  fi
+  rm -f "$RUNLOG"
+  exit "$rc"
+}
+trap on_exit EXIT
+log() { echo "auto-deploy[$APP]: $*"; printf '%s\n' "$*" >> "$RUNLOG"; }
+# Level: the box holds the ref it should. Clears the stamp so the next stall is
+# measured from when it started, not from the last time anything was wrong.
+report_level() { rm -f "$BEHIND_STAMP" 2>/dev/null || true; hc_ping "$HC_DEPLOY" "" "auto-deploy[$APP]: $1"; }
+# Not level, for whatever reason — behind, or unable to find out. One tick of
+# this is an ordinary deploy, so it only alarms once it has persisted.
+report_behind() {
+  local now since age
+  now=$(date +%s)
+  since=$(cat "$BEHIND_STAMP" 2>/dev/null || true)
+  case "$since" in ''|*[!0-9]*) since=$now; printf '%s\n' "$now" > "$BEHIND_STAMP" 2>/dev/null || true ;; esac
+  age=$(( now - since ))
+  if [ "$age" -ge "$BEHIND_FAIL_SECONDS" ]; then
+    log "DEPLOY STUCK: $1 for ${age}s (threshold ${BEHIND_FAIL_SECONDS}s)"
+    hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: STUCK $1 for ${age}s"
+  fi
+}
 
 # Per-app config, from the app's own repo. An app with no deploy/site.toml keeps
 # its knobs in /etc/<app>/env exactly as before — this is additive.
@@ -90,7 +143,6 @@ CURL="${CURL:-curl}"
 HEALTH_PATH="${DEPLOY_HEALTH_PATH-/health}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-10}"
 CSS_MIN_RATIO="${DEPLOY_CSS_MIN_RATIO:-50}"
-log() { echo "auto-deploy[$APP]: $*"; }
 
 # `systemctl start` on a oneshot that is still running is a SILENT no-op, so
 # anything that dispatches a build has to know whether it is busy. `deactivating`
@@ -150,7 +202,7 @@ if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -f "$PENDING_BUILD" ]; then
 fi
 
 # 1. Cheap remote check. A transient fetch failure just retries next tick (exit 0, not failed).
-git fetch --quiet origin || { log "fetch failed (transient?); will retry next tick"; exit 0; }
+git fetch --quiet origin || { log "fetch failed (transient?); will retry next tick"; report_behind "cannot fetch origin"; exit 0; }
 LOCAL=$(git rev-parse @)
 REMOTE=$(git rev-parse '@{u}')
 # A deploy is not finished when the merge lands — it is finished when the new
@@ -161,6 +213,7 @@ REMOTE=$(git rev-parse '@{u}')
 # unfinished half retry instead.
 PENDING_RELOAD="$SRV/.site-deploy-reload-pending"
 if [ "$LOCAL" = "$REMOTE" ] && [ ! -f "$PENDING_RELOAD" ]; then
+  report_level "at ${LOCAL:0:9}"
   exit 0                                     # up to date -> silent no-op
 fi
 # The marker's content is the verb the unfinished deploy needed, if it was not
@@ -197,6 +250,7 @@ if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
   # nothing but a human can resolve it.
   if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
     log "local is ahead of origin by $(git rev-list --count "$REMOTE".."$LOCAL") commit(s) — nothing to deploy"
+    report_level "ahead of origin at ${LOCAL:0:9}"
     exit 0
   fi
   log "local has diverged from origin (neither is an ancestor of the other) — manual fix needed"
@@ -204,6 +258,8 @@ if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
 fi
 
 log "${LOCAL:0:9} -> ${REMOTE:0:9}; deploying"
+report_behind "behind origin (${LOCAL:0:9} vs ${REMOTE:0:9})"
+hc_ping "$HC_DEPLOY" /start "auto-deploy[$APP]: deploying ${LOCAL:0:9} -> ${REMOTE:0:9}"
 
 # Does this deploy change the snapshot builder? If so we ALSO dispatch a rebuild after the
 # reload below. Detected before the merge from the incoming range.
@@ -288,9 +344,7 @@ EOF_SOURCES
   # stylesheet every visitor gets is otherwise compiled by whichever version
   # upstream had published when that box's venv was created.
   [ -n "${TAILWINDCSS_VERSION:-}" ] || log "WARNING tailwindcss_version is not pinned in deploy/site.toml"
-  CSS_TMP=$(mktemp "static/.app.css.XXXXXX")
-  # shellcheck disable=SC2064
-  trap "rm -f '$CSS_TMP'" EXIT
+  CSS_TMP=$(mktemp "static/.app.css.XXXXXX")   # removed by on_exit if we bail
   # --frozen --no-dev: an unflagged `uv run` re-locks uv.lock inside the
   # checkout on a pyproject/lock mismatch and wedges this very poller on
   # `git merge --ff-only` forever. This is the site a grep for "uv run"
@@ -310,7 +364,7 @@ EOF_SOURCES
     fi
   fi
   mv -f "$CSS_TMP" static/app.css
-  trap - EXIT
+  CSS_TMP=""
 fi
 
 # 4b. Converge box config from the repo, BEFORE the reload. Opt-in per app via
@@ -404,3 +458,4 @@ if [ -n "$SCHEMA_CHANGED" ]; then
 else
   log "deployed ${REMOTE:0:9} ($RELOAD)"
 fi
+report_level "deployed ${REMOTE:0:9}"

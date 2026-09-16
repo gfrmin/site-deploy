@@ -1,0 +1,20 @@
+# Every 5 min. This cadence and the <app>-probe check's schedule are ONE
+# decision: size the check SIMPLE, timeout=300s grace=600s, so systemd's
+# default AccuracySec (1min) plus the RandomizedDelaySec below can never
+# produce a false alarm — the worst honest gap between delivered pings is
+# ~8min (300s + 85s fire lateness + a ~90s worst-case run), inside 900s. A
+# cadence change here must change both check fields in the same breath.
+#
+# OnCalendar fires at the next wall-clock slot after boot, so no OnBootSec is
+# needed; Persistent=false because a missed window is stale news — the next
+# fire is <=5min out, and a catch-up probe at boot would race network-online.
+[Unit]
+Description=Active uptime probe for %i (every 5 min)
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=25
+Persistent=false
+
+[Install]
+WantedBy=timers.target
