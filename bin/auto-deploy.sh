@@ -23,6 +23,7 @@
 #   DEPLOY_HEALTH_TRIES=10            (one second apart)
 #   DEPLOY_CSS_MIN_RATIO=50           (refuse a rebuilt app.css smaller than this % of the one
 #                                      it would replace)
+#   TAILWINDCSS_VERSION=4.3.3         (pin the compiler pytailwindcss downloads; unset = latest)
 # Override RELOAD_CMD (default `sudo -n /usr/bin/systemctl`) to `echo` for a no-sudo local dry-run.
 set -uo pipefail
 
@@ -50,11 +51,22 @@ cd "$SRV" || { echo "auto-deploy[$APP]: no checkout at $SRV"; exit 1; }
 # the tick would die reading the old copy before it ever fetched the new one.
 # After the merge it IS fatal — by then it is the config being deployed, and
 # falling back to the environment would mean deploying with knobs nobody wrote.
+#
+# The pre-merge read is also SCOPED: it evaluates the old file in a subshell and
+# takes only DEPLOY_BUILD_SERVICE out of it. Evaluating it in this shell exported
+# every old knob, and the post-merge read only sets keys the NEW file has — so a
+# knob the deploying commit REMOVED (say, health_match) stayed armed from the
+# old copy for exactly the deploy that removed it.
 load_site_config() {
   [ -f deploy/site.toml ] || return 0
   local rendered
   if rendered=$(python3 "$SELF/bin/site-config.py" deploy/site.toml 2>&1); then
-    eval "$rendered"
+    if [ "${1:-}" = fatal ]; then
+      eval "$rendered"
+    else
+      DEPLOY_BUILD_SERVICE=$( eval "$rendered" 2>/dev/null; printf '%s' "${DEPLOY_BUILD_SERVICE:-}" )
+      return 0
+    fi
   else
     echo "auto-deploy[$APP]: $rendered"
     if [ "${1:-}" = fatal ]; then
@@ -94,10 +106,23 @@ unit_busy() {
 # "systemctl accepted the verb" is not "the site is up". A reload returns as soon
 # as SIGHUP is delivered, so without this the next line purges the edge and
 # refills it from an origin that may be throwing ImportError.
+#
+# READ THE BODY, NOT THE STATUS CODE — when there is a body to read. With
+# health_match set, `-f` is dropped: /health on a snapshot-backed app is an
+# operator-alerting endpoint, not a liveness one, and answers 503 on a STALE
+# SNAPSHOT while serving every page perfectly. A `-f` probe would call that
+# app down, skip the purge, and strand this deploy's templates at the edge for
+# a full TTL — the exact bug the purge exists to fix. So: up iff it answered
+# HTTP at all AND the body contains the match. Genuinely dead stays down: a
+# refused/timed-out connection, a half-booted worker whose body says
+# "starting", an nginx/Caddy error page. Without health_match the status code
+# is the only datum there is, and `-f` stays.
 health_ok() {
-  local url=$1 i body
+  local url=$1 i body fflag=-f
+  [ -n "${DEPLOY_HEALTH_MATCH:-}" ] && fflag=""
   for ((i = 1; i <= HEALTH_TRIES; i++)); do
-    if body=$($CURL -fsS --max-time 3 "$url" 2>/dev/null); then
+    # shellcheck disable=SC2086
+    if body=$($CURL $fflag -sS --max-time 3 "$url" 2>/dev/null); then
       if [ -z "${DEPLOY_HEALTH_MATCH:-}" ] || [[ $body == *"$DEPLOY_HEALTH_MATCH"* ]]; then
         return 0
       fi
@@ -138,8 +163,27 @@ PENDING_RELOAD="$SRV/.site-deploy-reload-pending"
 if [ "$LOCAL" = "$REMOTE" ] && [ ! -f "$PENDING_RELOAD" ]; then
   exit 0                                     # up to date -> silent no-op
 fi
+# The marker's content is the verb the unfinished deploy needed, if it was not
+# the configured one: a deploy that changed uv.lock needs a restart (below), and
+# a resumed tick has no diff left to rediscover that from.
+RESUME_VERB=""
 if [ "$LOCAL" = "$REMOTE" ]; then
-  log "resuming an unfinished deploy of ${LOCAL:0:9}"
+  RESUME_VERB=$(tr -d '[:space:]' < "$PENDING_RELOAD")
+  log "resuming an unfinished deploy of ${LOCAL:0:9}${RESUME_VERB:+ ($RESUME_VERB)}"
+fi
+
+# Recover from a uv.lock that something re-locked in place. Every `uv run` in
+# this script carries --frozen, but that cannot stop an operator pasting an
+# unflagged one from a runbook, and a box that is ALREADY dirty is not helped
+# by prevention: the ff-only merge below refuses every two minutes forever,
+# with a journal line nobody reads as the only symptom. Discarding is
+# unambiguously right — uv.lock is committed, so a working copy that differs
+# from HEAD was written by a machine, and we are about to install from it.
+# The named file, never `git checkout .`: an operator's in-place hotfix must
+# not vanish with no log line.
+if [ -n "$(git status --porcelain -- uv.lock)" ]; then
+  log "uv.lock is MODIFIED in the checkout — something ran uv without --frozen; discarding it"
+  git checkout -- uv.lock || log "could not restore uv.lock; the sync below will install from it as-is"
 fi
 
 # Only deploy when upstream is STRICTLY ahead (local is an ancestor of remote). If local is ahead
@@ -169,11 +213,29 @@ if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -n "$(git diff --name-only "$LOCAL" "
 fi
 
 # 2. Fast-forward only (guaranteed by the ancestor check; --ff-only is belt-and-braces).
+# A dependency change is a RESTART, not a reload. On SIGHUP gunicorn's arbiter
+# re-forks its workers but never re-execs itself: it keeps the interpreter, the
+# gunicorn and every module it imported before the first fork. Application code
+# IS re-imported after the fork, which is why an ordinary deploy works at all
+# and exactly what makes this hard to see — the wheels are installed, the app
+# is new, and the server underneath it is whatever was running at boot. Decided
+# before the merge (the diff is gone after) and remembered in the marker (a
+# resumed tick has no diff at all). -F, not a pattern: `uv.lock` as a regex
+# also matches `uvXlock`.
+LOCK_CHANGED=""
+if git diff --name-only "$LOCAL" "$REMOTE" | grep -qxF uv.lock; then LOCK_CHANGED=1; fi
+
 git merge --ff-only --quiet '@{u}' || { log "fast-forward merge failed (drift) — manual fix needed"; exit 1; }
-touch "$PENDING_RELOAD"   # cleared once the reload is verified healthy (see step 5)
+# Cleared once the reload is verified healthy (see step 5). Content = the verb
+# this deploy needs, when it is not the configured one.
+if [ -n "$LOCK_CHANGED" ]; then echo restart > "$PENDING_RELOAD"; else : > "$PENDING_RELOAD"; fi
 
 # Re-read: this deploy may have just changed it.
 load_site_config fatal
+if [ -n "$LOCK_CHANGED" ] || [ "$RESUME_VERB" = restart ]; then
+  [ "$RELOAD" = restart ] || log "uv.lock changed -> restart, not $RELOAD (a reload cannot re-exec the arbiter)"
+  RELOAD=restart
+fi
 
 # 3. Sync deps (frozen). On failure, stop BEFORE the reload.
 # shellcheck disable=SC2086
@@ -188,10 +250,52 @@ $UV sync $UV_ARGS || { log "uv sync failed; NOT reloading"; exit 1; }
 # then rename. The rename is atomic, so no request is ever served a half-written
 # stylesheet.
 if [ -f static/src.css ]; then
+  # Exit status is necessary but NOT sufficient. tailwindcss exits 0 with a
+  # drastically smaller stylesheet when an @source path does not resolve — a
+  # mistyped path is byte-identical to declaring no sources at all — and the
+  # size canary below has uneven reach: on an app whose src.css is mostly
+  # hand-written CSS the loss is a few percent, well inside the ratio. So every
+  # declared `@source "…"` is checked against the filesystem first, at its
+  # literal prefix (the part a typo lands in). `^@source` anchors past prose
+  # that discusses @source inside CSS comments. `@source not "…"` and
+  # `@source inline("…")` mean something else and are REPORTED rather than
+  # silently skipped: two parsers of one syntax will drift, and the count
+  # comparison is what stops drift becoming silence. Zero @source lines is
+  # deliberately fine — the size floor covers that.
+  declared=$(sed -n 's/^@source[[:space:]]\{1,\}"\([^"]*\)".*/\1/p' static/src.css)
+  n_lines=$(grep -c '^@source' static/src.css || true)
+  n_parsed=$(printf '%s' "$declared" | grep -c . || true)
+  if [ "$n_lines" != "$n_parsed" ]; then
+    log "static/src.css has an @source form this check does not model ($n_lines declared, $n_parsed parsed); NOT building, NOT reloading"
+    exit 1
+  fi
+  while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    lit=$src
+    # shellcheck disable=SC1083
+    case $src in *[][*?{]*) lit=${src%%[][*?{]*}; lit=${lit%/*};; esac
+    [ -n "$lit" ] || lit=.
+    if [ ! -e "static/$lit" ]; then
+      log "@source \"$src\" does not resolve on this box (static/$lit is missing) — tailwindcss would exit 0 with an unstyled site; NOT building, NOT reloading"
+      exit 1
+    fi
+  done <<EOF_SOURCES
+$declared
+EOF_SOURCES
+
+  # TAILWINDCSS_VERSION (site.toml `tailwindcss_version`) pins the compiler:
+  # pytailwindcss downloads releases/latest on first use with it unset, so the
+  # stylesheet every visitor gets is otherwise compiled by whichever version
+  # upstream had published when that box's venv was created.
+  [ -n "${TAILWINDCSS_VERSION:-}" ] || log "WARNING tailwindcss_version is not pinned in deploy/site.toml"
   CSS_TMP=$(mktemp "static/.app.css.XXXXXX")
   # shellcheck disable=SC2064
   trap "rm -f '$CSS_TMP'" EXIT
-  $UV run tailwindcss -i static/src.css -o "$CSS_TMP" --minify \
+  # --frozen --no-dev: an unflagged `uv run` re-locks uv.lock inside the
+  # checkout on a pyproject/lock mismatch and wedges this very poller on
+  # `git merge --ff-only` forever. This is the site a grep for "uv run"
+  # misses, because it is spelled $UV.
+  $UV run --frozen --no-dev tailwindcss -i static/src.css -o "$CSS_TMP" --minify \
     || { log "css build failed; NOT reloading"; exit 1; }
   NEW_BYTES=$(wc -c < "$CSS_TMP")
   if [ "$NEW_BYTES" -lt 1024 ]; then

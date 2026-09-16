@@ -23,7 +23,7 @@ ROOT=$(cd "$HERE/.." && pwd)
 
 fails=0
 pass() { echo "  ok   $1"; }
-fail() { echo "  FAIL $1"; fails=$((fails + 1)); }
+fail() { echo "  FAIL $1"; fails=$((fails + 1)); [ -s "$T/out.txt" ] && sed 's/^/         | /' "$T/out.txt" | tail -8; }
 check() { local desc=$1; shift; if "$@"; then pass "$desc"; else fail "$desc"; fi; }
 
 T=$(mktemp -d)
@@ -52,7 +52,8 @@ cat > "$T/bin/uv" <<'STUB'
 #!/usr/bin/env bash
 echo "uv $*" >> "$STUB_LOG"
 if [ "${1:-}" = "sync" ]; then [ -n "${STUB_FAIL_UV:-}" ] && exit 1; exit 0; fi
-if [ "${1:-}" = "run" ] && [ "${2:-}" = "tailwindcss" ]; then
+if [ "${1:-}" = "run" ] && printf '%s\n' "$@" | grep -qx tailwindcss; then
+  echo "tailwindcss-version=${TAILWINDCSS_VERSION:-unset}" >> "$STUB_LOG"
   [ -n "${STUB_FAIL_CSS:-}" ] && exit 1
   out=""; prev=""
   for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
@@ -69,6 +70,11 @@ case "$*" in
   *purge_cache*) printf '{"success":true}\n200\n'; exit 0 ;;
 esac
 if [ -n "${STUB_HEALTH_FAIL:-}" ]; then exit 22; fi
+# A non-2xx answer: real curl prints the body and exits 0, unless -f is given,
+# in which case it prints nothing and exits 22.
+if [ -n "${STUB_HEALTH_STATUS:-}" ] && [ "$STUB_HEALTH_STATUS" -ge 400 ]; then
+  if printf '%s\n' "$@" | grep -qxE -- '-f|-fsS|-fs|-sf|-sSf'; then exit 22; fi
+fi
 printf '%s' "${STUB_HEALTH_BODY:-{\"status\":\"ok\"}}"
 exit 0
 STUB
@@ -300,6 +306,94 @@ reset_log; run_deploy CONVERGE_CMD=env
 check "exit 0"                    [ "$(rc)" = 0 ]
 check "converged"                 called "CONVERGE RAN"
 check "reloaded"                  called "systemctl restart app"
+
+# ── latent bugs surfaced by comparing against the monorepo's poller ──────────
+echo "13a. the CSS build runs uv with --frozen --no-dev"
+# An unflagged `uv run` re-locks uv.lock in the checkout on a pyproject/lock
+# mismatch, after which every ff-only merge fails forever as "drift".
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "reload"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\nconverge = true\n' > deploy/site.toml
+  git commit -qam "back to reload"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "frozen, no-dev"             called "uv run --frozen --no-dev tailwindcss"
+
+echo "13b. a deploy that changes uv.lock RESTARTS instead of reloading"
+# SIGHUP re-forks workers under the interpreter and gunicorn the arbiter was
+# started with; only a restart execs the newly synced ones.
+( cd "$WORK" || exit 1; echo "version = 1" > uv.lock; git add uv.lock; git commit -qm "add lock"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "restarted"                  called "systemctl restart app"
+check "did not merely reload"      not_called "systemctl reload app"
+check "said why"                   grep -q "uv.lock" "$T/out.txt"
+
+echo "13c. a uv.lock re-locked in place on the box is discarded, not deployed over"
+( cd "$WORK" || exit 1; echo "version = 2" > uv.lock; git commit -qam "bump lock"; git push -q origin master )
+echo "machine-written" >> "$SRV/uv.lock"
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "merged the new lock"        [ "$(cat "$SRV/uv.lock")" = "version = 2" ]
+check "said it discarded"          grep -qi "uv.lock is MODIFIED" "$T/out.txt"
+check "restarted"                  called "systemctl restart app"
+
+echo "13d. with health_match set the BODY is the datum: a 503 whose body matches is up"
+# /health on a snapshot-backed app answers 503 on a stale snapshot while serving
+# every page. A `-f` probe would call it down, skip the purge, and strand the
+# deploy's templates at the edge for a full TTL.
+push_commit c13d; reset_log; run_deploy CONVERGE_CMD=env STUB_HEALTH_STATUS=503
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "purged"                     called "purge_cache"
+
+echo "13e. with NO health_match the status code is the datum: a 503 is down"
+# Also pins that a knob REMOVED by the deploying commit is really gone: the
+# pre-merge read of the old site.toml must not leave health_match exported.
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "reload"\nport = 8000\nhealth_path = "/health"\nhealth_tries = 2\nconverge = true\n' > deploy/site.toml
+  git commit -qam "no match"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env STUB_HEALTH_STATUS=503
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "did not purge"              not_called "purge_cache"
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "reload"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\nconverge = true\ntailwindcss_version = "4.3.3"\n' > deploy/site.toml
+  git commit -qam "match + pin"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env     # resume the refused deploy, and take the pin
+
+echo "13f. tailwindcss_version in site.toml pins the compiler"
+# pytailwindcss downloads releases/latest with the variable unset: the
+# stylesheet every visitor gets is then compiled by whichever version upstream
+# had published when that box's venv was created.
+check "pin reached the build"      called "tailwindcss-version=4.3.3"
+
+echo "13g. an @source that does not resolve on this box refuses the build"
+# tailwindcss exits 0 with a near-empty stylesheet when a source path is
+# mistyped, and the ratio guard alone misses apps whose src.css is mostly
+# hand-written CSS.
+( cd "$WORK" || exit 1; printf '@import "tailwindcss" source(none);\n@source "../templates/**/*.html";\n' > static/src.css
+  git commit -qam "declare a source"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "did not build"              not_called "tailwindcss"
+check "did not reload"             not_called "systemctl reload app"
+check "named the source"           grep -q "templates" "$T/out.txt"
+
+echo "13h. once the source exists the same commit deploys"
+( cd "$WORK" || exit 1; mkdir -p templates; touch templates/x.html; git add -A; git commit -qm "add templates"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "built"                      called "tailwindcss"
+check "reloaded"                   called "systemctl reload app"
+
+echo "13i. an @source form the check does not model is reported, not skipped"
+( cd "$WORK" || exit 1; printf '@import "tailwindcss" source(none);\n@source "../templates/**/*.html";\n@source not "../vendor";\n' > static/src.css
+  git commit -qam "unmodelled source"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "said unmodelled"            grep -qi "does not model" "$T/out.txt"
+( cd "$WORK" || exit 1; printf '@import "tailwindcss" source(none);\n@source "../templates/**/*.html";\n' > static/src.css
+  git commit -qam "fix source"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "recovers"                   [ "$(rc)" = 0 ]
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
