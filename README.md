@@ -120,9 +120,38 @@ health_path  = "/health"           # probed on 127.0.0.1:$port after the reload
 health_match = '"ok"'              # a 200 from a half-booted worker is not health
 cf_zone_id   = "..."               # non-secret half of the purge
 tailwindcss_version = "4.3.3"      # apps with static/src.css: pin the compiler (see below)
+# deploy_ref = "ci-green"          # deploy the TESTED ref, not the tip of master (see below)
 # build_service = "<app>-build.service"   # snapshot-backed apps only
 # converge      = true                    # apply deploy/ to the box each tick (see below)
 ```
+
+### `deploy_ref`: deploy the tested ref, not the tip of master
+
+A push to `master` reaches the box within two minutes, so every safety property otherwise rests on
+a human running the tests before merging. If the app's CI fast-forwards a `ci-green` ref only after
+a green run on `master` (a ~15-line job; this repo's own `tests.yml` is the template), then
+`deploy_ref = "ci-green"` makes the box fast-forward onto that ref instead. The clone keeps
+`master` checked out; only what is compared and merged changes.
+
+- **No fallback if the ref is missing.** A gate that opens when it cannot find its own lock is not
+  a gate. The poller refuses, loudly, every tick, and the dead-man gets `/fail`.
+- **A ref that stops moving is not "where the box should be."** While `master` is ahead, the
+  poller logs how far behind the ref is; once the ref has not moved for an hour (`REF_FROZEN_SECONDS`),
+  a level tick sends `/fail` instead of the root ping. A busy day of green merges never trips it.
+- **Emergency override:** a ref name in `/etc/<app>/deploy-ref` wins over site.toml (write
+  `master` when CI itself is broken). Deliberately a file, not a converged setting.
+- The fetch uses an explicit `+refs/heads/*` refspec, so a `--single-branch` clone cannot starve
+  the ref, and `--prune`, so a deleted ref cannot pass the existence check from a stale copy.
+- The ref is read from site.toml *before* the fetch (it decides what to fetch), so a commit that
+  changes `deploy_ref` governs the next deploy, not its own.
+
+### The reload contract
+
+`reload = "reload"` is `systemctl reload <app>`, i.e. the unit's `ExecReload=`. A unit with none
+makes the verb a silent no-op: every deploy "succeeds" while the old workers keep serving, which is
+how one box ran for months. And gunicorn's SIGHUP re-imports the app only when `preload_app` is
+False. The poller checks both after converge and before the verb, and refuses with the fix named.
+`reload = "restart"` needs neither.
 
 ### The health contract
 
