@@ -1,0 +1,16 @@
+# Daily dry-run: reports what cf-converge.py WOULD change for %i without
+# writing, so a hand-edit at the Cloudflare dashboard is caught even on a day
+# nobody deploys. A diff is itself the alertable condition (see
+# bin/cf-converge-run.sh) -- pings HEALTHCHECKS_CF_DRIFT_URL (/etc/%i/cf-env)
+# if set, /fail on either a reported diff or a reconciler failure.
+[Unit]
+Description=Report Cloudflare config drift for %i (dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/%i/cf-env
+ExecStart=/srv/site-deploy/bin/cf-converge-run.sh %i --dry-run
+TimeoutStartSec=2min
+Nice=19

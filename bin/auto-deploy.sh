@@ -336,6 +336,17 @@ if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -n "$(git diff --name-only "$LOCAL" "
   SCHEMA_CHANGED=1
 fi
 
+# Same idea for the Cloudflare zone config: dispatch cf-converge@$APP.service
+# (root, out of the toolkit, --no-block so a slow Cloudflare API never delays
+# this reload) only when this deploy actually touched it -- not every tick,
+# since an API round-trip is not something a 2-minute poller should pay for
+# when nothing declared changed. cf-drift@.timer is the daily backstop for
+# drift from a hand-edit at the dashboard.
+CF_CHANGED=
+if [ -n "$(git diff --name-only "$LOCAL" "$REMOTE" -- deploy/cloudflare.json)" ]; then
+  CF_CHANGED=1
+fi
+
 # 2. Fast-forward only (guaranteed by the ancestor check; --ff-only is belt-and-braces).
 # A dependency change is a RESTART, not a reload. On SIGHUP gunicorn's arbiter
 # re-forks its workers but never re-execs itself: it keeps the interpreter, the
@@ -538,6 +549,11 @@ fi
 
 rm -f "$PENDING_RELOAD"
 SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
+if [ -n "$CF_CHANGED" ]; then
+  log "deploy/cloudflare.json changed -> dispatching cf-converge@$APP.service"
+  $RELOAD_CMD start --no-block "cf-converge@$APP.service" \
+    || log "could not start cf-converge@$APP.service (edge config convergence will retry via cf-drift@.timer)"
+fi
 # If the deploy changed the snapshot builder, also rebuild — its --reload-service swaps the new
 # snapshot in atomically and runs its own cf-purge when done.
 if [ -n "$SCHEMA_CHANGED" ]; then
