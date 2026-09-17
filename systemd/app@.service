@@ -1,0 +1,69 @@
+# Reference gunicorn unit for an app on this fleet. %i is the app name, the
+# service user, /srv/%i and /etc/%i/env — the same instance-name convention
+# every other unit in this toolkit uses. NOT installed or converged
+# automatically: an app already has its own unit (this is where it usually
+# started). Copy it into the app's own systemd/, rename the instance or keep
+# it as app@<app>.service, and adjust the entry point, PORT and --workers.
+#
+# Promoted from renavon-monorepo's dataguru@.service.
+[Unit]
+Description=%i app server (gunicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=%i
+Group=%i
+WorkingDirectory=/srv/%i
+EnvironmentFile=/etc/%i/env
+# --workers: tune to the box's RAM, not left as a default — a small droplet
+# OOM'd in production running more workers than it could support. Measure,
+# then hardcode; do not compute it from nproc on a shared or burstable box.
+#
+# --no-control-socket: gunicorn <26.1.0 leaked one thread and one listening
+# socket per reload whenever a control socket was reachable — and it was,
+# because HOME=/srv/%i and /srv/%i is in ReadWritePaths= below. Fixed
+# upstream in 26.1.0 (pin `gunicorn>=26.1.0` in pyproject.toml), but the flag
+# earns its place independent of the leak: nothing on this fleet invokes
+# `gunicornc`, so the socket is pure cost, and it also narrows the
+# post-SIGHUP window in which old workers still accept connections from
+# ~2s down to ~70ms — which matters to the reload/purge race
+# CF_PURGE_SETTLE (bin/cf-purge.sh) exists to bound.
+ExecStart=/usr/local/bin/uv run --frozen --no-dev gunicorn app.main:app \
+  --bind 127.0.0.1:${PORT} --workers 2 \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --timeout 60 --graceful-timeout 25 --keep-alive 5 \
+  --no-control-socket \
+  --access-logfile -
+# Graceful worker rotation on `systemctl reload`: relied on by both
+# bin/auto-deploy.sh's DEPLOY_RELOAD=reload path and by site-build@.service's
+# post-build reload. SIGHUP re-forks workers without dropping the arbiter, so
+# in-flight requests finish on the old workers while new ones open whatever
+# the deploy or build just changed.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ProtectHostname=yes
+ProtectClock=yes
+# The checkout and this app's writable runtime state (a snapshot dir, a
+# ledger database — whatever the app itself owns under /var/lib/%i).
+ReadWritePaths=/srv/%i /var/lib/%i
+
+[Install]
+WantedBy=multi-user.target

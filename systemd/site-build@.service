@@ -1,0 +1,99 @@
+# Reference build unit for a snapshot-backed app (DEPLOY_BUILD_SERVICE in
+# deploy/site.toml — see bin/auto-deploy.sh). %i is the app name. NOT
+# installed or converged automatically: copy it, replace ExecStart with the
+# app's own build entry point, and set DEPLOY_BUILD_SERVICE to the copy's
+# real unit name.
+#
+# The ExecStart is the part that varies per app. The ExecStopPost chain below
+# does not, and is the reason this file exists: reload the app onto the new
+# build, then Cloudflare-purge — and skip the purge (loudly) if the reload
+# failed, because purging while the origin still serves the OLD build just
+# refills the edge from stale content on a fresh TTL.
+#
+# Promoted from renavon-monorepo's dataguru-build@.service, one incident at a
+# time (each referenced below); every trap it records is preserved because
+# each one already broke a build silently once.
+[Unit]
+Description=%i build/rebuild
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+WorkingDirectory=/srv/%i
+EnvironmentFile=/etc/%i/env
+# Replace with the app's own build command (a `data/build_db.py`, a
+# `pg_dump`-then-restore, whatever produces the new state and promotes it —
+# typically an atomic symlink/rename swap so a reader never sees a partial
+# write).
+ExecStart=/usr/local/bin/uv run --frozen --no-dev python data/build_db.py
+# Generous cap: an I/O-bound rebuild can run for hours. Nice/OOMScoreAdjust so
+# the build yields to (and dies before) the live app under memory pressure —
+# it just retries on the next timer fire.
+TimeoutStartSec=4h
+Nice=19
+OOMScoreAdjust=500
+
+# --- 1. reload, privileged, gated, and its result recorded for step 2 ------
+# NO --reload-service / sudo here: sudo cannot work under NoNewPrivileges=yes
+# below ("the no new privileges flag is set"), so a build script that shells
+# out to `sudo systemctl reload` fails that call silently and the app keeps
+# serving the OLD build until an unrelated deploy happens to reload it. The
+# reload is this `+`-prefixed ExecStopPost instead — systemd runs a `+` step
+# with full privileges regardless of User=/NoNewPrivileges=.
+#
+# The leading `-` is load-bearing and independent of the `+` (systemd.service(5)
+# allows prefixes in either order; `-+` is the spelling used here). systemd
+# stops running ExecStopPost= at the FIRST one that fails unless it is
+# `-`-prefixed — so without it, a failed reload would silently skip step 3
+# (the purge) ENTIRELY, along with the only line that says the reload failed.
+#
+# The marker file is the ONLY channel between this step and step 2/3: they are
+# separate processes, and `+` runs this one outside the unit's mount
+# namespace. A file under ReadWritePaths= is what a later sandboxed
+# ExecStopPost can still see (a RuntimeDirectory= would not work here — that
+# gives the reader a private, empty instance instead). Cleared UNCONDITIONALLY
+# first, so a marker left by a previous run, or by a box that lost power
+# mid-build, can never wedge tonight's purge.
+ExecStopPost=-+/bin/sh -c 'rm -f /var/lib/%i/.post-build-reload-failed; [ "$SERVICE_RESULT" = success ] || exit 0; /usr/bin/systemctl reload %i && exit 0; echo "site-build[%i]: post-build reload FAILED; still serving the OLD build" >&2; : > /var/lib/%i/.post-build-reload-failed || echo "site-build[%i]: could not write the failure marker, so the purge below cannot be suppressed" >&2; exit 1'
+
+# --- 2. tell healthchecks the night went wrong, unprivileged, best-effort --
+# SERVICE_RESULT ALONE is not enough: it reports how ExecStart ended, not how
+# this whole chain ends. A build that SUCCEEDS with a reload that then FAILS
+# still reads SERVICE_RESULT=success — hence the marker check as well.
+# `-` (never `+`): this step only reads state (EnvironmentFile= and outbound
+# network both work fine in an unprivileged, sandboxed ExecStopPost), and
+# there is no reason to run it, or let it fail the chain, as root.
+#
+# `$$NAME` here is NOT decoration: `${NAME}` is resolved by SYSTEMD itself,
+# before the shell ever sees it, and a shell parameter expansion
+# (`${HEALTHCHECKS_BUILD_URL%/}`) is not a valid variable name to systemd —
+# it silently evaluates to the EMPTY STRING (one journal line, easy to miss),
+# so a single `$` here disarms this ping on every app, permanently. `$$` is
+# what reaches the shell as a literal `$`, for the shell (not systemd) to
+# expand. Likewise `%` is a systemd SPECIFIER: an unknown one does not error,
+# it makes systemd drop the WHOLE ExecStopPost directive silently — so any
+# free-text English added to a message below must not contain a bare `%`
+# (write `%%` for a literal percent).
+ExecStopPost=-/bin/sh -c '[ -n "$$HEALTHCHECKS_BUILD_URL" ] || exit 0; if [ "$SERVICE_RESULT" = success ] && [ ! -e /var/lib/%i/.post-build-reload-failed ]; then exit 0; fi; r="build result $SERVICE_RESULT"; [ ! -e /var/lib/%i/.post-build-reload-failed ] || r="build OK but the post-build reload FAILED -- still serving the OLD build"; /usr/bin/curl -fsS -o /dev/null --max-time 10 --retry 2 --retry-delay 1 --retry-max-time 20 --data-raw "site-build[%i]: $$r" "$${HEALTHCHECKS_BUILD_URL%/}/fail" || echo "site-build[%i]: could NOT ping healthchecks /fail ($$r)" >&2'
+
+# --- 3. purge, gated on the marker, LAST so its exit 1 can fail the unit ---
+# Purging while the reload above failed would flush the edge and refill it
+# from the OLD build on a fresh full TTL — the opposite of what a purge is
+# for. This is the last ExecStopPost (no `-`), which is what lets it exit 1:
+# nothing is left for systemd to skip, and that non-zero status is what puts
+# the unit in `failed`, so `systemctl --failed` still shows the problem even
+# on an app with no HEALTHCHECKS_BUILD_URL (for which step 2 is a no-op).
+ExecStopPost=/bin/sh -c '[ ! -e /var/lib/%i/.post-build-reload-failed ] || { echo "site-build[%i]: NOT purging Cloudflare -- the post-build reload above failed, so the origin still serves the OLD build and a purge would refill the whole edge from it. Fix: systemctl status %i, then reload and purge by hand." >&2; exit 1; }; exec /srv/site-deploy/bin/cf-purge.sh'
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/srv/%i /var/lib/%i
+
+[Install]
+WantedBy=multi-user.target
