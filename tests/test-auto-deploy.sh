@@ -576,6 +576,20 @@ check "said why"                   grep -qi "host-converge" "$T/out.txt"
 reset_log; run_deploy
 check "resumes once fixed"         called "systemctl reload app"
 
+echo "18. deploy/cloudflare.json changing in the ff range dispatches cf-converge@app.service, --no-block"
+mkdir -p "$WORK/deploy"
+( cd "$WORK" || exit 1; echo '{"ssl_mode":"strict"}' > deploy/cloudflare.json; git add -A; git commit -qm "cf json"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "dispatched"                 called "systemctl start --no-block cf-converge@app.service"
+
+echo "19. an ordinary deploy that does not touch it never dispatches cf-converge"
+push_commit c19
+( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "not dispatched"             not_called "cf-converge@app.service"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))

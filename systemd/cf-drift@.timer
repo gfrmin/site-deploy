@@ -1,0 +1,14 @@
+# Daily, plus a boot run. Persistent=true: the job is idempotent (dry-run,
+# writes nothing), so a missed day (box was off) should catch up rather than
+# silently skip a day's check.
+[Unit]
+Description=Daily Cloudflare drift report for %i
+
+[Timer]
+OnBootSec=15min
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

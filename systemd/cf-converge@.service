@@ -1,0 +1,21 @@
+# Converge %i's Cloudflare zone config (SSL mode, A records, cache/WAF/rate-
+# limit rules) to what its deploy/cloudflare.json declares. Root: reads the
+# app's cf-env secret and the toolkit's own bin/cf-converge.py, neither of
+# which the service user should need write access to make it write to Cloudflare.
+#
+# Started --no-block by the poller when a deploy's fast-forward range touches
+# deploy/cloudflare.json (see bin/auto-deploy.sh) -- not on every tick, since
+# a Cloudflare API round-trip is not something a 2-minute poller should pay
+# for when nothing declared changed. cf-drift@.timer is the daily backstop
+# for drift introduced by hand at the dashboard, on days nobody deploys.
+[Unit]
+Description=Converge %i's Cloudflare zone config
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/%i/cf-env
+ExecStart=/srv/site-deploy/bin/cf-converge-run.sh %i
+TimeoutStartSec=2min
+Nice=19

@@ -82,11 +82,15 @@ bin/host-converge.sh converge the box below the app every tick: units, grants, j
 bin/install.sh       bootstrap: root-own the toolkit, first host-converge, env-check (admin, once)
 bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
 bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's current ranges (root)
+bin/cf-converge.py   converge one zone's Cloudflare config (SSL/DNS/cache/WAF/rate-limit) to deploy/cloudflare.json
+bin/cf-converge-run.sh root wrapper: derives the domain + the box's public IP, calls cf-converge.py
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
 systemd/site-probe@.service , site-probe@.timer            per-app active probe (every 5 min)
 systemd/site-checks-armed@.service , site-checks-armed@.timer   alarm-armed sweep (every 15 min)
 systemd/ufw-cloudflare-sync.service , ufw-cloudflare-sync.timer   daily Cloudflare range sync (root)
+systemd/cf-converge@.service   applies deploy/cloudflare.json, dispatched by the poller on change (root)
+systemd/cf-drift@.service , cf-drift@.timer   daily dry-run drift report for cloudflare.json (root)
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt, and the files host-converge installs
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
@@ -129,6 +133,7 @@ port         = 8000
 health_path  = "/health"           # probed on 127.0.0.1:$port after the reload
 health_match = '"ok"'              # a 200 from a half-booted worker is not health
 cf_zone_id   = "..."               # non-secret half of the purge
+cf_domain    = "example.com"       # apex domain for cf-converge.py (see below); non-secret
 tailwindcss_version = "4.3.3"      # apps with static/src.css: pin the compiler (see below)
 # deploy_ref = "ci-green"          # deploy the TESTED ref, not the tip of master (see below)
 # build_service = "<app>-build.service"   # snapshot-backed apps only
@@ -250,6 +255,74 @@ a commit that changes it governs its own deploy rather than the next one. A malf
 *after* the merge and merely a warning before it, or the file that breaks the deploy would deadlock
 the very commit that fixes it.
 
+### Cloudflare as code: `bin/cf-converge.py`
+
+Desired zone state lives in the app's own `deploy/cloudflare.json`, reviewed the same way as any
+other repo change, and converged the same way anything else here is: automatically, idempotently,
+and silently when nothing changed. Without this, a zone's SSL mode, its A records and its cache/WAF/
+rate-limit rules are applied by hand from committed JSON — so a change in git reaches Cloudflare
+only if a human remembers to curl it, which is how a cache rule can go missing on a zone while it
+looks, from the origin, perfectly cacheable.
+
+```json
+{
+  "ssl_mode": "strict",
+  "dns": {"a_records": [{"name": "@", "proxied": true}, {"name": "www", "proxied": true}]},
+  "cache_rules": [{"action": "set_cache_settings", "expression": "...", "enabled": true}],
+  "waf_custom_rules": [],
+  "rate_limit_rules": []
+}
+```
+
+- **Absent means "this repo does not manage that phase"**; `[]` means "this phase must hold no
+  rules". Each of the three rule phases is the declared list, in full — reconciling **is** replacing
+  the phase entrypoint, not diffing rule-by-rule.
+- **`__PUBLIC_IP__`** in any rule's text is substituted with the box's own derived public IP before
+  comparison, so a WAF exemption for the box itself (`bin/cf-purge-verify.sh` fetches the public URL
+  back *through* Cloudflare on every build) can be written once and stay correct as the box moves. An
+  unresolved placeholder — including an *underivable* IP — **aborts that phase** rather than shipping
+  a rule whose exemption silently never matches.
+- **Phases are isolated**: one bad WAF expression fails only that phase; SSL, DNS and the other rule
+  phases still converge, and the exit status still reflects the failure.
+- **Dry-run is the default.** `--apply` is required to write anything.
+
+**Shared zones — `rule_scope`.** Two apps can sit on subdomains of one Cloudflare zone. Without
+opting in, each app's declared rule list would delete the other's rules on its very next tick — the
+declared list *is* the phase, whole. Add a top-level key to opt one app's phases into naming their
+own rules instead of owning the phase outright:
+
+```json
+{"rule_scope": {"host": "a.example", "shared_with": ["b.example"]}}
+```
+
+A phase then owns exactly the declared rules whose `expression` names `host`; any declared rule that
+does not is refused and reported, never applied under the wrong scope. Rules found live that name
+some *other* host are left untouched, in their original relative position — only the previously-owned
+rules are replaced, as a block. A rule naming both this scope's host and a host outside
+`shared_with` is ambiguous: refused and reported by name, same as one naming no scoped host at all.
+`shared_with` is the "we agreed to co-own this one" escape hatch.
+
+**Units.** `cf-converge@.service` (root, `--apply`) is started `--no-block` by the poller when a
+deploy's fast-forward range touches `deploy/cloudflare.json` — not every tick, since an API
+round-trip is not something a 2-minute poller should pay for when nothing declared changed.
+`cf-drift@.timer` runs the same reconciler in dry-run daily, so a hand-edit at the dashboard is
+caught even on a day nobody deploys; a reported diff pings `HEALTHCHECKS_CF_DRIFT_URL` the same way
+a failure would, because drift **is** the failure mode that check exists to catch. Both are armed by
+`host-converge.sh` iff `deploy/cloudflare.json` exists and `CF_CONFIG_TOKEN` is set in
+`/etc/<app>/cf-env` — a declared file with no token nags instead (Cloudflare-as-code itself is
+opt-in, so its total absence is not a nag).
+
+`bin/cf-converge-run.sh` is the root wrapper the units call: it resolves the apex domain (site.toml's
+`cf_domain`, or `CF_DOMAIN` in `cf-env`) and the box's own public IP (an override in
+`/etc/site-deploy/host.env`, then cloud metadata, then an outbound echo — empty is safe, it just
+leaves A-record content and any `__PUBLIC_IP__` rule untouched) and calls the pure, tested
+`cf-converge.py` with them.
+
+`CF_CONFIG_TOKEN` — a **single-zone** scoped token with DNS + cache-settings + zone-settings + WAF
+edit and nothing else, notably not cache-purge (that is `CF_CACHE_PURGE_TOKEN`, used by
+`bin/cf-purge.sh`) — lives in root-only `/etc/<app>/cf-env`, never in `/etc/<app>/env`: the poller
+runs as the service user and has no business reading a token that can rewrite the zone's firewall.
+
 ## Monitoring: two checks per app, and why neither is enough alone
 
 Nothing here reports a success it has not verified, and a missing dead-man does not fail — it
@@ -321,6 +394,11 @@ DEPLOY_UV_ARGS=--frozen --no-dev   # or just: --frozen
 # PROBE_URL=... / HEALTHCHECKS_PROBE_URL=...  # active probe (see Monitoring)
 ```
 
+`/etc/<app>/cf-env` (root:root 0440, separate file — the service user reads `env` but not this) holds
+`CF_CONFIG_TOKEN` for `bin/cf-converge.py` (see "Cloudflare as code" above): a single-zone token
+that can rewrite DNS/WAF/cache is a different blast radius than the cache-purge token above it, and
+the poller that reads `env` every two minutes has no business reading it.
+
 ## Bootstrap (per box, one-time)
 ```bash
 APP=<app>
@@ -348,6 +426,8 @@ when current and loud when it refuses.
 ./tests/test-checks-armed.sh
 ./tests/test-host-converge.sh
 ./tests/test-ufw-cloudflare-sync.sh
+./tests/test-cf-converge.sh
+./tests/test-cf-converge-run.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,

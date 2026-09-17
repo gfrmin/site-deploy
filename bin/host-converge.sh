@@ -102,6 +102,7 @@ tmp_sudo=$(mktemp)
   echo "# Managed by site-deploy host-converge — edits on the box are overwritten each tick."
   echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $APP, /usr/bin/systemctl restart $APP"
   [ -n "$build_svc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
+  echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
   echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/host-converge.sh $APP"
   echo "$APP ALL=(root) NOPASSWD: /srv/$APP/deploy/converge.sh"
 } > "$tmp_sudo"
@@ -243,6 +244,20 @@ else
 fi
 [ -n "$(envval HEALTHCHECKS_DEPLOY_URL "$APP_ETC/env")" ] \
   || say "HEALTHCHECKS_DEPLOY_URL not set in $APP_ETC/env — deploys on this box are UNMONITORED"
+
+# Cloudflare-as-code is opt-in (most apps have no cloudflare.json at all), so
+# unlike PROBE/DEPLOY monitoring there is no nag for its absence — only for a
+# declared cloudflare.json with no token to converge it, which IS a gap.
+if [ -f "$SRV/deploy/cloudflare.json" ]; then
+  if [ -n "$(envval CF_CONFIG_TOKEN "$APP_ETC/cf-env")" ]; then
+    arm "cf-drift@$APP.timer" "cloudflare.json + CF_CONFIG_TOKEN set" rearm
+  else
+    disarm "cf-drift@$APP.timer" "CF_CONFIG_TOKEN not set in $APP_ETC/cf-env"
+    say "deploy/cloudflare.json declared but CF_CONFIG_TOKEN not set in $APP_ETC/cf-env — Cloudflare config on this box is NOT CONVERGED"
+  fi
+else
+  disarm "cf-drift@$APP.timer" "no deploy/cloudflare.json"
+fi
 
 # --- 10. apply ------------------------------------------------------------------------------
 if [ "$units_changed" = 1 ]; then

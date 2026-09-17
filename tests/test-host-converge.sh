@@ -157,6 +157,19 @@ check "armed"                           [ -e "$STUB_UNITS/site-checks-armed@app.
 rm "$HR/etc/app/ops-env"; reset_log; run
 check "disarmed"                        [ ! -e "$STUB_UNITS/site-checks-armed@app.timer.enabled" ]
 
+echo "6b. cf-converge: a sudoers grant always exists; cloudflare.json + a token arms cf-drift@app.timer"
+check "cf-converge start grant present" grep -q "cf-converge@app.service" "$HR/etc/sudoers.d/app-deploy"
+check "cf-drift NOT armed (no cloudflare.json)" [ ! -e "$STUB_UNITS/cf-drift@app.timer.enabled" ]
+: > "$HR/srv/app/deploy/cloudflare.json"
+reset_log; run
+check "still not armed (no token)"      [ ! -e "$STUB_UNITS/cf-drift@app.timer.enabled" ]
+check "said not converged"              grep -qi "NOT CONVERGED" "$T/out.txt"
+echo "CF_CONFIG_TOKEN=t" > "$HR/etc/app/cf-env"
+reset_log; run
+check "armed"                           [ -e "$STUB_UNITS/cf-drift@app.timer.active" ]
+rm "$HR/srv/app/deploy/cloudflare.json" "$HR/etc/app/cf-env"; reset_log; run
+check "disarmed once cloudflare.json is gone" [ ! -e "$STUB_UNITS/cf-drift@app.timer.enabled" ]
+
 echo "7. a Caddy unit exists -> the restart+memory drop-in is installed"
 touch "$STUB_UNITS/caddy.service.exists"
 reset_log; run
