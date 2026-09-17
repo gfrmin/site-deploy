@@ -170,6 +170,18 @@ check "armed"                           [ -e "$STUB_UNITS/cf-drift@app.timer.act
 rm "$HR/srv/app/deploy/cloudflare.json" "$HR/etc/app/cf-env"; reset_log; run
 check "disarmed once cloudflare.json is gone" [ ! -e "$STUB_UNITS/cf-drift@app.timer.enabled" ]
 
+echo "6c. backup: backup-producer.sh + BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST arms site-backup@app.timer"
+check "not armed (no producer)"        [ ! -e "$STUB_UNITS/site-backup@app.timer.enabled" ]
+: > "$HR/srv/app/deploy/backup-producer.sh"
+reset_log; run
+check "still not armed (no creds)"     [ ! -e "$STUB_UNITS/site-backup@app.timer.enabled" ]
+check "said not backed up"             grep -qi "NOT BACKED UP" "$T/out.txt"
+printf 'BACKUP_AGE_RECIPIENT=age1x\nBACKUP_RCLONE_DEST=r:b\n' > "$HR/etc/app/backup-env"
+reset_log; run
+check "armed"                          [ -e "$STUB_UNITS/site-backup@app.timer.active" ]
+rm "$HR/srv/app/deploy/backup-producer.sh" "$HR/etc/app/backup-env"; reset_log; run
+check "disarmed once producer is gone" [ ! -e "$STUB_UNITS/site-backup@app.timer.enabled" ]
+
 echo "7. a Caddy unit exists -> the restart+memory drop-in is installed"
 touch "$STUB_UNITS/caddy.service.exists"
 reset_log; run

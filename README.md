@@ -84,6 +84,7 @@ bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
 bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's current ranges (root)
 bin/cf-converge.py   converge one zone's Cloudflare config (SSL/DNS/cache/WAF/rate-limit) to deploy/cloudflare.json
 bin/cf-converge-run.sh root wrapper: derives the domain + the box's public IP, calls cf-converge.py
+bin/backup.sh        encrypt deploy/backup-producer.sh's stdout, ship off-box, verify by round trip, prune (root)
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
 systemd/site-probe@.service , site-probe@.timer            per-app active probe (every 5 min)
@@ -91,6 +92,7 @@ systemd/site-checks-armed@.service , site-checks-armed@.timer   alarm-armed swee
 systemd/ufw-cloudflare-sync.service , ufw-cloudflare-sync.timer   daily Cloudflare range sync (root)
 systemd/cf-converge@.service   applies deploy/cloudflare.json, dispatched by the poller on change (root)
 systemd/cf-drift@.service , cf-drift@.timer   daily dry-run drift report for cloudflare.json (root)
+systemd/site-backup@.service , site-backup@.timer   daily off-box backup, dispatched iff deploy/backup-producer.sh exists (root)
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt, and the files host-converge installs
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
@@ -336,6 +338,47 @@ from three near-identical app clones in renavon-monorepo; a fourth app's much la
 purge (specific hub + sitemap URLs, harvested from the origin's own sitemap index) stays app-owned
 rather than becoming a toolkit feature — this file purges everything, which is the common case.
 
+### Off-box backup: `bin/backup.sh`
+
+Opt-in by the **presence** of `deploy/backup-producer.sh` in the app's own repo — an executable that
+writes backup content to stdout and exits cleanly (a `pg_dump`, a `sqlite3 .backup`, a tar of a data
+directory: anything). The app declares WHAT to back up; this script owns HOW: `age`-encrypt, ship
+with `rclone`, verify by round trip, prune to a fixed count, report. No `backup-producer.sh` is not
+an error — most apps have no runtime state that outlives a redeploy.
+
+```
+"$PRODUCER" | age --encrypt --recipient $BACKUP_AGE_RECIPIENT
+            | rclone rcat $BACKUP_RCLONE_DEST/<host>/<app>-<stamp>.age
+            -> rclone cat (round-trip sha256, BEFORE the local copy is deleted)
+            -> /var/lib/<app>/backup-last-success
+            -> prune to BACKUP_KEEP_LAST, oldest first, this app's objects only
+```
+
+**Why the round trip matters, ported from renavon-monorepo's `dataguru-backup-state.py`:** an upload
+that returned success is not a backup that can be read back. Its whole reason for existing was an
+off-box tarball that went 13 days stale while every layer read green — the upload had never actually
+been confirmed readable. The local ciphertext is not deleted until the round trip proves the remote
+object matches it byte for byte; a mismatch fails the run loudly instead of silently trusting a
+corrupt upload.
+
+**Root, and a separate `/etc/<app>/backup-env`** — same reasoning as `cf-env`: a write-capable
+object-storage credential must not sit in the environment of a public-facing gunicorn. The producer
+script also runs as root, which is what lets it read state it does not own by construction (a WAL
+database under another user's directory) with no bespoke grant.
+
+```
+BACKUP_AGE_RECIPIENT=age1...     # the age PUBLIC key; only this key can decrypt
+BACKUP_RCLONE_DEST=<remote>:<bucket>/<prefix>   # an rclone remote already configured on the box
+BACKUP_KEEP_LAST=14              # optional, default 14
+HEALTHCHECKS_BACKUP_URL=...      # optional; a dead-man switch a silently-stopped backup deserves
+```
+
+`host-converge.sh` arms `site-backup@<app>.timer` (daily) iff `backup-producer.sh` exists AND both
+required vars are set; a declared producer with no credentials nags instead of silently not backing
+up. `age` and `rclone` are not in the fleet's base `host/packages.txt` (most apps need neither) — an
+app that opts in adds them to its own `deploy/packages.txt`, the same mechanism an app already uses
+for a native library dependency.
+
 ## Monitoring: two checks per app, and why neither is enough alone
 
 Nothing here reports a success it has not verified, and a missing dead-man does not fail — it
@@ -442,6 +485,7 @@ when current and loud when it refuses.
 ./tests/test-cf-converge.sh
 ./tests/test-cf-converge-run.sh
 ./tests/test-cf-purge.sh
+./tests/test-backup.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,

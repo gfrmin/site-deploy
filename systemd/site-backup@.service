@@ -1,0 +1,56 @@
+# Encrypt %i's own backup stream (deploy/backup-producer.sh) and ship it
+# off-box, verified by round trip. Root: the R2/S3 write credential lives in
+# /etc/%i/backup-env, root-only and separate from the app's ordinary
+# /etc/%i/env, because a write-capable object-storage credential must not
+# sit in the environment of a public-facing gunicorn. Opt-in by the
+# PRESENCE of deploy/backup-producer.sh — the script itself no-ops cleanly
+# without one, so this unit is harmless to enable speculatively.
+[Unit]
+Description=Back up %i's runtime state off-box, age-encrypted
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/srv/%i
+EnvironmentFile=-/etc/%i/backup-env
+ExecStart=/srv/site-deploy/bin/backup.sh %i
+# /fail ONLY, never success: the script owns the success edge (see
+# bin/hc-unit-result.sh). This catches the script being killed before its
+# own EXIT trap — TimeoutStartSec, OOM.
+ExecStopPost=-/srv/site-deploy/bin/hc-unit-result.sh backup
+# A large runtime database, encrypted and uploaded, then downloaded again for
+# the round-trip check: generous, and still well inside the daily cadence.
+TimeoutStartSec=20min
+Nice=19
+# First out under memory pressure: nothing here is latency-critical and the
+# next run is a day away.
+OOMScoreAdjust=500
+
+# Root, so the sandbox does the work the service user would otherwise.
+# ProtectSystem=strict makes the whole filesystem read-only except /dev,
+# /proc, /sys; PrivateTmp gives the plaintext staging file its own private
+# /tmp for the seconds before it is encrypted and deleted.
+#
+# ReadWritePaths=/var/lib and /srv/%i: the former is where backup-last-success
+# is written (StateDirectory=%i is not used here — %i is one app among
+# several state dirs already, not this unit's own), the latter is where an
+# app's own backup-producer.sh may need to read (e.g. a WAL database's -shm,
+# which reading a WAL database can require CREATING if no writer holds one
+# open — a read of a WAL file is not a read-only filesystem operation).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ProtectClock=yes
+ReadWritePaths=/var/lib /srv/%i
