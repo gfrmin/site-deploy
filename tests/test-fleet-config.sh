@@ -47,16 +47,16 @@ echo "4. exact hostname match only — no fuzzy fallback"
 # letter-order apart; a substring or prefix match would silently pick the
 # wrong host's app list.
 cat > "$T/fleet2.toml" <<'TOML'
-[hosts."crhkguru-web"]
-apps = ["crhkguru"]
-[hosts."hkjcguru-web"]
-apps = ["hkjcguru"]
+[hosts."foo-web"]
+apps = ["foo"]
+[hosts."bar-web"]
+apps = ["bar"]
 TOML
-run "$T/fleet2.toml" crhkguru-web-1
+run "$T/fleet2.toml" foo-web-1
 check "exit 0"                    [ "$RC" -eq 0 ]
 check "no fuzzy match"            [ -z "$OUT" ]
-run "$T/fleet2.toml" crhkguru-web
-check "the exact name matches"    [ "$OUT" = "crhkguru" ]
+run "$T/fleet2.toml" foo-web
+check "the exact name matches"    [ "$OUT" = "foo" ]
 
 echo "5. a host with no apps key at all: nothing printed, exit 0"
 cat > "$T/fleet3.toml" <<'TOML'
