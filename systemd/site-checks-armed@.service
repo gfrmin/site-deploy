@@ -1,0 +1,34 @@
+# Assert every alarm for %i's fleet is ARMED (no paused checks, no silent
+# staleness) — a property of the MONITORING, not of this box. A box serving
+# perfectly while every alarm on it is paused is exactly the state this exists
+# to catch. Fired by site-checks-armed@%i.timer.
+[Unit]
+Description=Alarm-armed assertion for %i's healthchecks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+# Root-only file (0600): the systemd manager reads EnvironmentFile= before
+# dropping to User=, so the service user never needs to read the API key from
+# disk. Leading dash: opt-in per box; without the file the script logs
+# "ALARMS ARE UNVERIFIED" and exits 0. Carries HEALTHCHECKS_API_URL,
+# HEALTHCHECKS_API_KEY, HEALTHCHECKS_SWEEP_TAG, HEALTHCHECKS_ARMED_URL and the
+# optional HEALTHCHECKS_EXPECTED_MIN floor.
+EnvironmentFile=-/etc/%i/ops-env
+ExecStart=/srv/site-deploy/bin/checks-armed.sh
+# Worst honest run: API read 45 + a full --max-time 20 = ~65s, then the ping
+# 20 + 10 = ~30s. 3min covers that and keeps a hung run from stacking.
+TimeoutStartSec=3min
+Nice=19
+
+# Writes nothing at all, so no write paths.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# No [Install] on purpose — fired by its timer only.

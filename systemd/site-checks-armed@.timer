@@ -1,0 +1,19 @@
+# Every 15 min. This cadence and the assertion's own check are ONE decision:
+# size that check SIMPLE, timeout=900s grace=900s. Worst honest gap between
+# delivered pings is ~19min (900s + 85s fire lateness + ~95s worst-case run),
+# inside 1800s. Change the cadence and both check fields in the same breath.
+#
+# Fifteen minutes rather than five: this watches configuration, which changes
+# when a human changes it, not traffic. Minutes versus never is the gap that
+# matters. OnCalendar fires at the next slot after boot; Persistent=false
+# because a missed window is stale news.
+[Unit]
+Description=Alarm-armed assertion for %i (every 15 min)
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=45
+Persistent=false
+
+[Install]
+WantedBy=timers.target
