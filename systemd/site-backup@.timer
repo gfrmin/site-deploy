@@ -1,0 +1,15 @@
+# Daily. Persistent=true, unlike the probe and deploy-update timers: a MISSED
+# backup is the one thing here worth catching up on immediately rather than
+# waiting for tomorrow's window — a box that was off over its scheduled time
+# should back up as soon as it returns.
+[Unit]
+Description=Daily off-box backup for %i
+
+[Timer]
+OnBootSec=20min
+OnCalendar=*-*-* 02:30:00 UTC
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

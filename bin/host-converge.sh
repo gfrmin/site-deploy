@@ -259,6 +259,20 @@ else
   disarm "cf-drift@$APP.timer" "no deploy/cloudflare.json"
 fi
 
+# Off-box backup is opt-in the same way: PRESENCE of backup-producer.sh, not a
+# knob. A declared producer with no credential to ship it is a real gap — nag.
+if [ -f "$SRV/deploy/backup-producer.sh" ]; then
+  if [ -n "$(envval BACKUP_AGE_RECIPIENT "$APP_ETC/backup-env")" ] \
+     && [ -n "$(envval BACKUP_RCLONE_DEST "$APP_ETC/backup-env")" ]; then
+    arm "site-backup@$APP.timer" "backup-producer.sh + BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST set" rearm
+  else
+    disarm "site-backup@$APP.timer" "BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST not set in $APP_ETC/backup-env"
+    say "deploy/backup-producer.sh declared but BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST not set in $APP_ETC/backup-env — this app is NOT BACKED UP"
+  fi
+else
+  disarm "site-backup@$APP.timer" "no deploy/backup-producer.sh"
+fi
+
 # --- 10. apply ------------------------------------------------------------------------------
 if [ "$units_changed" = 1 ]; then
   systemctl daemon-reload && say "systemd daemon-reloaded"

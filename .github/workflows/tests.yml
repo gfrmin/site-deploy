@@ -43,6 +43,7 @@ jobs:
           ./tests/test-cf-converge.sh
           ./tests/test-cf-converge-run.sh
           ./tests/test-cf-purge.sh
+          ./tests/test-backup.sh
 
   # Advance `ci-green` to this commit once the suite is green on master. The
   # boxes track that ref (bin/self-update.sh), so a red run here means the
