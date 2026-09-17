@@ -496,11 +496,22 @@ if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] ||
   if [ -x deploy/converge.sh ]; then
     ${CONVERGE_CMD:-sudo -n} "$SRV/deploy/converge.sh" \
       || { log "deploy/converge.sh failed; NOT reloading"; exit 1; }
-  else
-    # Declared but unusable is a misconfiguration, not a reason to deploy blind —
-    # the box would keep serving stale units while site.toml claimed otherwise.
-    log "site.toml sets converge but deploy/converge.sh is missing or not executable; NOT reloading"
+  elif [ -e deploy/converge.sh ]; then
+    # Present but not executable is a misconfiguration (a forgotten chmod
+    # +x), not "this app has none" — the box would keep serving stale units
+    # while site.toml claimed otherwise.
+    log "site.toml sets converge but deploy/converge.sh is not executable; NOT reloading"
     exit 1
+  else
+    # No app-owned script at all: fall back to the toolkit's own
+    # [converge]-table engine (bin/converge.sh), the shape webbsite's and
+    # renavon's hand-written converge.sh scripts had already converged on
+    # independently — install, validate, reload-with-rollback, prune. An app
+    # with converge=true but NEITHER a script NOR a [converge] table is
+    # still a real misconfiguration; bin/converge.sh's own "nothing
+    # declared" exit 0 surfaces it in the log without treating it as a crash.
+    ${CONVERGE_ENGINE_CMD:-sudo -n "$SELF/bin/converge.sh"} "$APP" \
+      || { log "bin/converge.sh failed; NOT reloading"; exit 1; }
   fi
 fi
 

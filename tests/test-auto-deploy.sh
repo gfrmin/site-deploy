@@ -117,11 +117,24 @@ echo "HOST-CONVERGE RAN $*" >> "$STUB_LOG"
 exit ${FAKE_HOST_CONVERGE_RC:-0}
 STUB
 chmod +x "$T/bin/host-converge"
+# Same reasoning as host-converge above, for the fallback [converge]-table
+# engine: stub it unconditionally so an app with converge=true and no
+# deploy/converge.sh cannot fall through to the REAL bin/converge.sh reading
+# a real /srv/<app>/deploy/site.toml on the dev box. Its own behaviour is
+# covered in depth by tests/test-converge.sh; this file only checks the
+# WIRING (when it is dispatched, and how a failure is handled).
+cat > "$T/bin/converge-engine" <<'STUB'
+#!/usr/bin/env bash
+echo "CONVERGE-ENGINE RAN $*" >> "$STUB_LOG"
+exit ${FAKE_CONVERGE_ENGINE_RC:-0}
+STUB
+chmod +x "$T/bin/converge-engine"
 run_deploy() {
   env APP=app APP_DIR="$SRV" SITE_DEPLOY_DIR="$ROOT" UV="$T/bin/uv" CURL="$T/bin/curl" \
       RELOAD_CMD="$T/bin/systemctl" PORT=8000 DEPLOY_HEALTH_TRIES=2 \
       CF_ZONE_ID=zone1 CF_CACHE_PURGE_TOKEN=tok1 \
-      CONVERGE_CMD=env HOST_CONVERGE_CMD="$T/bin/host-converge" DEPLOY_REF_FILE="$T/deploy-ref" \
+      CONVERGE_CMD=env HOST_CONVERGE_CMD="$T/bin/host-converge" \
+      CONVERGE_ENGINE_CMD="$T/bin/converge-engine" DEPLOY_REF_FILE="$T/deploy-ref" \
       "$@" bash "$ROOT/bin/auto-deploy.sh" > "$T/out.txt" 2>&1
   echo $? > "$T/rc.txt"
 }
@@ -251,6 +264,26 @@ reset_log; run_deploy
 check "exit 0"                 [ "$(rc)" = 0 ]
 check "printed nothing"        [ -z "$(out)" ]
 
+echo "11b. converge = true with no deploy/converge.sh falls back to the toolkit engine"
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\nconverge = true\n' > deploy/site.toml
+  git commit -qam "converge on, no script yet"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                  [ "$(rc)" = 0 ]
+check "dispatched the engine"   called "CONVERGE-ENGINE RAN"
+check "reloaded"                called "systemctl restart app"
+
+echo "11c. a failing engine stops the deploy BEFORE the reload, same as a failing app script"
+push_commit c11c; reset_log; run_deploy CONVERGE_CMD=env FAKE_CONVERGE_ENGINE_RC=1
+check "exit non-zero"           [ "$(rc)" != 0 ]
+check "tried the engine"        called "CONVERGE-ENGINE RAN"
+check "did NOT reload"          not_called "systemctl restart app"
+check "said why"                grep -qi "converge.sh failed" "$T/out.txt"
+( cd "$WORK" || exit 1; printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\n' > deploy/site.toml
+  git commit -qam "converge off again"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "recovers once converge is off"  [ "$(rc)" = 0 ]
+
 # Converging box config is the one step here that runs as root, so its failure
 # modes matter more than most: the thing it can get wrong is reloading the app
 # onto half-applied units.
@@ -290,7 +323,7 @@ echo "12d. declared but unusable refuses to deploy rather than deploying blind"
 reset_log; run_deploy CONVERGE_CMD=env
 check "exit non-zero"           [ "$(rc)" != 0 ]
 check "did NOT reload"          not_called "systemctl restart app"
-check "named the problem"       grep -qi "converge.sh is missing or not executable" "$T/out.txt"
+check "named the problem"       grep -qi "converge.sh is not executable" "$T/out.txt"
 
 echo "12e. root never runs a converge script out of a checkout that differs from the commit"
 # converge.sh runs as root via NOPASSWD from a directory the service user can
