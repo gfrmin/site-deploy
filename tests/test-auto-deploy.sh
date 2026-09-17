@@ -68,6 +68,7 @@ cat > "$T/bin/curl" <<'STUB'
 echo "curl $*" >> "$STUB_LOG"
 case "$*" in
   *purge_cache*) printf '{"success":true}\n200\n'; exit 0 ;;
+  *hc.example*) exit 0 ;;                    # a dead-man ping: always delivered
 esac
 if [ -n "${STUB_HEALTH_FAIL:-}" ]; then exit 22; fi
 # A non-2xx answer: real curl prints the body and exits 0, unless -f is given,
@@ -97,8 +98,8 @@ printf 'a%.0s' $(seq 1 4000) > "$SRV/static/app.css"   # the currently-served st
 
 push_commit() { ( cd "$WORK" || exit 1; echo "$1" >> notes.txt; git add -A; git commit -qm "$1"; git push -q origin master ); }
 reset_log() { : > "$STUB_LOG"; }
-called() { grep -qF "$1" "$STUB_LOG"; }
-not_called() { ! grep -qF "$1" "$STUB_LOG"; }
+called() { grep -qF -e "$1" "$STUB_LOG"; }
+not_called() { ! grep -qF -e "$1" "$STUB_LOG"; }
 
 run_deploy() {
   env APP=app APP_DIR="$SRV" SITE_DEPLOY_DIR="$ROOT" UV="$T/bin/uv" CURL="$T/bin/curl" \
@@ -394,6 +395,58 @@ check "said unmodelled"            grep -qi "does not model" "$T/out.txt"
   git commit -qam "fix source"; git push -q origin master )
 reset_log; run_deploy CONVERGE_CMD=env
 check "recovers"                   [ "$(rc)" = 0 ]
+
+# ── the deploy dead-man ──────────────────────────────────────────────────────
+# Subject: "this box is AT the ref it should be at" — not "a tick ran". A
+# ran-dead-man is green during the failure it most needs to catch (a fetch that
+# has failed every two minutes for a week).
+HC=https://hc.example/deploy1
+hc_calls() { grep -c "hc.example" "$STUB_LOG" || true; }
+echo "14a. an idle, level tick pings the check root and is still silent"
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC/
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "printed nothing"            [ -z "$(out)" ]
+check "pinged root, once"          bash -c 'grep -c "https://hc.example/deploy1 *$" "$STUB_LOG" | grep -qx 1'
+check "no double slash"            not_called "deploy1//"
+check "no /fail, no /start"        bash -c '! grep -qE "deploy1/(fail|start)" "$STUB_LOG"'
+
+echo "14b. a deploying tick pings /start before it reloads, root after health passes"
+push_commit c14b; reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "pinged /start"              called "deploy1/start"
+check "start before reload"        bash -c 's=$(grep -n "deploy1/start" "$STUB_LOG" | head -1 | cut -d: -f1); r=$(grep -n "systemctl reload app" "$STUB_LOG" | head -1 | cut -d: -f1); [ -n "$s" ] && [ -n "$r" ] && [ "$s" -lt "$r" ]'
+check "root after health"          bash -c 'h=$(grep -n "8000/health" "$STUB_LOG" | tail -1 | cut -d: -f1); p=$(grep -n "https://hc.example/deploy1 *$" "$STUB_LOG" | tail -1 | cut -d: -f1); [ -n "$h" ] && [ -n "$p" ] && [ "$h" -lt "$p" ]'
+
+echo "14c. a failed step pings /fail with the reason, never root"
+push_commit c14c; reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC STUB_FAIL_UV=1
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "pinged /fail"               called "deploy1/fail"
+check "body names the step"        bash -c 'grep "deploy1/fail" "$STUB_LOG" | grep -q "uv sync failed"'
+check "no root ping"               bash -c '! grep -q "https://hc.example/deploy1 *$" "$STUB_LOG"'
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC        # resume, heal
+check "healed: root again"         called "https://hc.example/deploy1"
+
+echo "14d. a fetch that keeps failing is a stuck box: /fail once it has persisted"
+git -C "$SRV" remote set-url origin "$T/nowhere.git"
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0 (transient)"         [ "$(rc)" = 0 ]
+check "no /fail yet"               not_called "deploy1/fail"
+check "no root either"             bash -c '! grep -q "https://hc.example/deploy1 *$" "$STUB_LOG"'
+check "stamped the stall"          [ -f "$SRV/.site-deploy-state/behind-since" ]
+echo 1000000000 > "$SRV/.site-deploy-state/behind-since"       # pretend it started long ago
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0 still"               [ "$(rc)" = 0 ]
+check "pinged /fail"               called "deploy1/fail"
+check "said stuck"                 grep -qi "STUCK" "$T/out.txt"
+git -C "$SRV" remote set-url origin "$ORIGIN"
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "level again: root"          called "https://hc.example/deploy1"
+check "stamp cleared"              [ ! -f "$SRV/.site-deploy-state/behind-since" ]
+
+echo "14e. unset URL: no ping, still silent"
+reset_log; run_deploy CONVERGE_CMD=env
+check "no hc call"                 [ "$(hc_calls)" = 0 ]
+check "printed nothing"            [ -z "$(out)" ]
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

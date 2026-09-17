@@ -1,0 +1,35 @@
+# Active uptime probe for %i: curl the PUBLIC health URL through the edge and
+# report to the app's healthchecks check. Fired by site-probe@%i.timer.
+#
+# No Requires=/After= on the app unit on purpose: what this measures is "can a
+# user load the site", not "is the local unit active" — a box serving 502s
+# under a green app unit is exactly what it exists to catch.
+[Unit]
+Description=Active uptime probe for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+# PROBE_URL + HEALTHCHECKS_PROBE_URL live here. Unset = logged no-op.
+EnvironmentFile=/etc/%i/env
+# The SCRIPT owns both the probe and the success-or-/fail ping: one ExecStart,
+# one owner.
+ExecStart=/srv/site-deploy/bin/health-probe.sh %i
+# Worst honest run is ~90s: --retry-max-time bounds when the last retry may
+# START, so probe = 45 + a full --max-time 15 = ~60s, ping = 20 + 10 = ~30s.
+# 2min covers that and means a hung run cannot stack into the next fire.
+TimeoutStartSec=2min
+Nice=19
+
+# The probe writes nothing (curl -o /dev/null), so the sandbox has no write paths.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# No [Install] on purpose — fired by its timer only; an enabled SERVICE would
+# add a boot-time probe outside the timer's cadence for no one's benefit.

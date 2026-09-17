@@ -33,6 +33,7 @@ sudo chmod -R u=rwX,go=rX "$HERE"
 # 2. Shared units (installed once per box; harmless to re-copy).
 sudo cp "$HERE/systemd/site-deploy@.service" "$HERE/systemd/site-deploy@.timer" \
         "$HERE/systemd/site-deploy-update.service" "$HERE/systemd/site-deploy-update.timer" \
+        "$HERE/systemd/site-probe@.service" "$HERE/systemd/site-probe@.timer" \
         /etc/systemd/system/
 
 # 3. NOPASSWD grants so the service user can reload/restart itself, and (for apps with a snapshot
@@ -54,6 +55,20 @@ rm -f "$tmp"
 sudo systemctl daemon-reload
 sudo systemctl enable --now site-deploy-update.timer
 sudo systemctl enable --now "site-deploy@${APP}.timer"
+
+# 5. Monitoring. Both halves are opt-in by env NAME and both nag when absent,
+#    because a missing dead-man does not fail — it just never speaks, and
+#    nothing distinguishes that from health.
+if [ -n "$(envval PROBE_URL)" ] && [ -n "$(envval HEALTHCHECKS_PROBE_URL)" ]; then
+  sudo systemctl enable --now "site-probe@${APP}.timer"
+  echo "enabled site-probe@${APP}.timer (PROBE_URL -> HEALTHCHECKS_PROBE_URL, every 5 min; size the check 300s/600s)"
+else
+  sudo systemctl disable --now "site-probe@${APP}.timer" 2>/dev/null || true
+  echo "WARNING: PROBE_URL / HEALTHCHECKS_PROBE_URL not set in /etc/$APP/env — THIS APP IS UNPROBED" >&2
+fi
+if [ -z "$(envval HEALTHCHECKS_DEPLOY_URL)" ]; then
+  echo "WARNING: HEALTHCHECKS_DEPLOY_URL not set in /etc/$APP/env — deploys on this box are UNMONITORED (size the check 600s/900s)" >&2
+fi
 
 echo
 echo "enabled site-deploy@${APP}.timer:"

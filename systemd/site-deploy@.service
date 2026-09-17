@@ -10,10 +10,19 @@ Type=oneshot
 User=%i
 Group=%i
 WorkingDirectory=/srv/%i
-# CF_ZONE_ID + CF_CACHE_PURGE_TOKEN (for the edge purge) live here, like the *-build service.
+# CF_ZONE_ID + CF_CACHE_PURGE_TOKEN (for the edge purge) and HEALTHCHECKS_DEPLOY_URL
+# (the deploy dead-man) live here, like the *-build service.
 EnvironmentFile=/etc/%i/env
 Environment=APP=%i
+Environment=DEPLOY_STATE_DIR=/var/lib/site-deploy/%i
+# Created by systemd before ExecStart and owned by User= above: the stall stamp
+# for the dead-man lives here rather than in the checkout.
+StateDirectory=site-deploy/%i
 ExecStart=/srv/site-deploy/bin/auto-deploy.sh
+# /fail ONLY, never success: the script owns the success edge, because only it
+# knows whether the box is at the ref it should be at. This catches the script
+# being killed before its own EXIT trap (TimeoutStartSec, OOM).
+ExecStopPost=-/srv/site-deploy/bin/hc-unit-result.sh deploy
 # A deploy (uv sync + tailwindcss) can take a little while on a small box; the poll is 2 min.
 TimeoutStartSec=10min
 Nice=19

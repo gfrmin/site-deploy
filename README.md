@@ -66,11 +66,14 @@ under one lock, and `/etc/dataguru/apps`.
 bin/auto-deploy.sh   generic poller (run by the timer, as the service user)
 bin/self-update.sh   keeps /srv/site-deploy on the toolkit's tested ref (run by a root timer)
 bin/cf-purge.sh      Cloudflare edge purge (no-op unless CF_* set in /etc/<app>/env)
-bin/health-probe.sh  active public probe -> healthchecks.io (see below)
+bin/health-probe.sh  active public probe -> its healthchecks check (see Monitoring)
+bin/hc-unit-result.sh ExecStopPost= backstop: /fail when a unit did not end in success
+lib/hc.sh            the ping leaf + http_probe, sourced by every reporter
 bin/install.sh       root-own the toolkit, install units + sudoers grant, enable timers (admin, once)
 bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
+systemd/site-probe@.service , site-probe@.timer            per-app active probe (every 5 min)
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
@@ -177,12 +180,38 @@ a commit that changes it governs its own deploy rather than the next one. A malf
 *after* the merge and merely a warning before it, or the file that breaks the deploy would deadlock
 the very commit that fixes it.
 
+## Monitoring: two checks per app, and why neither is enough alone
+
+Nothing here reports a success it has not verified, and a missing dead-man does not fail — it
+just never speaks. So both halves are opt-in by env *name* in `/etc/<app>/env`, and `install.sh`
+nags loudly when either is absent.
+
+**The deploy dead-man** (`HEALTHCHECKS_DEPLOY_URL`). The subject is *"this box is at the ref it
+should be at"*, not *"a tick ran"*: a ran-dead-man is green during the failure it most needs to
+catch, a fetch that has failed every two minutes for a week. The poller pings the check root on
+every level tick, `/start` when a deploy begins, and `/fail` from one `EXIT` trap on any failed
+step (body: the tick's log lines), or after 15 min of being unable to fetch. The unit's
+`ExecStopPost` (`hc-unit-result.sh`) covers the script being killed before its trap. Size the check
+600 s / grace 900 s: a dead poller, disabled timer or dead box goes DOWN inside 25 min; a failed
+deploy pages immediately.
+
+**The active probe** (`PROBE_URL` → `HEALTHCHECKS_PROBE_URL`, `site-probe@<app>.timer`, every
+5 min). Curls the app's *public* health URL through the edge — the user's vantage point — and pings
+root or `/fail` with the evidence. `http_probe` absorbs one blip of any class (`--retry-all-errors`,
+because plain `--retry` skips DNS flaps, refused connections and Cloudflare 52x). Point it at the
+deep variant where the app has one. Size the check 300 s / grace 600 s. A dead box cannot probe,
+but a dead box also stops pinging, so the check goes DOWN at timeout+grace: both failure classes
+are covered. Pings are leaves (`lib/hc.sh`): they never change an exit code and never become a
+dependency of the work they report on.
+
 ## Secrets (`/etc/<app>/env`, box-local — never in this repo)
 ```
 DEPLOY_RELOAD=reload               # or: restart   (apps with no ExecReload)
 DEPLOY_UV_ARGS=--frozen --no-dev   # or just: --frozen
 # DEPLOY_BUILD_SERVICE=<app>-build.service   # snapshot-backed apps only (see above)
 # CF_ZONE_ID=... / CF_CACHE_PURGE_TOKEN=...   # optional edge purge
+# HEALTHCHECKS_DEPLOY_URL=...                 # deploy dead-man (see Monitoring)
+# PROBE_URL=... / HEALTHCHECKS_PROBE_URL=...  # active probe (see Monitoring)
 ```
 
 ## Bootstrap (per box, one-time)
@@ -207,6 +236,7 @@ when current and loud when it refuses.
 ```sh
 ./tests/test-auto-deploy.sh
 ./tests/test-self-update.sh
+./tests/test-hc.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,
