@@ -52,6 +52,8 @@ say() { echo "host-converge[$APP]: $*"; }
 [ -d "$SELF/systemd" ] && [ -d "$SELF/host" ] \
   || { say "no toolkit checkout at $SELF (nothing to converge from); refusing"; exit 1; }
 [ -d "$SRV" ] || { say "no app checkout at $SRV; refusing"; exit 1; }
+# shellcheck disable=SC1091
+. "$SELF/lib/workspace.sh"
 failures=0
 note_failure() { failures=$((failures + 1)); say "$*"; }
 
@@ -74,6 +76,121 @@ envval() { [ -r "$2" ] && sed -n "s/^$1=//p" "$2" | tail -1 | tr -d '"'"'"'[:spa
 units_changed=0
 changed_timers=()
 
+# --- workspace mode (Phase D item 14): several apps out of one checkout -----
+# $APP is the SITE (the checkout); $APPS is what it hosts -- itself, under
+# dir ".", for a single-app site (today's shape, unchanged), or every name
+# ws_apps() returns for a workspace one.
+WORKSPACE=""
+ws_active "$SRV" && WORKSPACE=1
+APPS_DIR=$(ws_apps_dir "$SRV")
+if [ -n "$WORKSPACE" ]; then
+  mapfile -t APPS < <(ws_apps "$SRV" "$APP")
+else
+  APPS=("$APP")
+fi
+app_dir() { [ -n "$WORKSPACE" ] && printf '%s/%s' "$APPS_DIR" "$1" || printf '.'; }
+# <app>'s reload/restart unit and (optional) build unit, sed-extracted from
+# ITS OWN site.toml -- never eval'd, the same caution the sudoers block
+# below already applies to DEPLOY_BUILD_SERVICE (a value from a file this
+# root process does not otherwise trust with a full eval).
+app_service() {   # <app>
+  local a=$1 dir svc
+  dir=$(app_dir "$a")
+  svc=$(python3 "$SELF/bin/site-config.py" --app-keys "$SRV/$dir/deploy/site.toml" 2>/dev/null \
+          | sed -n "s/^export DEPLOY_SERVICE=//p" | tail -1 | tr -d "'\"")
+  if [ -n "$WORKSPACE" ]; then printf '%s' "${svc:-$APP@$a.service}"
+  else printf '%s' "${svc:-$a.service}"; fi
+}
+app_build_service() {   # <app>
+  local a=$1 dir
+  dir=$(app_dir "$a")
+  python3 "$SELF/bin/site-config.py" --app-keys "$SRV/$dir/deploy/site.toml" 2>/dev/null \
+    | sed -n "s/^export DEPLOY_BUILD_SERVICE=//p" | tail -1 | tr -d "'\""
+}
+# Two kinds of timer, two policies for one an operator STOPPED without
+# disabling. An ALARM timer (probe, sweep) is re-armed: there is no sanctioned
+# stopped state for an alarm — a stopped timer is a silently dead alarm, and
+# the way to stand a probe down is to blank its env pair (the script logs
+# UNPROBED) and pause the check. A WORK timer (the toolkit updater, the deploy
+# poller) is left stopped: `systemctl stop site-deploy-update.timer` is how an
+# operator pins the toolkit through an incident, and a deploy tick must not
+# undo that behind their back. Both are enabled if they never were. Defined
+# here (not at first use, section 9 below) so the per-app identity section
+# can also use them, to disarm a departed app's alarms.
+arm() {   # arm <timer> <why> [rearm]
+  local t=$1 why=$2 rearm=${3:-}
+  if ! systemctl is-enabled --quiet "$t" 2>/dev/null; then
+    systemctl enable --quiet --now "$t" && say "enabled $t ($why)"
+  elif [ -n "$rearm" ] && ! systemctl is-active --quiet "$t" 2>/dev/null; then
+    systemctl start "$t" && say "re-armed $t (was enabled but stopped; to stand an alarm down, blank its env pair instead)"
+  fi
+}
+disarm() {
+  local t=$1 why=$2
+  if systemctl is-enabled --quiet "$t" 2>/dev/null; then
+    systemctl disable --quiet --now "$t" && say "disabled $t ($why)"
+  fi
+}
+
+# --- per-app identity (workspace mode only) -----------------------------------
+# A workspace app has no checkout of its own: everything else in this script
+# and the rest of the toolkit (site-probe@<app>, cf-converge@<app>,
+# site-backup@<app>, env-check.sh, bin/converge.sh <app>) already assumes
+# /srv/<app> and /var/lib/<app> exist, so those are DERIVED here rather than
+# hand-created. Only a symlink pointing INTO this site's own <apps_dir>/ tree
+# is ever created or removed -- a real directory, or a symlink elsewhere, is
+# a name COLLISION (another site, or a leftover from before this app moved
+# between sites) and is a counted failure, never silently overwritten.
+if [ -n "$WORKSPACE" ]; then
+  for a in "${APPS[@]}"; do
+    dir=$(app_dir "$a")
+    link="$ROOT/srv/$a"
+    target="$SRV/$dir"
+    if [ -L "$link" ]; then
+      [ "$(readlink "$link")" = "$target" ] \
+        || note_failure "$a: /srv/$a is a symlink to $(readlink "$link"), not $target -- refusing to touch it (name collision)"
+    elif [ -e "$link" ]; then
+      note_failure "$a: /srv/$a exists and is not a symlink -- refusing to touch it (name collision)"
+    else
+      install -d -m0755 "$ROOT/srv" 2>/dev/null || true
+      ln -s "$target" "$link" && say "$a: created /srv/$a -> $target"
+    fi
+    install -d -m0755 "$ROOT/var/lib/$a" 2>/dev/null || true
+    # site-probe@ and site-checks-armed@ run as %i (the app name); everything
+    # else per-app is a root oneshot and needs no User= drop-in at all.
+    for u in "site-probe@$a.service" "site-checks-armed@$a.service"; do
+      tmp_dropin=$(mktemp)
+      printf '[Service]\nUser=%s\nGroup=%s\n' "$APP" "$APP" > "$tmp_dropin"
+      sync_file "$tmp_dropin" "$ETC/systemd/system/$u.d/site-deploy.conf" && units_changed=1
+      rm -f "$tmp_dropin"
+    done
+  done
+  # Prune identity + alarm timers for an app this site no longer hosts. Only
+  # symlinks pointing INTO this site's own apps_dir/ are ever considered --
+  # never a name this site does not own.
+  for link in "$ROOT"/srv/*; do
+    [ -L "$link" ] || continue
+    name=$(basename "$link")
+    case "$(readlink "$link")" in
+      "$SRV/$APPS_DIR"/*)
+        kept=""
+        for a in "${APPS[@]}"; do [ "$a" = "$name" ] && kept=1 && break; done
+        [ -n "$kept" ] && continue
+        rm -f "$link"
+        say "$name: removed /srv/$name (no longer hosted here)"
+        rm -rf "$ETC/systemd/system/site-probe@$name.service.d" \
+               "$ETC/systemd/system/site-checks-armed@$name.service.d"
+        disarm "site-probe@$name.timer" "$name no longer hosted here"
+        disarm "site-checks-armed@$name.timer" "$name no longer hosted here"
+        disarm "cf-drift@$name.timer" "$name no longer hosted here"
+        disarm "site-backup@$name.timer" "$name no longer hosted here"
+        ;;
+    esac
+  done
+fi
+
+# Install $1 at $2 only if it differs. Returns 0 when it wrote something.
+# A missing SOURCE is a counted failure, not a silent "updated": the first
 # --- 1. the toolkit's own units --------------------------------------------------
 # install.sh copied them once; a change to any of them (a pinned ref in an
 # Environment=, a new ExecStopPost) reached a box only if a human recopied it.
@@ -91,18 +208,30 @@ done
 # not a visit. Both reload and restart: a deploy that changes uv.lock restarts.
 # Validated before it replaces the live file — a malformed sudoers would leave
 # the box unable to escalate at all.
-build_svc=$(envval DEPLOY_BUILD_SERVICE "$APP_ETC/env")
-if [ -f "$SRV/deploy/site.toml" ]; then
-  toml_build=$(python3 "$SELF/bin/site-config.py" "$SRV/deploy/site.toml" 2>/dev/null \
-                 | sed -n "s/^export DEPLOY_BUILD_SERVICE=//p" | tr -d "'\"")
-  [ -n "$toml_build" ] && build_svc=$toml_build
-fi
 tmp_sudo=$(mktemp)
 {
   echo "# Managed by site-deploy host-converge — edits on the box are overwritten each tick."
-  echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $APP, /usr/bin/systemctl restart $APP"
-  [ -n "$build_svc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
-  echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
+  if [ -z "$WORKSPACE" ]; then
+    build_svc=$(envval DEPLOY_BUILD_SERVICE "$APP_ETC/env")
+    if [ -f "$SRV/deploy/site.toml" ]; then
+      toml_build=$(python3 "$SELF/bin/site-config.py" "$SRV/deploy/site.toml" 2>/dev/null \
+                     | sed -n "s/^export DEPLOY_BUILD_SERVICE=//p" | tr -d "'\"")
+      [ -n "$toml_build" ] && build_svc=$toml_build
+    fi
+    echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $APP, /usr/bin/systemctl restart $APP"
+    [ -n "$build_svc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
+    echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
+  else
+    # One grant per hosted app, keyed on ITS OWN service/build_service (a
+    # workspace app's default unit is $APP@<app>.service, not <app> bare).
+    for a in "${APPS[@]}"; do
+      svc=$(app_service "$a"); bsvc=$(app_build_service "$a")
+      echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
+      [ -n "$bsvc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $bsvc"
+      echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$a.service"
+      echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/converge.sh $a"
+    done
+  fi
   echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/host-converge.sh $APP"
   echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/converge.sh $APP"
   echo "$APP ALL=(root) NOPASSWD: /srv/$APP/deploy/converge.sh"
@@ -135,11 +264,17 @@ rm -f "$tmp_nr"
 # --- 5. unattended security upgrades ------------------------------------------------
 sync_file "$SELF/host/apt-auto-upgrades.conf" "$ETC/apt/apt.conf.d/20auto-upgrades" || true
 
-# --- 6. packages: the fleet baseline plus what the app declares ---------------------
+# --- 6. packages: the fleet baseline plus what the site (and each hosted app) declares
 # Installed on diff only: `apt-get install` of an installed set is not free, and
 # a tick that touches apt every two minutes is a tick nobody wants to read.
 PKG_FILES=("$SELF/host/packages.txt")
 [ -f "$SRV/deploy/packages.txt" ] && PKG_FILES+=("$SRV/deploy/packages.txt")
+if [ -n "$WORKSPACE" ]; then
+  for a in "${APPS[@]}"; do
+    dir=$(app_dir "$a")
+    [ -f "$SRV/$dir/deploy/packages.txt" ] && PKG_FILES+=("$SRV/$dir/deploy/packages.txt")
+  done
+fi
 missing=()
 while read -r pkg; do
   [ -n "$pkg" ] || continue
@@ -215,64 +350,65 @@ fi
 # poller) is left stopped: `systemctl stop site-deploy-update.timer` is how an
 # operator pins the toolkit through an incident, and a deploy tick must not
 # undo that behind their back. Both are enabled if they never were.
-arm() {   # arm <timer> <why> [rearm]
-  local t=$1 why=$2 rearm=${3:-}
-  if ! systemctl is-enabled --quiet "$t" 2>/dev/null; then
-    systemctl enable --quiet --now "$t" && say "enabled $t ($why)"
-  elif [ -n "$rearm" ] && ! systemctl is-active --quiet "$t" 2>/dev/null; then
-    systemctl start "$t" && say "re-armed $t (was enabled but stopped; to stand an alarm down, blank its env pair instead)"
-  fi
-}
-disarm() {
-  local t=$1 why=$2
-  if systemctl is-enabled --quiet "$t" 2>/dev/null; then
-    systemctl disable --quiet --now "$t" && say "disabled $t ($why)"
-  fi
-}
 arm site-deploy-update.timer "keeps the toolkit on its tested ref"
+# Never a per-app site-deploy@<app>.timer -- the SITE's poller is what
+# fetches and applies for every app it hosts; there is nothing per-app to
+# arm here regardless of mode.
 arm "site-deploy@$APP.timer" "the deploy poller"
 
-if [ -n "$(envval PROBE_URL "$APP_ETC/env")" ] && [ -n "$(envval HEALTHCHECKS_PROBE_URL "$APP_ETC/env")" ]; then
-  arm "site-probe@$APP.timer" "PROBE_URL + HEALTHCHECKS_PROBE_URL set" rearm
-else
-  disarm "site-probe@$APP.timer" "PROBE_URL/HEALTHCHECKS_PROBE_URL unset"
-  say "PROBE_URL/HEALTHCHECKS_PROBE_URL not set in $APP_ETC/env — THIS APP IS UNPROBED"
-fi
-if [ -n "$(envval HEALTHCHECKS_API_KEY "$APP_ETC/ops-env")" ] && [ -n "$(envval HEALTHCHECKS_SWEEP_TAG "$APP_ETC/ops-env")" ]; then
-  arm "site-checks-armed@$APP.timer" "ops-env carries an API key and a sweep tag" rearm
-else
-  disarm "site-checks-armed@$APP.timer" "ops-env gone or incomplete"
-fi
-[ -n "$(envval HEALTHCHECKS_DEPLOY_URL "$APP_ETC/env")" ] \
-  || say "HEALTHCHECKS_DEPLOY_URL not set in $APP_ETC/env — deploys on this box are UNMONITORED"
+# Per-app monitoring/edge/backup timers -- single-app mode's one entry in
+# $APPS is $APP itself, so this loop reduces to exactly today's checks
+# against $APP_ETC (a_etc == $APP_ETC when a == $APP). Workspace mode reads
+# each hosted app's OWN /etc/<app>/* (env, cf-env, backup-env, ops-env) and
+# its own <apps_dir>/<app>/deploy/{cloudflare.json,backup-producer.sh}.
+for a in "${APPS[@]}"; do
+  a_etc="$ETC/$a"
+  a_dir=$(app_dir "$a")
+  a_srv="$SRV/$a_dir"
 
-# Cloudflare-as-code is opt-in (most apps have no cloudflare.json at all), so
-# unlike PROBE/DEPLOY monitoring there is no nag for its absence — only for a
-# declared cloudflare.json with no token to converge it, which IS a gap.
-if [ -f "$SRV/deploy/cloudflare.json" ]; then
-  if [ -n "$(envval CF_CONFIG_TOKEN "$APP_ETC/cf-env")" ]; then
-    arm "cf-drift@$APP.timer" "cloudflare.json + CF_CONFIG_TOKEN set" rearm
+  if [ -n "$(envval PROBE_URL "$a_etc/env")" ] && [ -n "$(envval HEALTHCHECKS_PROBE_URL "$a_etc/env")" ]; then
+    arm "site-probe@$a.timer" "PROBE_URL + HEALTHCHECKS_PROBE_URL set" rearm
   else
-    disarm "cf-drift@$APP.timer" "CF_CONFIG_TOKEN not set in $APP_ETC/cf-env"
-    say "deploy/cloudflare.json declared but CF_CONFIG_TOKEN not set in $APP_ETC/cf-env — Cloudflare config on this box is NOT CONVERGED"
+    disarm "site-probe@$a.timer" "PROBE_URL/HEALTHCHECKS_PROBE_URL unset"
+    say "$a: PROBE_URL/HEALTHCHECKS_PROBE_URL not set in $a_etc/env — THIS APP IS UNPROBED"
   fi
-else
-  disarm "cf-drift@$APP.timer" "no deploy/cloudflare.json"
-fi
+  if [ -n "$(envval HEALTHCHECKS_API_KEY "$a_etc/ops-env")" ] && [ -n "$(envval HEALTHCHECKS_SWEEP_TAG "$a_etc/ops-env")" ]; then
+    arm "site-checks-armed@$a.timer" "ops-env carries an API key and a sweep tag" rearm
+  else
+    disarm "site-checks-armed@$a.timer" "ops-env gone or incomplete"
+  fi
+  [ -n "$(envval HEALTHCHECKS_DEPLOY_URL "$a_etc/env")" ] \
+    || say "$a: HEALTHCHECKS_DEPLOY_URL not set in $a_etc/env — deploys on this box are UNMONITORED"
 
-# Off-box backup is opt-in the same way: PRESENCE of backup-producer.sh, not a
-# knob. A declared producer with no credential to ship it is a real gap — nag.
-if [ -f "$SRV/deploy/backup-producer.sh" ]; then
-  if [ -n "$(envval BACKUP_AGE_RECIPIENT "$APP_ETC/backup-env")" ] \
-     && [ -n "$(envval BACKUP_RCLONE_DEST "$APP_ETC/backup-env")" ]; then
-    arm "site-backup@$APP.timer" "backup-producer.sh + BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST set" rearm
+  # Cloudflare-as-code is opt-in (most apps have no cloudflare.json at all),
+  # so unlike PROBE/DEPLOY monitoring there is no nag for its absence — only
+  # for a declared cloudflare.json with no token to converge it, which IS a gap.
+  if [ -f "$a_srv/deploy/cloudflare.json" ]; then
+    if [ -n "$(envval CF_CONFIG_TOKEN "$a_etc/cf-env")" ]; then
+      arm "cf-drift@$a.timer" "cloudflare.json + CF_CONFIG_TOKEN set" rearm
+    else
+      disarm "cf-drift@$a.timer" "CF_CONFIG_TOKEN not set in $a_etc/cf-env"
+      say "$a: deploy/cloudflare.json declared but CF_CONFIG_TOKEN not set in $a_etc/cf-env — Cloudflare config on this box is NOT CONVERGED"
+    fi
   else
-    disarm "site-backup@$APP.timer" "BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST not set in $APP_ETC/backup-env"
-    say "deploy/backup-producer.sh declared but BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST not set in $APP_ETC/backup-env — this app is NOT BACKED UP"
+    disarm "cf-drift@$a.timer" "no deploy/cloudflare.json"
   fi
-else
-  disarm "site-backup@$APP.timer" "no deploy/backup-producer.sh"
-fi
+
+  # Off-box backup is opt-in the same way: PRESENCE of backup-producer.sh,
+  # not a knob. A declared producer with no credential to ship it is a real
+  # gap — nag.
+  if [ -f "$a_srv/deploy/backup-producer.sh" ]; then
+    if [ -n "$(envval BACKUP_AGE_RECIPIENT "$a_etc/backup-env")" ] \
+       && [ -n "$(envval BACKUP_RCLONE_DEST "$a_etc/backup-env")" ]; then
+      arm "site-backup@$a.timer" "backup-producer.sh + BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST set" rearm
+    else
+      disarm "site-backup@$a.timer" "BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST not set in $a_etc/backup-env"
+      say "$a: deploy/backup-producer.sh declared but BACKUP_AGE_RECIPIENT/BACKUP_RCLONE_DEST not set in $a_etc/backup-env — this app is NOT BACKED UP"
+    fi
+  else
+    disarm "site-backup@$a.timer" "no deploy/backup-producer.sh"
+  fi
+done
 
 # --- 10. apply ------------------------------------------------------------------------------
 if [ "$units_changed" = 1 ]; then

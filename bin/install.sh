@@ -31,9 +31,29 @@ sudo chmod -R u=rwX,go=rX "$HERE"
 echo "converging host for $APP"
 sudo "$HERE/bin/host-converge.sh" "$APP"
 
-# 3. Does the box carry the config the app declares? Names only, never values.
-#    A rebuilt box that is missing half its env file serves 200s all day.
-if [ -r "/srv/$APP/deploy/required-env.txt" ]; then
+# 3. Does the box carry the config each app declares? Names only, never
+#    values. A rebuilt box that is missing half its env file serves 200s all
+#    day. Workspace mode (Phase D item 14): loop over every app this site
+#    hosts, checking EACH app's OWN /etc/<app>/* and required-env.txt against
+#    its own unit (default <site>@<app>.service) rather than the site's.
+if grep -q '^\[workspace\]' "/srv/$APP/deploy/site.toml" 2>/dev/null; then
+  # shellcheck disable=SC1091
+  . "$HERE/lib/workspace.sh"
+  APPS_DIR=$(ws_apps_dir "/srv/$APP")
+  mapfile -t WS_APPS < <(ws_apps "/srv/$APP" "$APP")
+  for a in "${WS_APPS[@]}"; do
+    a_dir="$APPS_DIR/$a"
+    a_manifest="/srv/$APP/$a_dir/deploy/required-env.txt"
+    if [ -r "$a_manifest" ]; then
+      a_svc=$(python3 "$HERE/bin/site-config.py" --app-keys "/srv/$APP/$a_dir/deploy/site.toml" 2>/dev/null \
+                | sed -n "s/^export DEPLOY_SERVICE=//p" | tail -1 | tr -d "'\"")
+      sudo ETC="/etc/$a" MANIFEST="$a_manifest" UNIT="${a_svc:-$APP@$a.service}" \
+        "$HERE/bin/env-check.sh" "$a" || echo "WARNING: env-check reported problems above for $a (exit $?)" >&2
+    else
+      echo "note: $a_manifest not found — $a declares no env manifest, so nothing can say whether this box has its config" >&2
+    fi
+  done
+elif [ -r "/srv/$APP/deploy/required-env.txt" ]; then
   sudo "$HERE/bin/env-check.sh" "$APP" || echo "WARNING: env-check reported problems above (exit $?)" >&2
 else
   echo "note: /srv/$APP/deploy/required-env.txt not found — the app declares no env manifest, so nothing can say whether this box has its config" >&2

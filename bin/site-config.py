@@ -105,11 +105,17 @@ def render(config: dict, environ: dict, app_keys: bool = False) -> list[str]:
         lines.append(f"export {var}={shlex.quote(value)}")
 
     if not app_keys:
-        workspace = config.get("workspace", {})
-        for key, var in WORKSPACE_KEYS.items():
-            if key not in workspace:
-                continue
-            lines.append(f"export {var}={shlex.quote(_render_value(workspace[key]))}")
+        workspace = config.get("workspace")
+        if workspace is not None:
+            # Emitted whenever a [workspace] table exists AT ALL, independent
+            # of which keys it declares -- an empty `[workspace]` (every key
+            # defaulted) is still workspace mode, and WORKSPACE_APPS_DIR alone
+            # would miss it since it only renders when apps_dir is set.
+            lines.append("export WORKSPACE_ACTIVE=1")
+            for key, var in WORKSPACE_KEYS.items():
+                if key not in workspace:
+                    continue
+                lines.append(f"export {var}={shlex.quote(_render_value(workspace[key]))}")
 
     # shlex.quote the whole message: the warnings embed repr()'d values, whose
     # own quotes would otherwise close the echo and inject shell.

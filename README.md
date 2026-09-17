@@ -78,7 +78,7 @@ bin/hc-unit-result.sh ExecStopPost= backstop: /fail when a unit did not end in s
 bin/env-check.sh     does the box carry every env NAME deploy/required-env.txt declares? (see below)
 bin/checks-armed.sh  are the fleet's healthchecks alarms actually armed? (paused = silent)
 lib/hc.sh            the ping leaf + http_probe, sourced by every reporter
-bin/host-converge.sh converge the box below the app every tick: units, grants, journald, swap, packages, Caddy policy, timers (root)
+bin/host-converge.sh converge the box below the app every tick: units, grants, journald, swap, packages, Caddy policy, timers, and (workspace mode) per-app identity symlinks (root)
 bin/install.sh       bootstrap: root-own the toolkit, first host-converge, env-check (admin, once)
 bin/site-config.py   deploy/site.toml -> DEPLOY_*/WORKSPACE_* env; --app-keys renders only the per-app subset
 bin/fleet-config.py  deploy/fleet.toml -> which apps this hostname hosts (workspace mode; see below)
