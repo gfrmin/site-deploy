@@ -93,6 +93,8 @@ systemd/ufw-cloudflare-sync.service , ufw-cloudflare-sync.timer   daily Cloudfla
 systemd/cf-converge@.service   applies deploy/cloudflare.json, dispatched by the poller on change (root)
 systemd/cf-drift@.service , cf-drift@.timer   daily dry-run drift report for cloudflare.json (root)
 systemd/site-backup@.service , site-backup@.timer   daily off-box backup, dispatched iff deploy/backup-producer.sh exists (root)
+systemd/app@.service   reference gunicorn unit for an app (copy, do not converge — see below)
+systemd/site-build@.service   reference build unit: reload -> /fail -> purge, ordering pinned by tests
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt, and the files host-converge installs
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
@@ -379,6 +381,44 @@ up. `age` and `rclone` are not in the fleet's base `host/packages.txt` (most app
 app that opts in adds them to its own `deploy/packages.txt`, the same mechanism an app already uses
 for a native library dependency.
 
+### Reference units: `systemd/app@.service`, `systemd/site-build@.service`
+
+Unlike every other unit in this repo, these two are **not** installed or converged automatically —
+they are what an app's own unit usually started from, kept here reviewed and tested so an app can
+copy or diff against them rather than re-derive the hardening block and the build-unit's ExecStopPost
+chain from scratch. `systemd/app@.service` is a reference gunicorn unit (`--no-control-socket` and
+why it outlives the fd leak it was originally added for, `ExecReload=` SIGHUP for graceful worker
+rotation). `systemd/site-build@.service` is the reference for a `DEPLOY_BUILD_SERVICE` build unit:
+reload the app onto the new build, then purge — and skip the purge, loudly, if the reload failed,
+because purging while the origin still serves the OLD build just refills the edge from stale content
+on a fresh TTL. `tests/test-systemd-units.sh` pins the ordering (`-+` reload, then a `-`-prefixed
+`/fail` ping, then the un-prefixed purge LAST so its `exit 1` can fail the unit), the marker
+handshake between the privileged reload step and the sandboxed steps after it, and the two systemd
+text transforms that fail silently: an unresolved `%` specifier (systemd drops the whole
+`ExecStopPost=` directive) and a single-`$` `${...}` (systemd resolves it itself, to nothing, before
+the shell ever sees it — write `$${...}` for a form the shell resolves instead).
+
+**The canonical hardening block**, reused verbatim by both of the above and by `site-backup@.service`:
+```
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ProtectClock=yes
+ReadWritePaths=<whatever this unit actually writes>
+```
+`ReadWritePaths=` is the one line that must be reasoned about per unit, not copied blind — and reading
+a WAL SQLite database can itself require creating its `-shm` file if no writer currently has one open,
+which is not a read-only filesystem operation despite being a "read".
+
 ## Monitoring: two checks per app, and why neither is enough alone
 
 Nothing here reports a success it has not verified, and a missing dead-man does not fail — it
@@ -486,6 +526,7 @@ when current and loud when it refuses.
 ./tests/test-cf-converge-run.sh
 ./tests/test-cf-purge.sh
 ./tests/test-backup.sh
+./tests/test-systemd-units.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,
