@@ -37,6 +37,7 @@ KEYS = {
     "cf_zone_id": "CF_ZONE_ID",
     "converge": "DEPLOY_CONVERGE",
     "tailwindcss_version": "TAILWINDCSS_VERSION",
+    "deploy_ref": "DEPLOY_REF",
 }
 
 

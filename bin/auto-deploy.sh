@@ -106,10 +106,13 @@ report_behind() {
 # falling back to the environment would mean deploying with knobs nobody wrote.
 #
 # The pre-merge read is also SCOPED: it evaluates the old file in a subshell and
-# takes only DEPLOY_BUILD_SERVICE out of it. Evaluating it in this shell exported
-# every old knob, and the post-merge read only sets keys the NEW file has — so a
-# knob the deploying commit REMOVED (say, health_match) stayed armed from the
-# old copy for exactly the deploy that removed it.
+# takes only the two knobs needed before anything is fetched out of it —
+# DEPLOY_BUILD_SERVICE (the queued-rebuild retry) and DEPLOY_REF (which ref to
+# fetch at all; a commit changing deploy_ref therefore governs the NEXT deploy,
+# necessarily). Evaluating it in this shell exported every old knob, and the
+# post-merge read only sets keys the NEW file has — so a knob the deploying
+# commit REMOVED (say, health_match) stayed armed from the old copy for exactly
+# the deploy that removed it.
 load_site_config() {
   [ -f deploy/site.toml ] || return 0
   local rendered
@@ -118,6 +121,7 @@ load_site_config() {
       eval "$rendered"
     else
       DEPLOY_BUILD_SERVICE=$( eval "$rendered" 2>/dev/null; printf '%s' "${DEPLOY_BUILD_SERVICE:-}" )
+      DEPLOY_REF=$( eval "$rendered" 2>/dev/null; printf '%s' "${DEPLOY_REF:-}" )
       return 0
     fi
   else
@@ -201,10 +205,67 @@ if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -f "$PENDING_BUILD" ]; then
   fi
 fi
 
-# 1. Cheap remote check. A transient fetch failure just retries next tick (exit 0, not failed).
-git fetch --quiet origin || { log "fetch failed (transient?); will retry next tick"; report_behind "cannot fetch origin"; exit 0; }
+# 1. Which ref this box deploys. `deploy_ref` in site.toml (default master);
+#    for an app whose CI advances a `ci-green` ref only after a green run on
+#    master, tracking that ref means the box can only ever fast-forward onto a
+#    commit whose whole suite passed. The clone keeps `master` checked out with
+#    origin/master as its upstream; only what we compare and merge changes.
+#
+#    Operator override: a ref name in /etc/<app>/deploy-ref. `master` restores
+#    the ungated behaviour for the case this exists to survive — CI itself
+#    broken, or a fix that must ship before it can be green. A file rather than
+#    a converged setting on purpose: converge would overwrite the override on
+#    the next tick. `[ -r ]` first: a failed input redirection prints even under
+#    2>/dev/null, and the file is absent in the normal case.
+DEPLOY_REF_FILE="${DEPLOY_REF_FILE:-/etc/$APP/deploy-ref}"
+REF_OVERRIDE=""
+[ -r "$DEPLOY_REF_FILE" ] && REF_OVERRIDE=$(tr -d '[:space:]' < "$DEPLOY_REF_FILE")
+REF="${REF_OVERRIDE:-${DEPLOY_REF:-master}}"
+
+# Cheap remote check. A transient fetch failure just retries next tick (exit 0, not failed).
+# The explicit wildcard refspec is load-bearing: a box cloned --single-branch
+# has remote.origin.fetch narrowed to master, and a bare `git fetch` would then
+# never see the tested ref at all. --prune, or a ref deleted on the remote lives
+# on locally and passes the existence check below forever.
+git fetch --quiet --prune origin '+refs/heads/*:refs/remotes/origin/*' \
+  || { log "fetch failed (transient?); will retry next tick"; report_behind "cannot fetch origin"; exit 0; }
 LOCAL=$(git rev-parse @)
-REMOTE=$(git rev-parse '@{u}')
+# No fallback to master if the ref is missing. A gate that opens when it cannot
+# find its own lock is not a gate: an accidentally deleted ref, or a repo where
+# CI has never run, would silently restore ungated deploys. Refusing keeps the
+# last known-good tree serving — but it can strand a box indefinitely, so it is
+# loud on EVERY tick (and exit 1 sends the dead-man /fail).
+if ! REMOTE=$(git rev-parse --verify --quiet "refs/remotes/origin/$REF"); then
+  log "REFUSING TO DEPLOY: origin/$REF does not exist, so there is no tested commit to deploy." \
+      "The box keeps serving ${LOCAL:0:9}. Fix CI, or write a ref that exists (e.g. master) to" \
+      "$DEPLOY_REF_FILE to bypass the gate."
+  exit 1
+fi
+# How far behind master the tracked ref is. A red CI stops the ref advancing,
+# which is the point — but the visible symptom is "my merge never deployed", and
+# without this the poller reports a silent no-op while master runs away from it.
+# One line per tick is not enough on its own (nobody reads it) — so if the ref
+# has not MOVED for REF_FROZEN_SECONDS while master is ahead, the dead-man is
+# told the box is NOT where it should be. Keyed on the ref's SHA: a busy day of
+# green merges moves the ref, restamps, and never trips this.
+REF_FROZEN=""
+REF_FROZEN_STAMP="$STATE_DIR/ref-frozen-since"
+REF_FROZEN_SECONDS="${REF_FROZEN_SECONDS:-3600}"
+if [ "$REF" != master ] && MASTER=$(git rev-parse --verify --quiet refs/remotes/origin/master) \
+   && [ "$MASTER" != "$REMOTE" ] && [ "$(git rev-list --count "$REMOTE..$MASTER" 2>/dev/null || echo 0)" != 0 ]; then
+  behind=$(git rev-list --count "$REMOTE..$MASTER")
+  log "WARNING origin/$REF is $behind commit(s) behind origin/master (${REMOTE:0:9} vs ${MASTER:0:9}) — those commits are NOT deployed. CI is red, still running, or never ran for them."
+  now=$(date +%s); frozen_sha=""; frozen_since=""
+  [ -r "$REF_FROZEN_STAMP" ] && read -r frozen_sha frozen_since < "$REF_FROZEN_STAMP"
+  case "$frozen_since" in ''|*[!0-9]*) frozen_sha="" ;; esac
+  if [ "$frozen_sha" != "$REMOTE" ]; then
+    { printf '%s %s\n' "$REMOTE" "$now" > "$REF_FROZEN_STAMP"; } 2>/dev/null || true
+  elif [ $(( now - frozen_since )) -ge "$REF_FROZEN_SECONDS" ]; then
+    REF_FROZEN="origin/$REF has not moved for $(( now - frozen_since ))s while origin/master is $behind commit(s) ahead — CI is red or not running, so this box is level with an untested gap"
+  fi
+else
+  rm -f "$REF_FROZEN_STAMP" 2>/dev/null || true
+fi
 # A deploy is not finished when the merge lands — it is finished when the new
 # code is reloaded and answering. Anything that fails in between (uv sync, the
 # CSS build, the reload, the health probe) leaves the checkout already merged,
@@ -213,7 +274,14 @@ REMOTE=$(git rev-parse '@{u}')
 # unfinished half retry instead.
 PENDING_RELOAD="$SRV/.site-deploy-reload-pending"
 if [ "$LOCAL" = "$REMOTE" ] && [ ! -f "$PENDING_RELOAD" ]; then
-  report_level "at ${LOCAL:0:9}"
+  if [ -n "$REF_FROZEN" ]; then
+    # Level with a ref that stopped moving is not "where it should be".
+    rm -f "$BEHIND_STAMP" 2>/dev/null || true
+    log "DEPLOY GATE FROZEN: $REF_FROZEN"
+    hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: GATE FROZEN — $REF_FROZEN"
+  else
+    report_level "at ${LOCAL:0:9} (origin/$REF)"
+  fi
   exit 0                                     # up to date -> silent no-op
 fi
 # The marker's content is the verb the unfinished deploy needed, if it was not
@@ -257,8 +325,8 @@ if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
   exit 1
 fi
 
-log "${LOCAL:0:9} -> ${REMOTE:0:9}; deploying"
-report_behind "behind origin (${LOCAL:0:9} vs ${REMOTE:0:9})"
+log "${LOCAL:0:9} -> ${REMOTE:0:9} (origin/$REF); deploying"
+report_behind "behind origin/$REF (${LOCAL:0:9} vs ${REMOTE:0:9})"
 hc_ping "$HC_DEPLOY" /start "auto-deploy[$APP]: deploying ${LOCAL:0:9} -> ${REMOTE:0:9}"
 
 # Does this deploy change the snapshot builder? If so we ALSO dispatch a rebuild after the
@@ -281,7 +349,10 @@ fi
 LOCK_CHANGED=""
 if git diff --name-only "$LOCAL" "$REMOTE" | grep -qxF uv.lock; then LOCK_CHANGED=1; fi
 
-git merge --ff-only --quiet '@{u}' || { log "fast-forward merge failed (drift) — manual fix needed"; exit 1; }
+# Merge the resolved SHA, not the ref name: naming the ref would re-resolve
+# it, and a ref that advanced in between would deploy a commit this tick never
+# diffed for changed paths.
+git merge --ff-only --quiet "$REMOTE" || { log "fast-forward merge failed (drift) — manual fix needed"; exit 1; }
 # Cleared once the reload is verified healthy (see step 5). Content = the verb
 # this deploy needs, when it is not the configured one.
 if [ -n "$LOCK_CHANGED" ]; then echo restart > "$PENDING_RELOAD"; else : > "$PENDING_RELOAD"; fi
@@ -412,6 +483,25 @@ if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] ||
     # Declared but unusable is a misconfiguration, not a reason to deploy blind —
     # the box would keep serving stale units while site.toml claimed otherwise.
     log "site.toml sets converge but deploy/converge.sh is missing or not executable; NOT reloading"
+    exit 1
+  fi
+fi
+
+# 4c. The reload contract. `reload = "reload"` is `systemctl reload <app>`, which
+#     is the unit's ExecReload= — and a unit with none makes the verb a silent
+#     no-op, so every deploy "succeeds" while the old workers keep serving
+#     (the way one box ran for months). And gunicorn's SIGHUP re-imports the app
+#     only when preload_app is False; with preload the arbiter keeps the modules
+#     it imported at boot and re-forks the old code. Both are checked HERE,
+#     after converge (the deploying commit may be the one that adds ExecReload=)
+#     and before the verb is sent. The stub in tests answers the show query.
+if [ "$RELOAD" = reload ]; then
+  if [ -z "$(${SYSCTL_QUERY:-systemctl} show -p ExecReload --value "$APP.service" 2>/dev/null)" ]; then
+    log "site.toml says reload = \"reload\" but $APP.service has no ExecReload= — the verb would be a no-op and the old workers would keep serving; declare one, or set reload = \"restart\". NOT reloading"
+    exit 1
+  fi
+  if [ -f gunicorn.conf.py ] && grep -qE '^[[:space:]]*preload_app[[:space:]]*=[[:space:]]*True' gunicorn.conf.py; then
+    log "site.toml says reload = \"reload\" but gunicorn.conf.py sets preload_app = True — SIGHUP would re-fork the OLD code; set preload_app = False, or reload = \"restart\". NOT reloading"
     exit 1
   fi
 fi

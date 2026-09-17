@@ -42,6 +42,11 @@ if [ "${1:-}" = "is-active" ]; then
   if [ -f "$f" ]; then cat "$f"; else echo inactive; fi
   exit 0
 fi
+if [ "${1:-}" = "show" ] && [ "${2:-}" = "-p" ] && [ "${3:-}" = "ExecReload" ]; then
+  if [ "${STUB_EXEC_RELOAD+set}" = set ]; then printf '%s\n' "$STUB_EXEC_RELOAD"
+  else echo '{ path=/bin/kill ; argv[]=/bin/kill -HUP $MAINPID }'; fi
+  exit 0
+fi
 verb=${1:-}
 [ "$verb" = "start" ] && [ "${2:-}" = "--no-block" ] && verb=start
 if [ -n "${STUB_FAIL_VERB:-}" ] && [ "$verb" = "$STUB_FAIL_VERB" ]; then exit 1; fi
@@ -448,6 +453,98 @@ echo "14e. unset URL: no ping, still silent"
 reset_log; run_deploy CONVERGE_CMD=env
 check "no hc call"                 [ "$(hc_calls)" = 0 ]
 check "printed nothing"            [ -z "$(out)" ]
+
+# ── deploy_ref: deploy the TESTED ref, not the tip of master ─────────────────
+site_toml() { ( cd "$WORK" || exit 1; printf '%s\n' "$@" > deploy/site.toml; git commit -qam "site.toml: $*"; git push -q origin master ); }
+BASE=('[deploy]' 'reload = "reload"' 'port = 8000' 'health_path = "/health"' 'health_match = "ok"' 'health_tries = 2' 'converge = true' 'tailwindcss_version = "4.3.3"')
+echo "15a. deploy_ref names a ref that does not exist -> REFUSES, keeps serving, says how to bypass"
+# A gate that opens when it cannot find its own lock is not a gate.
+site_toml "${BASE[@]}" 'deploy_ref = "ci-green"'
+reset_log; run_deploy CONVERGE_CMD=env                    # takes the site.toml change (still on master)
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 1"                     [ "$(rc)" = 1 ]
+check "did not reload"             not_called "systemctl reload app"
+check "said REFUSING"              grep -q "REFUSING" "$T/out.txt"
+check "named the override"         grep -q "deploy-ref" "$T/out.txt"
+check "dead-man got /fail"         called "deploy1/fail"
+
+echo "15b. the ref exists at master -> deploys onto it"
+( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "silent (level)"             [ -z "$(out)" ]
+
+echo "15c. master runs ahead of the ref -> nothing deployed, said out loud"
+push_commit c15c; reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "did not reload"             not_called "systemctl reload app"
+check "said behind"                grep -qi "behind origin/master" "$T/out.txt"
+check "still level (root ping)"    called "https://hc.example/deploy1"
+check "untested commit not taken"  bash -c 'cd "'"$SRV"'" && [ "$(git rev-parse @)" = "$(git rev-parse origin/ci-green)" ]'
+
+echo "15d. the ref has not moved for an hour while master is ahead -> the box is NOT where it should be"
+echo "$(git -C "$SRV" rev-parse origin/ci-green) 1000000000" > "$SRV/.site-deploy-state/ref-frozen-since"
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0 (nothing to do)"     [ "$(rc)" = 0 ]
+check "said FROZEN"                grep -q "FROZEN" "$T/out.txt"
+check "dead-man got /fail"         called "deploy1/fail"
+check "no root ping"               bash -c '! grep -q "https://hc.example/deploy1 *$" "$STUB_LOG"'
+
+echo "15e. the ref advances -> deploys, and the frozen clock resets"
+( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "reloaded"                   called "systemctl reload app"
+check "clock cleared"              [ ! -f "$SRV/.site-deploy-state/ref-frozen-since" ]
+
+echo "15f. a narrowed remote.origin.fetch cannot starve the ref"
+git -C "$SRV" config remote.origin.fetch '+refs/heads/master:refs/remotes/origin/master'
+git -C "$SRV" update-ref -d refs/remotes/origin/ci-green
+push_commit c15f; ( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "deployed the ref"           called "systemctl reload app"
+git -C "$SRV" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+
+echo "15g. the /etc override file wins over site.toml (an emergency, deliberately not converged)"
+push_commit c15g                                                  # master ahead of ci-green again
+echo master > "$T/deploy-ref"
+reset_log; run_deploy CONVERGE_CMD=env DEPLOY_REF_FILE="$T/deploy-ref"
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "deployed master"            called "systemctl reload app"
+check "said which ref"             grep -q "origin/master" "$T/out.txt"
+rm -f "$T/deploy-ref"
+( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "level again"                [ "$(rc)" = 0 ]
+
+# ── the reload contract ───────────────────────────────────────────────────────
+echo "16a. reload = \"reload\" against a unit with no ExecReload= refuses (the verb would be a no-op)"
+push_commit c16a; ( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env STUB_EXEC_RELOAD=""
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "did not reload"             not_called "systemctl reload app"
+check "did not purge"              not_called "purge_cache"
+check "named ExecReload"           grep -q "ExecReload" "$T/out.txt"
+reset_log; run_deploy CONVERGE_CMD=env                          # unit fixed (stub default) -> resumes
+check "resumed once fixed"         called "systemctl reload app"
+
+echo "16b. reload = \"reload\" with preload_app = True in gunicorn.conf.py refuses (SIGHUP would not re-import)"
+( cd "$WORK" || exit 1; printf 'workers = 3\npreload_app = True\n' > gunicorn.conf.py; git add -A; git commit -qm "preload"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "did not reload"             not_called "systemctl reload app"
+check "named preload_app"          grep -q "preload_app" "$T/out.txt"
+( cd "$WORK" || exit 1; printf 'workers = 3\npreload_app = False\n' > gunicorn.conf.py; git commit -qam "no preload"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "recovers"                   [ "$(rc)" = 0 ]
+
+echo "16c. reload = \"restart\" needs neither"
+site_toml "${BASE[@]/reload = \"reload\"/reload = \"restart\"}" 'deploy_ref = "ci-green"'
+( cd "$WORK" || exit 1; printf 'preload_app = True\n' > gunicorn.conf.py; git commit -qam "preload again"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env STUB_EXEC_RELOAD=""
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "restarted"                  called "systemctl restart app"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
