@@ -29,6 +29,19 @@
 # Absent from both override and fleet.toml, or present but hosting nothing:
 # said on stderr every tick, never silently — an ambiguous or empty app list
 # must never look like a question this function already answered.
+# True (exit 0) iff the site's own deploy/site.toml declares a [workspace]
+# table at all -- the sole trigger for workspace mode. WORKSPACE_ACTIVE is
+# emitted whenever the table exists, independent of which keys it declares
+# (an empty `[workspace]`, every key defaulted, is still workspace mode) --
+# checking WORKSPACE_APPS_DIR instead would miss exactly that case, since it
+# only renders when apps_dir is actually set.
+ws_active() {   # <srv>
+  local srv=$1 self_dir
+  self_dir=$(dirname "${BASH_SOURCE[0]}")
+  python3 "${WS_SITE_CONFIG:-$self_dir/../bin/site-config.py}" "$srv/deploy/site.toml" 2>/dev/null \
+    | grep -q "^export WORKSPACE_ACTIVE="
+}
+
 ws_apps() {   # <srv> <site>
   local srv=$1 site=$2
   local override="${WS_APPS_FILE:-/etc/$site/apps}"

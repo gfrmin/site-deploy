@@ -164,6 +164,12 @@ load_site_config() {
       # fact as DEPLOY_REF -- a decision that must be made from the OLD
       # checkout before anything is fetched, so a commit that turns workspace
       # mode on (or moves apps_dir) governs the NEXT deploy, not its own.
+      # WORKSPACE_ACTIVE, not WORKSPACE_APPS_DIR, is what actually decides
+      # workspace mode below: it is emitted whenever [workspace] exists at
+      # all, independent of which keys it declares, so an empty [workspace]
+      # (every key defaulted) still counts -- WORKSPACE_APPS_DIR alone would
+      # miss exactly that case, since it only renders when apps_dir is set.
+      WORKSPACE_ACTIVE=$( eval "$rendered" 2>/dev/null; printf '%s' "${WORKSPACE_ACTIVE:-}" )
       WORKSPACE_APPS_DIR=$( eval "$rendered" 2>/dev/null; printf '%s' "${WORKSPACE_APPS_DIR:-}" )
       WORKSPACE_SHARED=$( eval "$rendered" 2>/dev/null; printf '%s' "${WORKSPACE_SHARED:-}" )
       return 0
@@ -201,7 +207,7 @@ CSS_MIN_RATIO="${DEPLOY_CSS_MIN_RATIO:-50}"
 # at all (WORKSPACE_APPS_DIR is present iff it does) -- single-app is the
 # default and the degenerate case, one app named $APP under dir ".".
 WORKSPACE=""
-[ -n "${WORKSPACE_APPS_DIR:-}" ] && WORKSPACE=1
+[ -n "${WORKSPACE_ACTIVE:-}" ] && WORKSPACE=1
 APPS_DIR="${WORKSPACE_APPS_DIR:-apps}"
 if [ -n "$WORKSPACE" ]; then
   # ws_apps's own diagnostics go straight to stderr (never through log()/

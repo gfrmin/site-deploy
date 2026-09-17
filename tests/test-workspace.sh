@@ -16,6 +16,7 @@ fails=0
 pass() { echo "  ok   $1"; }
 fail() { echo "  FAIL $1"; fails=$((fails + 1)); }
 check() { local desc=$1; shift; if "$@"; then pass "$desc"; else fail "$desc"; fi; }
+not() { ! "$@"; }
 
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -84,6 +85,20 @@ OUT=$(BOX_HOSTNAME=test-host ws_apps "$T/srv/site" site 2>"$T/err"); RC=$?
 check "exit 0"                  [ "$RC" -eq 0 ]
 check "printed nothing"         [ -z "$OUT" ]
 check "said hosts nothing"      grep -qi "hosts nothing" "$T/err"
+
+# --- ws_active ---------------------------------------------------------------
+echo "7b. ws_active is false with no [workspace] table at all"
+rm -rf "$T/srv/site3"; mkdir -p "$T/srv/site3/deploy"
+printf '[deploy]\nreload = "reload"\n' > "$T/srv/site3/deploy/site.toml"
+check "not active"       not ws_active "$T/srv/site3"
+
+echo "7c. ws_active is true once [workspace] is declared, even with no keys"
+printf '[workspace]\n' > "$T/srv/site3/deploy/site.toml"
+check "active"            ws_active "$T/srv/site3"
+
+echo "7d. ws_active is false with no deploy/site.toml at all"
+rm -rf "$T/srv/site4"; mkdir -p "$T/srv/site4"
+check "not active (no file)" not ws_active "$T/srv/site4"
 
 # --- ws_apps_dir -----------------------------------------------------------
 echo "8. ws_apps_dir defaults to 'apps' with no site.toml at all"

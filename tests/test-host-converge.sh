@@ -217,6 +217,75 @@ check "named packages"                  grep -qi "packages" "$T/out.txt"
 echo "11. with HOST_ROOT unset the constants are the production paths"
 check "/etc and /srv literal"           grep -qF 'ROOT="${HOST_ROOT:-}"' "$ROOT/bin/host-converge.sh"
 
+# ── workspace mode (Phase D item 14): several apps out of one checkout ──────
+echo "workspace fixture: a site hosting foo and bar"
+mkdir -p "$HR/srv/site/apps/foo/deploy" "$HR/srv/site/apps/bar/deploy" "$HR/srv/site/deploy" \
+         "$HR/etc/foo" "$HR/etc/bar"
+printf '[workspace]\napps_dir = "apps"\n' > "$HR/srv/site/deploy/site.toml"
+printf '[hosts."the-host"]\napps = ["foo", "bar"]\n' > "$HR/srv/site/deploy/fleet.toml"
+printf '[deploy]\nreload = "reload"\n' > "$HR/srv/site/apps/foo/deploy/site.toml"
+printf '[deploy]\nreload = "reload"\nbuild_service = "site-build@bar.service"\n' > "$HR/srv/site/apps/bar/deploy/site.toml"
+run_ws() { env HOST_ROOT="$HR" BOX_HOSTNAME=the-host bash "$ROOT/bin/host-converge.sh" site > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
+
+echo "12. a fresh workspace box: a symlink + /var/lib per app, no name collision"
+reset_log; run_ws
+check "exit 0"                       [ "$(rc)" = 0 ]
+check "foo symlinked"                [ -L "$HR/srv/foo" ]
+check "foo points at the right dir"  [ "$(readlink "$HR/srv/foo")" = "$HR/srv/site/apps/foo" ]
+check "bar symlinked"                [ -L "$HR/srv/bar" ]
+check "/var/lib/foo created"         [ -d "$HR/var/lib/foo" ]
+check "/var/lib/bar created"         [ -d "$HR/var/lib/bar" ]
+check "site poller timer armed"      [ -e "$STUB_UNITS/site-deploy@site.timer.enabled" ]
+check "NEVER a per-app deploy timer" [ ! -e "$STUB_UNITS/site-deploy@foo.timer.enabled" ]
+
+echo "13. re-run: silent identity (idempotent, no re-link, no re-mkdir noise)"
+reset_log; run_ws
+check "exit 0"           [ "$(rc)" = 0 ]
+check "no re-creation logged" not_called "created /srv/foo"
+
+echo "14. the probe/checks-armed drop-ins carry User=site (the site's service user)"
+check "foo probe drop-in exists"     [ -f "$HR/etc/systemd/system/site-probe@foo.service.d/site-deploy.conf" ]
+check "it names the site as User="   grep -qx "User=site" "$HR/etc/systemd/system/site-probe@foo.service.d/site-deploy.conf"
+check "checks-armed drop-in too"     grep -qx "User=site" "$HR/etc/systemd/system/site-checks-armed@foo.service.d/site-deploy.conf"
+
+echo "15. per-app sudoers: each app's OWN unit name, default site@<app>.service"
+check "foo reload/restart grant"     grep -q "systemctl reload site@foo.service, /usr/bin/systemctl restart site@foo.service" "$HR/etc/sudoers.d/site-deploy"
+check "bar's build_service grant"    grep -q "start --no-block site-build@bar.service" "$HR/etc/sudoers.d/site-deploy"
+check "foo has no build grant"       bash -c '! grep -q "site-build@foo" "$HR/etc/sudoers.d/site-deploy"'
+check "per-app converge grant"       grep -q "bin/converge.sh foo" "$HR/etc/sudoers.d/site-deploy"
+
+echo "16. a directory (not a symlink) already at /srv/foo is a name collision: refused, not clobbered"
+rm -rf "$HR/srv/foo"; mkdir -p "$HR/srv/foo"; echo sentinel > "$HR/srv/foo/sentinel"
+reset_log; run_ws
+check "exit 1"                       [ "$(rc)" = 1 ]
+check "named the collision"          grep -qi "name collision" "$T/out.txt"
+check "did not touch the directory"  [ -f "$HR/srv/foo/sentinel" ]
+rm -rf "$HR/srv/foo"; reset_log; run_ws   # heal it for the scenarios below
+check "healed: exit 0"               [ "$(rc)" = 0 ]
+
+echo "17. per-app monitoring is keyed on THAT app's own /etc/<app>/env, not the site's"
+printf 'PROBE_URL=https://x/health\nHEALTHCHECKS_PROBE_URL=https://hc/x\n' > "$HR/etc/foo/env"
+reset_log; run_ws
+check "exit 0"                       [ "$(rc)" = 0 ]
+check "foo's probe armed"            [ -e "$STUB_UNITS/site-probe@foo.timer.enabled" ]
+check "bar's probe NOT armed"        [ ! -e "$STUB_UNITS/site-probe@bar.timer.enabled" ]
+check "bar named as unprobed"        grep -q "bar: .*UNPROBED" "$T/out.txt"
+
+echo "18. per-app packages: bar's own deploy/packages.txt is installed"
+printf 'libbaronly1\n' > "$HR/srv/site/apps/bar/deploy/packages.txt"
+reset_log; run_ws
+check "exit 0"                       [ "$(rc)" = 0 ]
+check "installed libbaronly1"        called "apt-get install"
+check "named it"                     grep -q libbaronly1 "$T/out.txt"
+
+echo "19. bar leaves the fleet: its symlink and armed timers are pruned"
+printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
+reset_log; run_ws
+check "exit 0"                       [ "$(rc)" = 0 ]
+check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
+check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
+check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))
