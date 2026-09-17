@@ -573,6 +573,7 @@ when current and loud when it refuses.
 
 ```sh
 ./tests/test-auto-deploy.sh
+./tests/test-auto-deploy-workspace.sh
 ./tests/test-self-update.sh
 ./tests/test-hc.sh
 ./tests/test-env-check.sh
