@@ -24,17 +24,22 @@ chmod 0644 /etc/ssh/sshd_config.d/00-site-harden.conf
 sshd -t && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true; }
 
 # ufw: deny inbound by default; allow the tailnet; allow Cloudflare's CURRENT
-# ranges on 80/443. The origin only ever needs Cloudflare, so this closes the
-# direct-to-origin path that would bypass Cloudflare's WAF/DDoS/cache.
+# ranges on 80/443, kept in step daily by ufw-cloudflare-sync.timer (enabled
+# below — its unit files are already on the box, installed by host-converge.sh
+# during install.sh, which per the bootstrap order runs before this script).
+# The origin only ever needs Cloudflare, so this closes the direct-to-origin
+# path that would bypass Cloudflare's WAF/DDoS/cache. reset+deny+tailnet
+# happens ONCE here; the Cloudflare rules themselves are the sync script's
+# job even on this first run, so day-one and every day after use the same
+# code path.
 ufw --force reset >/dev/null
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
 ufw allow in on tailscale0 >/dev/null
-for cidr in $(curl -fsS https://www.cloudflare.com/ips-v4) $(curl -fsS https://www.cloudflare.com/ips-v6); do
-  ufw allow from "$cidr" to any port 443 proto tcp >/dev/null
-  ufw allow from "$cidr" to any port 80  proto tcp >/dev/null
-done
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$SELF/../bin/ufw-cloudflare-sync.sh"
 ufw --force enable >/dev/null
+systemctl enable --quiet --now ufw-cloudflare-sync.timer
 
 echo "hardened: sshd key-only + ufw up ($(ufw status | grep -c ALLOW) allow rules = tailnet + Cloudflare 80/443)"
 echo "VERIFY NOW from another shell:  ssh g@<box>   AND   curl -fsS https://<domain>/health"

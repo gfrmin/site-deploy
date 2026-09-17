@@ -1,0 +1,15 @@
+# Daily, plus a boot run: Cloudflare's ranges change occasionally, and a box
+# that never re-fetches them silently drifts. Persistent=true because a
+# missed day (box was off) should catch up rather than wait for the next
+# scheduled tick — the job is idempotent, so a catch-up run is free.
+[Unit]
+Description=Sync ufw's Cloudflare allow-list daily
+
+[Timer]
+OnBootSec=10min
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

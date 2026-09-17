@@ -39,6 +39,7 @@ jobs:
           ./tests/test-env-check.sh
           ./tests/test-checks-armed.sh
           ./tests/test-host-converge.sh
+          ./tests/test-ufw-cloudflare-sync.sh
 
   # Advance `ci-green` to this commit once the suite is green on master. The
   # boxes track that ref (bin/self-update.sh), so a red run here means the

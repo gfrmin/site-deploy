@@ -1,0 +1,13 @@
+# Keep ufw's 80/443 allow-list equal to Cloudflare's current ranges. Root,
+# because ufw is. Idempotent and silent when nothing changed — see the script
+# for why it never touches a rule it did not tag itself.
+[Unit]
+Description=Sync ufw's Cloudflare allow-list to their current published ranges
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/srv/site-deploy/bin/ufw-cloudflare-sync.sh
+TimeoutStartSec=2min
+Nice=19
