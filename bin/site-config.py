@@ -39,6 +39,8 @@ KEYS = {
     "converge": "DEPLOY_CONVERGE",
     "tailwindcss_version": "TAILWINDCSS_VERSION",
     "deploy_ref": "DEPLOY_REF",
+    "service": "DEPLOY_SERVICE",
+    "build_inputs": "DEPLOY_BUILD_INPUTS",
 }
 
 
@@ -50,7 +52,14 @@ def render(config: dict, environ: dict) -> list[str]:
         if key not in deploy:
             continue
         value = deploy[key]
-        value = "" if value is None else str(value)
+        # A list (e.g. `build_inputs = ["data/", "packages/x/"]`) is joined
+        # newline-separated: shlex.quote below keeps embedded newlines intact
+        # inside the exported string, and the shell side reads them back with
+        # `while IFS= read -r`.
+        if isinstance(value, list):
+            value = "\n".join(str(v) for v in value)
+        else:
+            value = "" if value is None else str(value)
         existing = environ.get(var)
         if existing is not None and existing != value:
             warnings.append(
