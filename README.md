@@ -72,7 +72,7 @@ under one lock, and `/etc/dataguru/apps`.
 ```
 bin/auto-deploy.sh   generic poller (run by the timer, as the service user)
 bin/self-update.sh   keeps /srv/site-deploy on the toolkit's tested ref (run by a root timer)
-bin/cf-purge.sh      Cloudflare edge purge (no-op unless CF_* set in /etc/<app>/env)
+bin/cf-purge.sh      Cloudflare edge purge (no-op without CF_CACHE_PURGE_TOKEN); bin/cf-purge-verify.sh checks it actually evicted
 bin/health-probe.sh  active public probe -> its healthchecks check (see Monitoring)
 bin/hc-unit-result.sh ExecStopPost= backstop: /fail when a unit did not end in success
 bin/env-check.sh     does the box carry every env NAME deploy/required-env.txt declares? (see below)
@@ -323,6 +323,19 @@ edit and nothing else, notably not cache-purge (that is `CF_CACHE_PURGE_TOKEN`, 
 `bin/cf-purge.sh`) — lives in root-only `/etc/<app>/cf-env`, never in `/etc/<app>/env`: the poller
 runs as the service user and has no business reading a token that can rewrite the zone's firewall.
 
+**`bin/cf-purge.sh`** (unlike the config-write path above, this token lives in the ordinary
+`/etc/<app>/env` — a cache-purge-only token is a much smaller blast radius). `CF_ZONE_ID` skips the
+lookup; otherwise the zone is resolved from `BASE_URL`'s domain, the same name-filtered-list trick
+`cf-converge.py` uses. `CF_PURGE_SETTLE` (default 3s) waits before purging, because the reload
+immediately before it only *sends* SIGHUP — for a short window the old workers still answer, and
+whatever the edge pulls in that window sits there for a full TTL. `bin/cf-purge-verify.sh` then
+re-requests one URL and checks the edge actually let go of it: Cloudflare's purge API answers
+`200 {"success": true}` whether or not anything was evicted, which is how a zone whose cache rule
+quietly stopped admitting `PURGE` requests can log a clean purge every night for months. Promoted
+from three near-identical app clones in renavon-monorepo; a fourth app's much larger *targeted*
+purge (specific hub + sitemap URLs, harvested from the origin's own sitemap index) stays app-owned
+rather than becoming a toolkit feature — this file purges everything, which is the common case.
+
 ## Monitoring: two checks per app, and why neither is enough alone
 
 Nothing here reports a success it has not verified, and a missing dead-man does not fail — it
@@ -389,7 +402,7 @@ refresh-env   R2_KEY           required        the loader
 DEPLOY_RELOAD=reload               # or: restart   (apps with no ExecReload)
 DEPLOY_UV_ARGS=--frozen --no-dev   # or just: --frozen
 # DEPLOY_BUILD_SERVICE=<app>-build.service   # snapshot-backed apps only (see above)
-# CF_ZONE_ID=... / CF_CACHE_PURGE_TOKEN=...   # optional edge purge
+# CF_CACHE_PURGE_TOKEN=... / CF_ZONE_ID=... / BASE_URL=...  # optional edge purge (see below)
 # HEALTHCHECKS_DEPLOY_URL=...                 # deploy dead-man (see Monitoring)
 # PROBE_URL=... / HEALTHCHECKS_PROBE_URL=...  # active probe (see Monitoring)
 ```
@@ -428,6 +441,7 @@ when current and loud when it refuses.
 ./tests/test-ufw-cloudflare-sync.sh
 ./tests/test-cf-converge.sh
 ./tests/test-cf-converge-run.sh
+./tests/test-cf-purge.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,

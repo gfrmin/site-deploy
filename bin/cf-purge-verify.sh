@@ -54,7 +54,7 @@ cf_purge_verify() {
   # honest wait. Too short and this reports a false failure.
   sleep "$settle" || true
 
-  hdrs=$(/usr/bin/curl -sS -o /dev/null -D - --max-time 15 \
+  hdrs=$(curl -sS -o /dev/null -D - --max-time 15 \
            -H 'Accept-Encoding: gzip' "$url" 2>/dev/null) || hdrs=""
   if [ -z "$hdrs" ]; then
     echo "cf-purge: WARNING unverified -- probe of $url failed (network? origin down?)" >&2
@@ -94,7 +94,7 @@ cf_purge_verify() {
       # match a page we are treating as cached. crhk.guru shipped exactly this
       # for /browse, /new-companies and /statistics (#175).
       echo "cf-purge: WARNING $url is not edge-cached ($cache) -- purging it does nothing." \
-           "Its path is missing from the zone's cache rule in deploy/site.toml." >&2
+           "Its path is missing from the zone's cache rule in deploy/cloudflare.json." >&2
       ;;
     *)
       echo "cf-purge: unverified -- $url returned cf-cache-status: $cache" >&2
