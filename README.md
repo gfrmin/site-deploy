@@ -85,6 +85,8 @@ bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's cu
 bin/cf-converge.py   converge one zone's Cloudflare config (SSL/DNS/cache/WAF/rate-limit) to deploy/cloudflare.json
 bin/cf-converge-run.sh root wrapper: derives the domain + the box's public IP, calls cf-converge.py
 bin/backup.sh        encrypt deploy/backup-producer.sh's stdout, ship off-box, verify by round trip, prune (root)
+bin/converge.sh       generic [converge]-table engine: install/validate/reload-with-rollback/prune (root)
+bin/converge-config.py deploy/site.toml [converge] table -> bin/converge.sh's bash arrays
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
 systemd/site-probe@.service , site-probe@.timer            per-app active probe (every 5 min)
@@ -238,8 +240,9 @@ Cloudflare 521s while the app underneath answered every health check.
 
 With `converge = true`, `deploy/converge.sh` from the app repo runs **as root**, after `uv sync` and
 **before** the reload. A failure stops the deploy with the old code still serving and the edge cache
-intact, exactly like a failed `uv sync`. Declaring the knob without a usable script is also fatal:
-deploying while believing the config converged is worse than not deploying.
+intact, exactly like a failed `uv sync`. If `deploy/converge.sh` exists but is not executable that is
+also fatal — a forgotten `chmod +x`, not "this app has none": deploying while believing the config
+converged is worse than not deploying.
 
 The app owns the script, because only it knows which files it declares. Keep a fixed
 destination allowlist in it so a stray file cannot become a live unit by accident, validate anything
@@ -258,6 +261,49 @@ twice: once before the fetch (for knobs needed to decide what to do) and again a
 a commit that changes it governs its own deploy rather than the next one. A malformed file is fatal
 *after* the merge and merely a warning before it, or the file that breaks the deploy would deadlock
 the very commit that fixes it.
+
+#### No `deploy/converge.sh`? `bin/converge.sh` — declare files instead of scripting them
+
+An app with **no** `deploy/converge.sh` at all gets the toolkit's own engine instead, driven by a
+`[converge]` table in `site.toml` — the shape webbsite's own hand-written `converge.sh` and
+renavon-monorepo's `dataguru-converge.sh` had each already converged on independently: install a file
+only on diff, validate before installing, reload with a rollback on failure, keep declared timers
+enabled. An app with its own script keeps using it — this is the alternative for one that would
+rather declare than script.
+
+```toml
+[[converge.files]]
+src      = "deploy/app.service"          # relative to the app's repo
+dst      = "/etc/systemd/system/app.service"
+apply    = "daemon-reload"               # reload | restart | daemon-reload
+
+[[converge.files]]
+src      = "deploy/Caddyfile"
+dst      = "/etc/caddy/Caddyfile"
+validate = "caddy"                       # caddy | systemd-analyze | visudo
+unit     = "caddy"                       # required iff apply is reload/restart
+apply    = "reload"
+
+[converge]
+ensure_active = ["caddy"]   # started (once enabled) if found down, every tick
+enable_timers = true        # every *.timer among the files above is enabled+started
+prune         = true        # a dst this app installed before but no longer declares is deleted
+```
+
+- **Rollback.** A `reload`-apply file is backed up to `$dst.bak` before being overwritten; if the
+  reload then fails, the backup is restored and reloaded again, and the run is still marked failed —
+  the box is left exactly where it was, not merely "not worse".
+- **The cold-start race**, ported from webbsite's own Caddy special case: if `ensure_active` had to
+  *start* a unit this tick (it was found down), that fresh process already read whatever file was
+  just installed. Reloading it immediately after is not merely redundant — it can lose a race with
+  the daemon still coming up and report a failure that would roll back a file that was never wrong.
+  A reload sharing a unit with one `ensure_active` just started is skipped, once, that tick only.
+- **`prune`** is state-tracked (`/var/lib/<app>/converge-installed-files`), not a directory scan: a
+  file the app never asked this engine to manage is never at risk just because it happens to sit near
+  one that is.
+- `bin/converge-config.py` reads the `[converge]` table; a malformed one (an unknown `apply`/
+  `validate` value, `apply = "reload"` with no `unit`) refuses outright rather than silently doing
+  nothing.
 
 ### Cloudflare as code: `bin/cf-converge.py`
 
@@ -527,6 +573,8 @@ when current and loud when it refuses.
 ./tests/test-cf-purge.sh
 ./tests/test-backup.sh
 ./tests/test-systemd-units.sh
+./tests/test-converge-config.sh
+./tests/test-converge.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,

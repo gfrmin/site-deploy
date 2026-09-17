@@ -104,6 +104,7 @@ tmp_sudo=$(mktemp)
   [ -n "$build_svc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
   echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
   echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/host-converge.sh $APP"
+  echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/converge.sh $APP"
   echo "$APP ALL=(root) NOPASSWD: /srv/$APP/deploy/converge.sh"
 } > "$tmp_sudo"
 if visudo -cf "$tmp_sudo" >/dev/null 2>&1; then
