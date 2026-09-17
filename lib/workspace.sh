@@ -32,7 +32,7 @@
 ws_apps() {   # <srv> <site>
   local srv=$1 site=$2
   local override="${WS_APPS_FILE:-/etc/$site/apps}"
-  local self_dir out rc
+  local self_dir rc
   self_dir=$(dirname "${BASH_SOURCE[0]}")
   local out_str=""
   if [ -r "$override" ]; then
