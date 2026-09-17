@@ -80,7 +80,9 @@ bin/checks-armed.sh  are the fleet's healthchecks alarms actually armed? (paused
 lib/hc.sh            the ping leaf + http_probe, sourced by every reporter
 bin/host-converge.sh converge the box below the app every tick: units, grants, journald, swap, packages, Caddy policy, timers (root)
 bin/install.sh       bootstrap: root-own the toolkit, first host-converge, env-check (admin, once)
-bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
+bin/site-config.py   deploy/site.toml -> DEPLOY_*/WORKSPACE_* env; --app-keys renders only the per-app subset
+bin/fleet-config.py  deploy/fleet.toml -> which apps this hostname hosts (workspace mode; see below)
+lib/workspace.sh     ws_apps/ws_apps_dir/ws_site_of: which apps a site hosts, and where (workspace mode)
 bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's current ranges (root)
 bin/cf-converge.py   converge one zone's Cloudflare config (SSL/DNS/cache/WAF/rate-limit) to deploy/cloudflare.json
 bin/cf-converge-run.sh root wrapper: derives the domain + the box's public IP, calls cf-converge.py
@@ -584,6 +586,9 @@ when current and loud when it refuses.
 ./tests/test-systemd-units.sh
 ./tests/test-converge-config.sh
 ./tests/test-converge.sh
+./tests/test-fleet-config.sh
+./tests/test-workspace.sh
+./tests/test-site-config.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,
