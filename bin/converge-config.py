@@ -62,6 +62,21 @@ def parse(config: dict, path: Path) -> list[str] | None:
         if apply_ in ("reload", "restart") and not unit:
             print(f"{path}: converge.files[{i}] apply={apply_!r} requires 'unit'", file=sys.stderr)
             return None
+        # A template unit ("foo@" or "foo@.service"/"foo@.timer" -- no
+        # instance name between the @ and the suffix) has no single running
+        # process to SIGHUP: `systemctl reload foo@` is meaningless, and
+        # there is no safe interpretation converge.sh could guess at. Only
+        # `apply = "restart"` is accepted for one (converge.sh then queues a
+        # restart for every hosted app whose service instantiates it, rather
+        # than restarting the template itself).
+        is_template = unit.endswith("@") or any(
+            unit.endswith(f"@.{suffix}") for suffix in ("service", "timer", "socket")
+        )
+        if is_template and apply_ == "reload":
+            print(f"{path}: converge.files[{i}] unit={unit!r} is a template unit; "
+                  "apply = 'reload' cannot target one (no single instance to SIGHUP) -- "
+                  "use apply = 'restart'", file=sys.stderr)
+            return None
         for v in (f["src"], f["dst"], validate, unit, apply_):
             if FS in v or "\n" in v:
                 print(f"{path}: converge.files[{i}] a value contains the field separator or a newline",

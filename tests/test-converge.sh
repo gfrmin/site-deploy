@@ -213,6 +213,123 @@ check "exit 1"       [ "$(rc)" = 1 ]
 check "said so"      grep -q "missing in repo" "$T/out.txt"
 check "not installed" [ ! -f "$HR/etc/systemd/system/nope.service" ]
 
+echo "16. a comment-only change to a systemd unit is installed but NOT reloaded/restarted"
+printf 'unit a\n' > "$HR/srv/app/deploy/d.service"
+site_toml \
+  '[[converge.files]]' 'src = "deploy/d.service"' 'dst = "/etc/systemd/system/d.service"' 'unit = "d"' 'apply = "restart"'
+reset_log; run
+check "exit 0 (baseline restart)" [ "$(rc)" = 0 ]
+check "restarted the baseline"    called "systemctl restart d"
+printf 'unit a\n# just a comment\n\n' > "$HR/srv/app/deploy/d.service"
+reset_log; run
+check "exit 0"                    [ "$(rc)" = 0 ]
+check "installed the new file"    grep -qF "$(cat "$HR/srv/app/deploy/d.service")" "$HR/etc/systemd/system/d.service"
+check "said comment-only"         grep -qi "comments or blank" "$T/out.txt"
+check "did NOT restart again"     not_called "systemctl restart d"
+
+echo "17. a REAL directive change to the same unit restarts it"
+printf 'unit a\nExtra=1\n' > "$HR/srv/app/deploy/d.service"
+reset_log; run
+check "exit 0"                    [ "$(rc)" = 0 ]
+check "restarted (real change)"   called "systemctl restart d"
+
+echo "18. apply=restart daemon-reloads BEFORE restarting, not only apply=daemon-reload files"
+printf 'unit a\nExtra=2\n' > "$HR/srv/app/deploy/d.service"
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "daemon-reloaded"                 called "systemctl daemon-reload"
+check "reload happens before restart"   bash -c '
+  r=$(grep -n "daemon-reload" "$STUB_LOG" | head -1 | cut -d: -f1)
+  s=$(grep -n "restart d$" "$STUB_LOG" | head -1 | cut -d: -f1)
+  [ -n "$r" ] && [ -n "$s" ] && [ "$r" -lt "$s" ]'
+
+echo "19. enable_timers: an ALREADY enabled+active timer whose file changed is restarted, not left alone"
+printf 'timer x\n' > "$HR/srv/app/deploy/y.timer"
+site_toml \
+  '[[converge.files]]' 'src = "deploy/d.service"' 'dst = "/etc/systemd/system/d.service"' 'unit = "d"' 'apply = "restart"' '' \
+  '[[converge.files]]' 'src = "deploy/y.timer"' 'dst = "/etc/systemd/system/y.timer"' '' \
+  '[converge]' 'enable_timers = true'
+reset_log; run
+check "exit 0 (first arm)"        [ "$(rc)" = 0 ]
+check "x armed"                   [ -e "$STUB_UNITS/y.timer.enabled" ] && [ -e "$STUB_UNITS/y.timer.active" ]
+printf 'timer x\nOnCalendar=*-*-* 05:00:00\n' > "$HR/srv/app/deploy/y.timer"
+reset_log; run
+check "exit 0"                    [ "$(rc)" = 0 ]
+check "restarted (schedule changed)" [ -e "$STUB_UNITS/y.timer.restarted" ]
+rm -f "$STUB_UNITS/y.timer.restarted"
+reset_log; run   # idle tick: nothing changed this time
+check "exit 0"                    [ "$(rc)" = 0 ]
+check "NOT restarted again"       [ ! -e "$STUB_UNITS/y.timer.restarted" ]
+
+# ── the template-restart queue (workspace mode, Phase D item 14) ────────────
+# A site-level [[converge.files]] entry can declare the TEMPLATE unit that
+# every hosted app instantiates (e.g. site2@.service). systemctl cannot
+# restart a bare template, so converge.sh queues a restart for each hosted
+# app whose own service is an instance of it instead.
+echo "workspace fixture: site2 hosting foo2 and bar2"
+mkdir -p "$HR/srv/site2/apps/foo2/deploy" "$HR/srv/site2/apps/bar2/deploy" "$HR/srv/site2/deploy" \
+         "$HR/var/lib/site-deploy/site2"
+printf '[hosts."thehost"]\napps = ["foo2", "bar2"]\n' > "$HR/srv/site2/deploy/fleet.toml"
+printf '[deploy]\nreload = "reload"\n' > "$HR/srv/site2/apps/foo2/deploy/site.toml"
+printf '[deploy]\nreload = "reload"\nservice = "site2@custom-bar2.service"\n' > "$HR/srv/site2/apps/bar2/deploy/site.toml"
+printf 'template v1\n' > "$HR/srv/site2/deploy/site2-app.service"
+run2() { env HOST_ROOT="$HR" BOX_HOSTNAME=thehost bash "$ROOT/bin/converge.sh" site2 > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
+
+echo "20. a template unit's restart queues one marker per hosted app that instantiates it"
+cat > "$HR/srv/site2/deploy/site.toml" <<'TOML'
+[workspace]
+apps_dir = "apps"
+
+[[converge.files]]
+src = "deploy/site2-app.service"
+dst = "/etc/systemd/system/site2@.service"
+unit = "site2@"
+apply = "restart"
+TOML
+reset_log; run2
+check "exit 0"                      [ "$(rc)" = 0 ]
+check "installed the template file" [ -f "$HR/etc/systemd/system/site2@.service" ]
+check "did NOT try to restart the bare template" not_called "systemctl restart site2@"
+check "foo2 queued (default site2@foo2.service matches)" \
+      [ "$(cat "$HR/var/lib/site-deploy/site2/pending/foo2")" = restart ]
+check "bar2 queued too (its OWN declared service also matches)" \
+      [ "$(cat "$HR/var/lib/site-deploy/site2/pending/bar2")" = restart ]
+check "said so for foo2"            grep -q "foo2: restart queued (site2@ changed" "$T/out.txt"
+
+echo "21. re-run with the template unchanged: no new markers, no restart, silent about it"
+rm -f "$HR/var/lib/site-deploy/site2/pending/foo2" "$HR/var/lib/site-deploy/site2/pending/bar2"
+reset_log; run2
+check "exit 0"                [ "$(rc)" = 0 ]
+check "no re-install"         not_called "installed deploy/site2-app.service"
+check "nothing queued again"  [ ! -e "$HR/var/lib/site-deploy/site2/pending/foo2" ]
+
+echo "22. a service that does not actually instantiate the template is not swept in"
+printf '[deploy]\nreload = "reload"\nservice = "notsite2@bar2.service"\n' > "$HR/srv/site2/apps/bar2/deploy/site.toml"
+echo "template v2" >> "$HR/srv/site2/deploy/site2-app.service"
+reset_log; run2
+check "exit 0"                 [ "$(rc)" = 0 ]
+check "foo2 still queued"      [ "$(cat "$HR/var/lib/site-deploy/site2/pending/foo2")" = restart ]
+check "bar2 NOT queued (its service does not instantiate site2@)" \
+      [ ! -e "$HR/var/lib/site-deploy/site2/pending/bar2" ]
+rm -f "$HR/var/lib/site-deploy/site2/pending/foo2"
+printf '[deploy]\nreload = "reload"\nservice = "site2@custom-bar2.service"\n' > "$HR/srv/site2/apps/bar2/deploy/site.toml"
+
+echo "23. apply = \"reload\" on a template is refused by converge-config.py, never attempted"
+cat > "$HR/srv/site2/deploy/site.toml" <<'TOML'
+[workspace]
+apps_dir = "apps"
+
+[[converge.files]]
+src = "deploy/site2-app.service"
+dst = "/etc/systemd/system/site2@.service"
+unit = "site2@"
+apply = "reload"
+TOML
+reset_log; run2
+check "exit 1"                 [ "$(rc)" = 1 ]
+check "named it a template"    grep -qi "template unit" "$T/out.txt"
+check "did not install"        not_called "installed deploy/site2-app.service"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))

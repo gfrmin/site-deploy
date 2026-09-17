@@ -47,6 +47,9 @@ TOML="$SRV/deploy/site.toml"
 STATE_DIR="${CONVERGE_STATE_DIR:-$ROOT/var/lib/$APP}"
 MANIFEST="$STATE_DIR/converge-installed-files"
 
+# shellcheck disable=SC1091
+. "$SELF/lib/workspace.sh"
+
 say() { echo "converge[$APP]: $*"; }
 rc=0
 note_failure() { rc=1; say "$*"; }
@@ -73,6 +76,15 @@ while IFS=$'\x1f' read -r kind a b c d e; do
   esac
 done <<< "$cfg"
 
+# A unit's directives: every line systemd acts on, without comments (# or ;)
+# or blank lines. Used to tell a unit change that alters what runs from one
+# that only rewords a comment (renavon #1362) -- scoped to files under
+# /etc/systemd/, the only class of file this distinction applies to.
+unit_directives() {   # <path>
+  [ -f "$1" ] || return 0
+  grep -vE '^[[:space:]]*([#;]|$)' "$1" || true
+}
+
 validate_file() {   # <type> <path> <unit>
   local type=$1 path=$2 unit=$3
   case "$type" in
@@ -91,11 +103,59 @@ validate_file() {   # <type> <path> <unit>
   esac
 }
 
+# A TEMPLATE unit ("foo@" or "foo@.service"/"foo@.timer"/"foo@.socket" --
+# no instance name between the @ and the suffix) has no single running
+# process to restart. converge-config.py already refuses apply = "reload"
+# on one; a "restart" here means the FILE that defines every instance
+# changed, which is a build input for every app that instantiates it, not
+# a single unit to restart.
+is_template_unit() {   # <unit>
+  case "$1" in
+    *@) return 0 ;;
+    *@.service|*@.timer|*@.socket) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A template unit changed: queue a restart for every app THIS SITE hosts
+# whose OWN service instantiates it, rather than restarting the template
+# (which systemctl cannot do). $APP here may be the site itself (a
+# site-level converge run) or a workspace app reached through its /srv/<app>
+# symlink (a per-app converge run) -- ws_site_of resolves either back to the
+# owning site, so this works the same from both call sites.
+queue_template_restart() {   # <template-unit>
+  local tmpl=$1 site site_srv apps_dir a dir svc pending_dir queued=""
+  site=$(ws_site_of "$ROOT" "$APP")
+  site_srv="$ROOT/srv/$site"
+  apps_dir=$(ws_apps_dir "$site_srv")
+  pending_dir="${CONVERGE_QUEUE_DIR:-$ROOT/var/lib/site-deploy/$site}/pending"
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    dir="$apps_dir/$a"
+    svc=$(python3 "$SELF/bin/site-config.py" --app-keys "$site_srv/$dir/deploy/site.toml" 2>/dev/null \
+            | sed -n "s/^export DEPLOY_SERVICE=//p" | tail -1 | tr -d "'\"")
+    [ -n "$svc" ] || svc="$site@$a.service"
+    case "$svc" in
+      "${tmpl%@}@"*) : ;;   # this app's service is an instance of $tmpl
+      *) continue ;;
+    esac
+    if mkdir -p "$pending_dir" 2>/dev/null; then
+      echo restart > "$pending_dir/$a"
+      say "$a: restart queued ($tmpl changed; the poller applies it after the CSS build, same as a code-side uv.lock change)"
+      queued=1
+    else
+      note_failure "$a: restart needed ($tmpl changed) but $pending_dir is not writable -- could not queue it"
+    fi
+  done < <(ws_apps "$site_srv" "$site" 2>/dev/null)
+  [ -n "$queued" ] || note_failure "$tmpl is a template unit, but no hosted app's service instantiates it -- nothing queued"
+}
+
 daemon_reload_needed=""
 reload_targets=()   # "<unit>:<dst>", one per changed reload-apply file
 restart_units=()
 cold_started=()      # ensure_active units this tick had to START
 installed_now=()
+changed_dsts=()      # dst paths actually installed (i.e. differed) THIS tick
 
 for i in "${!files_src[@]}"; do
   src="$SRV/${files_src[$i]}"; dst="$ROOT${files_dst[$i]}"
@@ -110,15 +170,36 @@ for i in "${!files_src[@]}"; do
     note_failure "refusing to install $dst: failed $type validation"
     continue
   fi
+  # Captured BEFORE the install, so a systemd-path file's comment-only edit
+  # (renavon #1362) can be told from one that changes what actually runs.
+  old_directives=""
+  case "$dst" in "$ROOT/etc/systemd/"*) old_directives=$(unit_directives "$dst") ;; esac
   install -d -m0755 "$(dirname "$dst")"
   [ "$apply" = reload ] && [ -f "$dst" ] && cp -a "$dst" "$dst.bak"
   install -m0644 "$src" "$dst" || { note_failure "could not install $dst"; continue; }
   say "installed ${files_src[$i]} -> $dst"
-  case "$apply" in
-    daemon-reload) daemon_reload_needed=1 ;;
-    reload) reload_targets+=("$unit:$dst") ;;
-    restart) restart_units+=("$unit") ;;
+  changed_dsts+=("$dst")
+  # ANY changed file under /etc/systemd/ needs a daemon-reload before anything
+  # (reload, restart, or enable) acts on it -- not only files whose OWN apply
+  # is "daemon-reload". Without this, apply = "restart" restarted the unit
+  # against whatever systemd still had cached from the PREVIOUS file.
+  case "$dst" in "$ROOT/etc/systemd/"*) daemon_reload_needed=1 ;; esac
+  comment_only=""
+  case "$dst" in
+    "$ROOT/etc/systemd/"*)
+      if [ "$(unit_directives "$dst")" = "$old_directives" ]; then
+        comment_only=1
+        say "${files_src[$i]} changed only in comments or blank lines -- installed, no reload/restart queued"
+      fi
+      ;;
   esac
+  if [ -z "$comment_only" ]; then
+    case "$apply" in
+      daemon-reload) daemon_reload_needed=1 ;;
+      reload) reload_targets+=("$unit:$dst") ;;
+      restart) restart_units+=("$unit") ;;
+    esac
+  fi
 done
 
 if [ -n "$daemon_reload_needed" ]; then
@@ -162,7 +243,11 @@ for entry in "${reload_targets[@]}"; do
 done
 
 for unit in "${restart_units[@]}"; do
-  ${SYSCTL_QUERY:-systemctl} restart "$unit" && say "$unit restarted" || note_failure "$unit restart failed"
+  if is_template_unit "$unit"; then
+    queue_template_restart "$unit"
+  else
+    ${SYSCTL_QUERY:-systemctl} restart "$unit" && say "$unit restarted" || note_failure "$unit restart failed"
+  fi
 done
 
 if [ -n "$enable_timers" ]; then
@@ -173,6 +258,19 @@ if [ -n "$enable_timers" ]; then
     if ! ${SYSCTL_QUERY:-systemctl} is-enabled --quiet "$t" 2>/dev/null \
        || ! ${SYSCTL_QUERY:-systemctl} is-active --quiet "$t" 2>/dev/null; then
       ${SYSCTL_QUERY:-systemctl} enable --now --quiet "$t" && say "enabled $t" || note_failure "could not enable $t"
+    else
+      # Already enabled AND active: `enable` above is a no-op, so a schedule
+      # drop-in or the unit file itself changing under it would otherwise
+      # only take effect at the NEXT boot. Restart ONLY the ones this tick
+      # actually installed (renavon #204: restarting a Persistent=true timer
+      # whose stamp predates a scheduled elapse fires its service
+      # IMMEDIATELY, so a timer that did not change here must stay untouched).
+      for c in "${changed_dsts[@]:-}"; do
+        if [ "$c" = "$ROOT$dst" ]; then
+          ${SYSCTL_QUERY:-systemctl} restart "$t" && say "$t restarted (schedule changed)" || note_failure "$t restart failed"
+          break
+        fi
+      done
     fi
   done
 fi
