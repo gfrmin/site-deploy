@@ -12,9 +12,14 @@
 #   DEPLOY_RELOAD=reload|restart      (default reload; use restart for apps with no ExecReload)
 #   DEPLOY_UV_ARGS=--frozen [--no-dev]
 #   DEPLOY_BUILD_SERVICE=<app>-build.service  (optional; for apps with a snapshot build — if a
-#                                              deploy changes data/build_db.py, ALSO dispatch a
-#                                              snapshot rebuild after the reload; new app code must
-#                                              degrade gracefully on the previous snapshot schema)
+#                                              deploy changes a DEPLOY_BUILD_INPUTS path, ALSO
+#                                              dispatch a snapshot rebuild after the reload; new
+#                                              app code must degrade gracefully on the previous
+#                                              snapshot schema)
+#   DEPLOY_BUILD_INPUTS=data/build_db.py      (site.toml `build_inputs`; one path prefix per
+#                                              line, default data/build_db.py)
+#   DEPLOY_SERVICE=$APP.service               (site.toml `service`; the unit reloaded/restarted
+#                                              and inspected for the reload contract)
 #   CF_ZONE_ID, CF_CACHE_PURGE_TOKEN  (optional; used by bin/cf-purge.sh)
 #   DEPLOY_HEALTH_PATH=/health        (probed on 127.0.0.1:$PORT after the reload, before the
 #                                      purge; empty disables the gate)
@@ -57,20 +62,46 @@ STATE_DIR="${DEPLOY_STATE_DIR:-$SRV/.site-deploy-state}"
 BEHIND_STAMP="$STATE_DIR/behind-since"
 BEHIND_FAIL_SECONDS="${BEHIND_FAIL_SECONDS:-900}"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
+# Per-app queue dirs (Phase D item 14: a workspace site hosts several apps out
+# of one checkout; today's single-app site has exactly one entry, $APP, under
+# dir "."). pending/<app>: the verb ("reload"|"restart") an unfinished apply
+# still owes, cleared once that app's health probe passes. rebuild-pending/<app>:
+# an empty flag for a queued-but-not-yet-dispatched snapshot rebuild.
+PENDING_DIR="$STATE_DIR/pending"
+REBUILD_DIR="$STATE_DIR/rebuild-pending"
 RUNLOG=$(mktemp)
 CSS_TMP=""
+DRAIN_OK=0
 on_exit() {
   local rc=$?
   [ -n "$CSS_TMP" ] && rm -f "$CSS_TMP"
   if [ "$rc" -ne 0 ]; then
     hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: exit $rc
 $(tail -n 60 "$RUNLOG" 2>/dev/null)"
+  elif [ "$DRAIN_OK" = 1 ]; then
+    drain_rebuild_queue
   fi
   rm -f "$RUNLOG"
   exit "$rc"
 }
 trap on_exit EXIT
 log() { echo "auto-deploy[$APP]: $*"; printf '%s\n' "$*" >> "$RUNLOG"; }
+
+# One-time migration from the pre-workspace-mode single-file markers to the
+# per-app queue directories, so a box with an in-flight retry or a resumed
+# deploy is not silently dropped by this refactor.
+mkdir -p "$PENDING_DIR" "$REBUILD_DIR" 2>/dev/null || true
+if [ -f "$SRV/.site-deploy-reload-pending" ]; then
+  legacy_verb=$(tr -d '[:space:]' < "$SRV/.site-deploy-reload-pending")
+  printf '%s' "$legacy_verb" > "$PENDING_DIR/$APP"
+  rm -f "$SRV/.site-deploy-reload-pending"
+  log "migrated legacy .site-deploy-reload-pending -> $PENDING_DIR/$APP${legacy_verb:+ ($legacy_verb)}"
+fi
+if [ -f "$SRV/.site-deploy-build-pending" ]; then
+  : > "$REBUILD_DIR/$APP"
+  rm -f "$SRV/.site-deploy-build-pending"
+  log "migrated legacy .site-deploy-build-pending -> $REBUILD_DIR/$APP"
+fi
 # Level: the box holds the ref it should. Clears the stamp so the next stall is
 # measured from when it started, not from the last time anything was wrong.
 report_level() { rm -f "$BEHIND_STAMP" 2>/dev/null || true; hc_ping "$HC_DEPLOY" "" "auto-deploy[$APP]: $1"; }
@@ -122,6 +153,11 @@ load_site_config() {
     else
       DEPLOY_BUILD_SERVICE=$( eval "$rendered" 2>/dev/null; printf '%s' "${DEPLOY_BUILD_SERVICE:-}" )
       DEPLOY_REF=$( eval "$rendered" 2>/dev/null; printf '%s' "${DEPLOY_REF:-}" )
+      # Scoped like DEPLOY_BUILD_SERVICE, and for the same reason: SCHEMA_CHANGED
+      # below is computed from the OLD checkout's diff before anything is
+      # fetched, so the path list that decides it has to come from the OLD
+      # site.toml too, not from whatever this incoming commit changes it to.
+      DEPLOY_BUILD_INPUTS=$( eval "$rendered" 2>/dev/null; printf '%s' "${DEPLOY_BUILD_INPUTS:-}" )
       return 0
     fi
   else
@@ -138,11 +174,15 @@ load_site_config() {
   HEALTH_PATH="${DEPLOY_HEALTH_PATH-/health}"
   HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-10}"
   CSS_MIN_RATIO="${DEPLOY_CSS_MIN_RATIO:-50}"
+  SERVICE="${DEPLOY_SERVICE:-$APP.service}"
+  BUILD_INPUTS="${DEPLOY_BUILD_INPUTS:-data/build_db.py}"
 }
 
 RELOAD="${DEPLOY_RELOAD:-reload}"
 UV_ARGS="${DEPLOY_UV_ARGS:---frozen}"
+SERVICE="${DEPLOY_SERVICE:-$APP.service}"
 load_site_config
+BUILD_INPUTS="${DEPLOY_BUILD_INPUTS:-data/build_db.py}"
 CURL="${CURL:-curl}"
 HEALTH_PATH="${DEPLOY_HEALTH_PATH-/health}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-10}"
@@ -193,17 +233,49 @@ health_ok() {
 # bin/self-update.sh for why the service user must not own a directory root
 # executes from.
 
-# 0b. Retry a queued snapshot rebuild. `systemctl start` on an activating oneshot is a silent
-#     no-op (live miss, crescira 2026-07-13: the nightly was mid-run — on pre-push code — when a
-#     build_db deploy dispatched), so step 5 queues a flag instead and every tick retries here
-#     until the unit is idle. Runs BEFORE the up-to-date early-exit on purpose.
-PENDING_BUILD="$SRV/.site-deploy-build-pending"
-if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -f "$PENDING_BUILD" ]; then
-  if ! unit_busy "$DEPLOY_BUILD_SERVICE"; then
-    log "queued snapshot rebuild -> starting $DEPLOY_BUILD_SERVICE"
-    $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE" && rm -f "$PENDING_BUILD"
+# --- the snapshot-rebuild queue -----------------------------------------------
+# Called when THIS tick's own diff changed a build input. Busy queues a flag
+# rather than blocking: `systemctl start` on an activating oneshot is a silent
+# no-op (live miss, crescira 2026-07-13 — the nightly was mid-run on pre-push
+# code when a build_db deploy dispatched), so a start attempted straight into
+# a busy unit would look like it worked and do nothing. A start command that
+# itself fails (not "busy", a real error) stays fatal, exactly as before.
+queue_or_dispatch_build() {   # <app>
+  local app=$1
+  if unit_busy "$DEPLOY_BUILD_SERVICE"; then
+    log "$app: $DEPLOY_BUILD_SERVICE is busy; queued (retried every tick until idle)"
+    mkdir -p "$REBUILD_DIR" 2>/dev/null && : > "$REBUILD_DIR/$app"
+  elif $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE"; then
+    rm -f "$REBUILD_DIR/$app"
+    log "$app: dispatched $DEPLOY_BUILD_SERVICE (build input changed)"
+  else
+    log "$app: could not start $DEPLOY_BUILD_SERVICE"
+    exit 1
   fi
-fi
+}
+
+# Drains queued-but-not-dispatched rebuild flags. Called from the EXIT trap at
+# the end of every HEALTHY tick (fetch, ref, sync and converge all OK —
+# DRAIN_OK is set near each such exit), including the silent up-to-date one,
+# so a flag left by a busy unit is retried without waiting for the next
+# build-input change. Never fatal: a failed retry here just logs and waits for
+# the next tick, since nothing new is being applied.
+drain_rebuild_queue() {
+  [ -n "${DEPLOY_BUILD_SERVICE:-}" ] || return 0
+  local f app
+  for f in "$REBUILD_DIR"/*; do
+    [ -e "$f" ] || continue
+    app=$(basename "$f")
+    if unit_busy "$DEPLOY_BUILD_SERVICE"; then
+      continue
+    elif $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE"; then
+      rm -f "$f"
+      log "$app: dispatched queued snapshot rebuild"
+    else
+      log "$app: queued build dispatch failed; will retry next tick"
+    fi
+  done
+}
 
 # 1. Which ref this box deploys. `deploy_ref` in site.toml (default master);
 #    for an app whose CI advances a `ci-green` ref only after a green run on
@@ -272,7 +344,7 @@ fi
 # so the next tick would see "up to date", exit 0, and quietly turn the failed
 # unit green while the box still runs the old workers. This marker makes the
 # unfinished half retry instead.
-PENDING_RELOAD="$SRV/.site-deploy-reload-pending"
+PENDING_RELOAD="$PENDING_DIR/$APP"
 if [ "$LOCAL" = "$REMOTE" ] && [ ! -f "$PENDING_RELOAD" ]; then
   if [ -n "$REF_FROZEN" ]; then
     # Level with a ref that stopped moving is not "where it should be".
@@ -282,6 +354,7 @@ if [ "$LOCAL" = "$REMOTE" ] && [ ! -f "$PENDING_RELOAD" ]; then
   else
     report_level "at ${LOCAL:0:9} (origin/$REF)"
   fi
+  DRAIN_OK=1                                 # fetch/ref/sync all fine this tick
   exit 0                                     # up to date -> silent no-op
 fi
 # The marker's content is the verb the unfinished deploy needed, if it was not
@@ -319,6 +392,7 @@ if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
   if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
     log "local is ahead of origin by $(git rev-list --count "$REMOTE".."$LOCAL") commit(s) — nothing to deploy"
     report_level "ahead of origin at ${LOCAL:0:9}"
+    DRAIN_OK=1
     exit 0
   fi
   log "local has diverged from origin (neither is an ancestor of the other) — manual fix needed"
@@ -332,8 +406,18 @@ hc_ping "$HC_DEPLOY" /start "auto-deploy[$APP]: deploying ${LOCAL:0:9} -> ${REMO
 # Does this deploy change the snapshot builder? If so we ALSO dispatch a rebuild after the
 # reload below. Detected before the merge from the incoming range.
 SCHEMA_CHANGED=
-if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ -n "$(git diff --name-only "$LOCAL" "$REMOTE" -- data/build_db.py)" ]; then
-  SCHEMA_CHANGED=1
+if [ -n "${DEPLOY_BUILD_SERVICE:-}" ]; then
+  # BUILD_INPUTS (site.toml `build_inputs`, one path prefix per line; default
+  # data/build_db.py, today's one-file behaviour) handed to git diff as
+  # pathspecs directly — a directory prefix here fails OPEN into one extra
+  # rebuild, which is the safe direction; an allow-list of exact files fails
+  # CLOSED into a silently stale snapshot (renavon gfrmin/dataguru#344).
+  build_inputs=()
+  while IFS= read -r bp; do [ -n "$bp" ] && build_inputs+=("$bp"); done <<< "$BUILD_INPUTS"
+  if [ "${#build_inputs[@]}" -gt 0 ] \
+     && [ -n "$(git diff --name-only "$LOCAL" "$REMOTE" -- "${build_inputs[@]}")" ]; then
+    SCHEMA_CHANGED=1
+  fi
 fi
 
 # Same idea for the Cloudflare zone config: dispatch cf-converge@$APP.service
@@ -524,8 +608,8 @@ fi
 #     after converge (the deploying commit may be the one that adds ExecReload=)
 #     and before the verb is sent. The stub in tests answers the show query.
 if [ "$RELOAD" = reload ]; then
-  if [ -z "$(${SYSCTL_QUERY:-systemctl} show -p ExecReload --value "$APP.service" 2>/dev/null)" ]; then
-    log "site.toml says reload = \"reload\" but $APP.service has no ExecReload= — the verb would be a no-op and the old workers would keep serving; declare one, or set reload = \"restart\". NOT reloading"
+  if [ -z "$(${SYSCTL_QUERY:-systemctl} show -p ExecReload --value "$SERVICE" 2>/dev/null)" ]; then
+    log "site.toml says reload = \"reload\" but $SERVICE has no ExecReload= — the verb would be a no-op and the old workers would keep serving; declare one, or set reload = \"restart\". NOT reloading"
     exit 1
   fi
   if [ -f gunicorn.conf.py ] && grep -qE '^[[:space:]]*preload_app[[:space:]]*=[[:space:]]*True' gunicorn.conf.py; then
@@ -540,7 +624,7 @@ fi
 #    which 500s on any template that needs new Python (live incident, crescira 2026-07-12: new
 #    template kwarg + old templates_config). The app-side contract making this safe: new code
 #    must degrade gracefully on the previous snapshot schema (feature-detect tables/columns).
-$RELOAD_CMD "$RELOAD" "$APP" || { log "systemctl $RELOAD $APP failed"; exit 1; }
+$RELOAD_CMD "$RELOAD" "$SERVICE" || { log "systemctl $RELOAD $SERVICE failed"; exit 1; }
 
 # Purging before the origin serves the new code just refills the edge from
 # stale — or worse, from a 500. So the purge is gated on the app actually
@@ -565,20 +649,14 @@ if [ -n "$CF_CHANGED" ]; then
   $RELOAD_CMD start --no-block "cf-converge@$APP.service" \
     || log "could not start cf-converge@$APP.service (edge config convergence will retry via cf-drift@.timer)"
 fi
-# If the deploy changed the snapshot builder, also rebuild — its --reload-service swaps the new
-# snapshot in atomically and runs its own cf-purge when done.
+# If the deploy changed a build input, also rebuild — its --reload-service swaps
+# the new snapshot in atomically and runs its own cf-purge when done. Routed
+# through the same helper the EXIT-trap drain uses, so "busy" and "dispatch
+# failed" are handled identically whether the trigger was this tick's own diff
+# or a flag left over from an earlier one.
 if [ -n "$SCHEMA_CHANGED" ]; then
-  if unit_busy "$DEPLOY_BUILD_SERVICE"; then
-    # A build is mid-run on the code it started with; `start` now would be a silent no-op.
-    log "data/build_db.py changed but $DEPLOY_BUILD_SERVICE is busy -> queueing rebuild (retried each tick)"
-    touch "$PENDING_BUILD"
-    log "deployed ${REMOTE:0:9} ($RELOAD + snapshot rebuild queued)"
-  else
-    log "data/build_db.py changed -> dispatching $DEPLOY_BUILD_SERVICE (rebuilds snapshot, then reloads + purges again)"
-    $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE" || { log "could not start $DEPLOY_BUILD_SERVICE"; exit 1; }
-    log "deployed ${REMOTE:0:9} ($RELOAD + snapshot rebuild dispatched)"
-  fi
-else
-  log "deployed ${REMOTE:0:9} ($RELOAD)"
+  queue_or_dispatch_build "$APP"
 fi
+log "deployed ${REMOTE:0:9} ($RELOAD)"
 report_level "deployed ${REMOTE:0:9}"
+DRAIN_OK=1   # healthy end of a deploy tick: the EXIT trap may now drain the rebuild queue

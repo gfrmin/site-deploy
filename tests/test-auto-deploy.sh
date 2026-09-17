@@ -186,14 +186,14 @@ echo deactivating > "$STUB_UNITS/app-build.service.state"
 push_commit "c7 build" ; ( cd "$WORK" || exit 1; echo "# changed" >> data/build_db.py; git commit -qam "touch builder"; git push -q origin master )
 reset_log; run_deploy DEPLOY_BUILD_SERVICE=app-build.service
 check "queued, did not start"  not_called "systemctl start --no-block app-build.service"
-check "wrote the queue flag"   [ -f "$SRV/.site-deploy-build-pending" ]
+check "wrote the queue flag"   [ -f "$SRV/.site-deploy-state/rebuild-pending/app" ]
 check "said it queued"         grep -qi "queue" "$T/out.txt"
 
 echo "8. once the build unit is idle the queued rebuild is dispatched"
 echo inactive > "$STUB_UNITS/app-build.service.state"
 reset_log; run_deploy DEPLOY_BUILD_SERVICE=app-build.service
 check "started the build"      called "systemctl start --no-block app-build.service"
-check "cleared the flag"       [ ! -f "$SRV/.site-deploy-build-pending" ]
+check "cleared the flag"       [ ! -f "$SRV/.site-deploy-state/rebuild-pending/app" ]
 
 echo "9. a collapsed stylesheet is refused and blocks the reload"
 cp "$SRV/static/app.css" "$T/app.css.before"
@@ -622,6 +622,49 @@ push_commit c19
 reset_log; run_deploy
 check "exit 0"                     [ "$(rc)" = 0 ]
 check "not dispatched"             not_called "cf-converge@app.service"
+
+
+# ── Phase D item 14 prep: the `service` and `build_inputs` knobs, and the ────
+# one-time migration off the old single-file markers ─────────────────────────
+echo "20. deploy/site.toml's \`service\` knob names the unit that is reloaded"
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\nservice = "app@custom.service"\n' > deploy/site.toml
+  git commit -qam "service knob"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "restarted the named unit"        called "systemctl restart app@custom.service"
+check "did not restart the plain name"  not_called "systemctl restart app "
+
+echo "21. deploy/site.toml's \`build_inputs\` knob widens the snapshot-rebuild trigger"
+# A site.toml change governs the NEXT deploy, not its own (the pre-merge read
+# of DEPLOY_BUILD_SERVICE/DEPLOY_BUILD_INPUTS is scoped to the OLD checkout,
+# same as deploy_ref) — so the knob lands in one tick and the widened path is
+# exercised in the next.
+( cd "$WORK" || exit 1
+  mkdir -p data/reference
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\nservice = "app.service"\nbuild_inputs = ["data/reference/"]\n' > deploy/site.toml
+  git add -A; git commit -qm "build_inputs knob"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+echo inactive > "$STUB_UNITS/app-build.service.state"
+reset_log; run_deploy DEPLOY_BUILD_SERVICE=app-build.service
+check "knob deploy: exit 0"             [ "$(rc)" = 0 ]
+( cd "$WORK" || exit 1; echo "hk1" > data/reference/poll.yaml; git add -A; git commit -qm "reference data only, not build_db.py"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy DEPLOY_BUILD_SERVICE=app-build.service
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "dispatched on the widened path"  called "systemctl start --no-block app-build.service"
+
+echo "22. legacy single-file markers migrate into the queue dirs on first sight"
+: > "$SRV/.site-deploy-build-pending"
+printf 'restart' > "$SRV/.site-deploy-reload-pending"
+echo inactive > "$STUB_UNITS/app-build.service.state"
+reset_log; run_deploy DEPLOY_BUILD_SERVICE=app-build.service
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "logged the reload-marker migration" grep -qi "migrated legacy .site-deploy-reload-pending" "$T/out.txt"
+check "logged the build-marker migration"  grep -qi "migrated legacy .site-deploy-build-pending" "$T/out.txt"
+check "resumed as a restart"            called "systemctl restart app.service"
+check "dispatched the migrated build"   called "systemctl start --no-block app-build.service"
+check "legacy reload marker is gone"    [ ! -e "$SRV/.site-deploy-reload-pending" ]
+check "legacy build marker is gone"     [ ! -e "$SRV/.site-deploy-build-pending" ]
+check "queue dir has the state now"     [ ! -e "$SRV/.site-deploy-state/pending/app" ]
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

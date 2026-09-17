@@ -142,9 +142,18 @@ cf_zone_id   = "..."               # non-secret half of the purge
 cf_domain    = "example.com"       # apex domain for cf-converge.py (see below); non-secret
 tailwindcss_version = "4.3.3"      # apps with static/src.css: pin the compiler (see below)
 # deploy_ref = "ci-green"          # deploy the TESTED ref, not the tip of master (see below)
+# service       = "<app>.service"         # the unit reloaded/restarted (default: <app>.service)
 # build_service = "<app>-build.service"   # snapshot-backed apps only
+# build_inputs  = ["data/build_db.py"]    # paths whose change dispatches build_service (default shown)
 # converge      = true                    # apply deploy/ to the box each tick (see below)
 ```
+
+`service` and `build_inputs` exist for workspace mode (Phase D item 14: several apps served from
+one checkout) — `service` because a workspace app's unit is `<site>@<app>.service`, not
+`<app>.service`; `build_inputs` because a snapshot-backed app's build reads more than one exact
+file (a directory prefix fails *open* into one extra rebuild, which is the safe direction, where
+an allow-list of exact files fails *closed* into a silently stale snapshot). A single-app site
+never needs either — the defaults already match today's behaviour.
 
 ### `deploy_ref`: deploy the tested ref, not the tip of master
 

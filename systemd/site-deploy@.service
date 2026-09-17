@@ -16,7 +16,8 @@ EnvironmentFile=/etc/%i/env
 Environment=APP=%i
 Environment=DEPLOY_STATE_DIR=/var/lib/site-deploy/%i
 # Created by systemd before ExecStart and owned by User= above: the stall stamp
-# for the dead-man lives here rather than in the checkout.
+# for the dead-man lives here rather than in the checkout, alongside pending/
+# and rebuild-pending/ (one flag per app; a single-app site has exactly one).
 StateDirectory=site-deploy/%i
 ExecStart=/srv/site-deploy/bin/auto-deploy.sh
 # /fail ONLY, never success: the script owns the success edge, because only it
