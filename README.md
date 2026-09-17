@@ -87,7 +87,7 @@ bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's cu
 bin/cf-converge.py   converge one zone's Cloudflare config (SSL/DNS/cache/WAF/rate-limit) to deploy/cloudflare.json
 bin/cf-converge-run.sh root wrapper: derives the domain + the box's public IP, calls cf-converge.py
 bin/backup.sh        encrypt deploy/backup-producer.sh's stdout, ship off-box, verify by round trip, prune (root)
-bin/converge.sh       generic [converge]-table engine: install/validate/reload-with-rollback/prune (root)
+bin/converge.sh       generic [converge]-table engine: install/validate/reload-with-rollback/prune, template-unit restart queue (root)
 bin/converge-config.py deploy/site.toml [converge] table -> bin/converge.sh's bash arrays
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
