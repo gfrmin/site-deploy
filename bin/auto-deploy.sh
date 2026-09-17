@@ -41,6 +41,8 @@ RELOAD_CMD="${RELOAD_CMD:-sudo -n /usr/bin/systemctl}"   # override to `echo` fo
 cd "$SRV" || { echo "auto-deploy[$APP]: no checkout at $SRV"; exit 1; }
 # shellcheck disable=SC1091
 . "$SELF/lib/hc.sh"
+# shellcheck disable=SC1091
+. "$SELF/lib/workspace.sh"
 
 # --- the deploy dead-man ------------------------------------------------------
 # HEALTHCHECKS_DEPLOY_URL (from /etc/<app>/env; unset = no pings, and the poller
@@ -158,6 +160,12 @@ load_site_config() {
       # fetched, so the path list that decides it has to come from the OLD
       # site.toml too, not from whatever this incoming commit changes it to.
       DEPLOY_BUILD_INPUTS=$( eval "$rendered" 2>/dev/null; printf '%s' "${DEPLOY_BUILD_INPUTS:-}" )
+      # Phase D item 14: which apps this SITE hosts is exactly the same kind of
+      # fact as DEPLOY_REF -- a decision that must be made from the OLD
+      # checkout before anything is fetched, so a commit that turns workspace
+      # mode on (or moves apps_dir) governs the NEXT deploy, not its own.
+      WORKSPACE_APPS_DIR=$( eval "$rendered" 2>/dev/null; printf '%s' "${WORKSPACE_APPS_DIR:-}" )
+      WORKSPACE_SHARED=$( eval "$rendered" 2>/dev/null; printf '%s' "${WORKSPACE_SHARED:-}" )
       return 0
     fi
   else
@@ -187,6 +195,25 @@ CURL="${CURL:-curl}"
 HEALTH_PATH="${DEPLOY_HEALTH_PATH-/health}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-10}"
 CSS_MIN_RATIO="${DEPLOY_CSS_MIN_RATIO:-50}"
+
+# --- workspace mode (Phase D item 14): several apps out of one checkout -----
+# Triggered by the SITE's own deploy/site.toml declaring a [workspace] table
+# at all (WORKSPACE_APPS_DIR is present iff it does) -- single-app is the
+# default and the degenerate case, one app named $APP under dir ".".
+WORKSPACE=""
+[ -n "${WORKSPACE_APPS_DIR:-}" ] && WORKSPACE=1
+APPS_DIR="${WORKSPACE_APPS_DIR:-apps}"
+if [ -n "$WORKSPACE" ]; then
+  # ws_apps's own diagnostics go straight to stderr (never through log()/
+  # RUNLOG -- they are lib/workspace.sh's, not this script's, and already
+  # self-prefixed "workspace[$APP]:").
+  mapfile -t APPS < <(ws_apps "$SRV" "$APP")
+else
+  APPS=("$APP")
+fi
+# dir for app $1: "." in single-app mode (there is only ever one, and it IS
+# the checkout root); $APPS_DIR/$1 in workspace mode.
+app_dir() { [ -n "$WORKSPACE" ] && printf '%s/%s' "$APPS_DIR" "$1" || printf '.'; }
 
 # `systemctl start` on a oneshot that is still running is a SILENT no-op, so
 # anything that dispatches a build has to know whether it is busy. `deactivating`
@@ -234,19 +261,35 @@ health_ok() {
 # executes from.
 
 # --- the snapshot-rebuild queue -----------------------------------------------
-# Called when THIS tick's own diff changed a build input. Busy queues a flag
-# rather than blocking: `systemctl start` on an activating oneshot is a silent
-# no-op (live miss, crescira 2026-07-13 — the nightly was mid-run on pre-push
-# code when a build_db deploy dispatched), so a start attempted straight into
-# a busy unit would look like it worked and do nothing. A start command that
-# itself fails (not "busy", a real error) stays fatal, exactly as before.
+# ONE poller-started build per box per tick (renavon #1561): a workspace box
+# can host several apps whose builds are each heavy (memory, I/O), and a
+# single commit under a [workspace] `shared`/`build_inputs` prefix is a build
+# input for every one of them at once. $BUILD_DISPATCH_FLAG is a FILE, not a
+# shell variable, because each app's deploy_app call runs in its own subshell
+# in workspace mode (so failure isolation doesn't also isolate this count) —
+# a write to it is visible to every later app in the SAME tick regardless.
+# Reset once, at the top of the tick, by the caller before the per-app loop.
+BUILD_DISPATCH_FLAG="$STATE_DIR/.build-dispatched-this-tick"
+rm -f "$BUILD_DISPATCH_FLAG"   # one poller-started build per box, per TICK -- reset before anything below (including an early up-to-date exit) can reach the EXIT trap's drain
+
+# Called when THIS app's OWN diff changed one of ITS build inputs. Busy
+# queues a flag rather than blocking: `systemctl start` on an activating
+# oneshot is a silent no-op (live miss, crescira 2026-07-13 — the nightly
+# was mid-run on pre-push code when a build_db deploy dispatched), so a
+# start attempted straight into a busy unit would look like it worked and do
+# nothing. A start command that itself fails (not "busy", a real error)
+# stays fatal, exactly as a same-tick dispatch always has.
 queue_or_dispatch_build() {   # <app>
   local app=$1
-  if unit_busy "$DEPLOY_BUILD_SERVICE"; then
+  if [ -e "$BUILD_DISPATCH_FLAG" ]; then
+    log "$app: another app already dispatched a build on this box this tick (one at a time); queued"
+    mkdir -p "$REBUILD_DIR" 2>/dev/null && : > "$REBUILD_DIR/$app"
+  elif unit_busy "$DEPLOY_BUILD_SERVICE"; then
     log "$app: $DEPLOY_BUILD_SERVICE is busy; queued (retried every tick until idle)"
     mkdir -p "$REBUILD_DIR" 2>/dev/null && : > "$REBUILD_DIR/$app"
   elif $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE"; then
     rm -f "$REBUILD_DIR/$app"
+    : > "$BUILD_DISPATCH_FLAG"
     log "$app: dispatched $DEPLOY_BUILD_SERVICE (build input changed)"
   else
     log "$app: could not start $DEPLOY_BUILD_SERVICE"
@@ -254,22 +297,44 @@ queue_or_dispatch_build() {   # <app>
   fi
 }
 
-# Drains queued-but-not-dispatched rebuild flags. Called from the EXIT trap at
-# the end of every HEALTHY tick (fetch, ref, sync and converge all OK —
-# DRAIN_OK is set near each such exit), including the silent up-to-date one,
-# so a flag left by a busy unit is retried without waiting for the next
-# build-input change. Never fatal: a failed retry here just logs and waits for
-# the next tick, since nothing new is being applied.
+# <app>'s own build_service. Single-app mode: the one already loaded at the
+# top level. Workspace mode: sed-extracted from THAT app's own site.toml,
+# never eval'd (matching host-converge.sh's convention for a single scalar
+# read out of a file the caller does not otherwise trust with a full eval).
+app_build_service() {   # <app>
+  local app=$1 dir
+  if [ -z "$WORKSPACE" ]; then
+    printf '%s' "${DEPLOY_BUILD_SERVICE:-}"
+    return 0
+  fi
+  dir=$(app_dir "$app")
+  python3 "$SELF/bin/site-config.py" --app-keys "$SRV/$dir/deploy/site.toml" 2>/dev/null \
+    | sed -n "s/^export DEPLOY_BUILD_SERVICE=//p" | tail -1 | tr -d "'\""
+}
+
+# Drains queued-but-not-dispatched rebuild flags, at most ONE per call —
+# same one-build-per-box rule as a same-tick dispatch. Called from the EXIT
+# trap at the end of every HEALTHY tick (fetch, ref, sync and converge all
+# OK — DRAIN_OK is set near each such exit), including the silent up-to-date
+# one, so a flag left by a busy unit is retried without waiting for the next
+# build-input change. Never fatal: a failed retry here just logs and waits
+# for the next tick, since nothing new is being applied.
 drain_rebuild_queue() {
-  [ -n "${DEPLOY_BUILD_SERVICE:-}" ] || return 0
-  local f app
+  local f app build_service dispatched=""
+  [ -e "$BUILD_DISPATCH_FLAG" ] && dispatched=1   # this tick already used its one dispatch
   for f in "$REBUILD_DIR"/*; do
     [ -e "$f" ] || continue
+    [ -z "$dispatched" ] || continue
     app=$(basename "$f")
-    if unit_busy "$DEPLOY_BUILD_SERVICE"; then
-      continue
-    elif $RELOAD_CMD start --no-block "$DEPLOY_BUILD_SERVICE"; then
+    build_service=$(app_build_service "$app")
+    if [ -z "$build_service" ]; then
       rm -f "$f"
+      log "$app: no build_service declared any more; dropping its queued rebuild"
+    elif unit_busy "$build_service"; then
+      continue
+    elif $RELOAD_CMD start --no-block "$build_service"; then
+      rm -f "$f"
+      dispatched=1
       log "$app: dispatched queued snapshot rebuild"
     else
       log "$app: queued build dispatch failed; will retry next tick"
@@ -344,8 +409,15 @@ fi
 # so the next tick would see "up to date", exit 0, and quietly turn the failed
 # unit green while the box still runs the old workers. This marker makes the
 # unfinished half retry instead.
-PENDING_RELOAD="$PENDING_DIR/$APP"
-if [ "$LOCAL" = "$REMOTE" ] && [ ! -f "$PENDING_RELOAD" ]; then
+# any_pending: true iff at least one hosted app has an outstanding marker. A
+# single-app site has exactly one entry in $APPS, so this is a strict
+# generalisation of "the one marker exists" -- unchanged behaviour there.
+any_pending() {
+  local a
+  for a in "${APPS[@]}"; do [ -f "$PENDING_DIR/$a" ] && return 0; done
+  return 1
+}
+if [ "$LOCAL" = "$REMOTE" ] && ! any_pending; then
   if [ -n "$REF_FROZEN" ]; then
     # Level with a ref that stopped moving is not "where it should be".
     rm -f "$BEHIND_STAMP" 2>/dev/null || true
@@ -357,13 +429,8 @@ if [ "$LOCAL" = "$REMOTE" ] && [ ! -f "$PENDING_RELOAD" ]; then
   DRAIN_OK=1                                 # fetch/ref/sync all fine this tick
   exit 0                                     # up to date -> silent no-op
 fi
-# The marker's content is the verb the unfinished deploy needed, if it was not
-# the configured one: a deploy that changed uv.lock needs a restart (below), and
-# a resumed tick has no diff left to rediscover that from.
-RESUME_VERB=""
 if [ "$LOCAL" = "$REMOTE" ]; then
-  RESUME_VERB=$(tr -d '[:space:]' < "$PENDING_RELOAD")
-  log "resuming an unfinished deploy of ${LOCAL:0:9}${RESUME_VERB:+ ($RESUME_VERB)}"
+  log "resuming an unfinished deploy of ${LOCAL:0:9}"
 fi
 
 # Recover from a uv.lock that something re-locked in place. Every `uv run` in
@@ -403,139 +470,120 @@ log "${LOCAL:0:9} -> ${REMOTE:0:9} (origin/$REF); deploying"
 report_behind "behind origin/$REF (${LOCAL:0:9} vs ${REMOTE:0:9})"
 hc_ping "$HC_DEPLOY" /start "auto-deploy[$APP]: deploying ${LOCAL:0:9} -> ${REMOTE:0:9}"
 
-# Does this deploy change the snapshot builder? If so we ALSO dispatch a rebuild after the
-# reload below. Detected before the merge from the incoming range.
-SCHEMA_CHANGED=
-if [ -n "${DEPLOY_BUILD_SERVICE:-}" ]; then
-  # BUILD_INPUTS (site.toml `build_inputs`, one path prefix per line; default
-  # data/build_db.py, today's one-file behaviour) handed to git diff as
-  # pathspecs directly — a directory prefix here fails OPEN into one extra
-  # rebuild, which is the safe direction; an allow-list of exact files fails
-  # CLOSED into a silently stale snapshot (renavon gfrmin/dataguru#344).
-  build_inputs=()
-  while IFS= read -r bp; do [ -n "$bp" ] && build_inputs+=("$bp"); done <<< "$BUILD_INPUTS"
-  if [ "${#build_inputs[@]}" -gt 0 ] \
-     && [ -n "$(git diff --name-only "$LOCAL" "$REMOTE" -- "${build_inputs[@]}")" ]; then
-    SCHEMA_CHANGED=1
-  fi
-fi
+# The whole incoming diff, computed once before the merge (the diff is gone
+# after it) -- both the site-wide LOCK_CHANGED decision below and each hosted
+# app's in-scope/build-input decisions (in deploy_app, since those are
+# per-app knobs) read it from here rather than re-diffing per app.
+CHANGED=$(git diff --name-only "$LOCAL" "$REMOTE")
 
-# Same idea for the Cloudflare zone config: dispatch cf-converge@$APP.service
-# (root, out of the toolkit, --no-block so a slow Cloudflare API never delays
-# this reload) only when this deploy actually touched it -- not every tick,
-# since an API round-trip is not something a 2-minute poller should pay for
-# when nothing declared changed. cf-drift@.timer is the daily backstop for
-# drift from a hand-edit at the dashboard.
-CF_CHANGED=
-if [ -n "$(git diff --name-only "$LOCAL" "$REMOTE" -- deploy/cloudflare.json)" ]; then
-  CF_CHANGED=1
-fi
-
-# 2. Fast-forward only (guaranteed by the ancestor check; --ff-only is belt-and-braces).
 # A dependency change is a RESTART, not a reload. On SIGHUP gunicorn's arbiter
 # re-forks its workers but never re-execs itself: it keeps the interpreter, the
 # gunicorn and every module it imported before the first fork. Application code
 # IS re-imported after the fork, which is why an ordinary deploy works at all
 # and exactly what makes this hard to see — the wheels are installed, the app
 # is new, and the server underneath it is whatever was running at boot. Decided
-# before the merge (the diff is gone after) and remembered in the marker (a
-# resumed tick has no diff at all). -F, not a pattern: `uv.lock` as a regex
-# also matches `uvXlock`.
+# before the merge (the diff is gone after); the marker (never downgraded, see
+# lib/workspace.sh's queue-contract note) is what a resumed tick reads back,
+# since a same-commit resume has no diff to rediscover it from. -F, not a
+# pattern: `uv.lock` as a regex also matches `uvXlock`.
 LOCK_CHANGED=""
-if git diff --name-only "$LOCAL" "$REMOTE" | grep -qxF uv.lock; then LOCK_CHANGED=1; fi
+printf '%s\n' "$CHANGED" | grep -qxF uv.lock && LOCK_CHANGED=1
 
 # Merge the resolved SHA, not the ref name: naming the ref would re-resolve
 # it, and a ref that advanced in between would deploy a commit this tick never
 # diffed for changed paths.
 git merge --ff-only --quiet "$REMOTE" || { log "fast-forward merge failed (drift) — manual fix needed"; exit 1; }
-# Cleared once the reload is verified healthy (see step 5). Content = the verb
-# this deploy needs, when it is not the configured one.
-if [ -n "$LOCK_CHANGED" ]; then echo restart > "$PENDING_RELOAD"; else : > "$PENDING_RELOAD"; fi
 
-# Re-read: this deploy may have just changed it.
+# Which hosted apps does THIS tick's diff put in scope, and what marker verb
+# do they need? Single-app: every commit governs the one app, as always --
+# there is nothing else "in scope" could mean with one app. Workspace: an app
+# is in scope when the diff touches its own directory, the site's top-level
+# deploy/ (fleet.toml, site-wide policy), the shared venv files (uv.lock,
+# pyproject.toml), or a declared [workspace] shared prefix.
+#
+# A marker already carrying "restart" is NEVER downgraded back to "reload" by
+# a later tick whose OWN diff didn't touch uv.lock -- the obligation from an
+# earlier lock change survives until it is actually applied, however many
+# ticks that takes (a CSS failure, say, retrying the same app).
+mkdir -p "$PENDING_DIR" 2>/dev/null || true
+for app in "${APPS[@]}"; do
+  in_scope=""
+  if [ -n "$WORKSPACE" ]; then
+    dir=$(app_dir "$app")
+    pattern="^(${dir}/|uv\.lock$|pyproject\.toml$|deploy/"
+    while IFS= read -r sp; do [ -n "$sp" ] && pattern="$pattern|^${sp}"; done <<< "$WORKSPACE_SHARED"
+    pattern="$pattern)"
+    printf '%s\n' "$CHANGED" | grep -qE "$pattern" && in_scope=1
+  else
+    in_scope=1
+  fi
+  [ -n "$in_scope" ] || continue
+  if [ -n "$LOCK_CHANGED" ]; then
+    echo restart > "$PENDING_DIR/$app"
+  elif [ ! -f "$PENDING_DIR/$app" ] || [ "$(cat "$PENDING_DIR/$app" 2>/dev/null)" != restart ]; then
+    : > "$PENDING_DIR/$app"
+  fi
+done
+
+# Re-read the SITE's own config: this deploy may have just changed it. Only
+# UV_ARGS/TAILWINDCSS_VERSION/DEPLOY_CONVERGE (and, in single-app mode, the
+# per-app RELOAD/SERVICE/etc) come from this call -- a workspace app's OWN
+# knobs are read fresh from ITS OWN site.toml inside deploy_app, per app.
+# The lock-changed-forces-restart decision also moved there (deploy_app reads
+# the marker it is about to apply), since that is now a per-app fact.
 load_site_config fatal
-if [ -n "$LOCK_CHANGED" ] || [ "$RESUME_VERB" = restart ]; then
-  [ "$RELOAD" = restart ] || log "uv.lock changed -> restart, not $RELOAD (a reload cannot re-exec the arbiter)"
-  RELOAD=restart
-fi
 
-# 3. Sync deps (frozen). On failure, stop BEFORE the reload.
+# 3. Sync deps (frozen). Workspace mode scopes the sync to the hosted apps via
+#    `--package`, exactly the "one lock resolves every app, --package narrows
+#    which of them land in THIS box's venv" split renavon's #409 established.
+#    Three rules, each because the alternative is worse than the fat venv:
+#      1. a name that is not a real workspace member (no matching
+#         `name = "<app>"` in <dir>/pyproject.toml) emits NO --package flags at
+#         all -- `uv sync --package nosuchapp` exits before touching the venv,
+#         which is a wedged deploy for a typo in fleet.toml/the override file.
+#      2. an empty hosted-app list emits NO flags either -- collapsing to some
+#         other scope invents a decision this file cannot support.
+#      3. a scoped sync that fails for any OTHER reason retries unscoped once
+#         before giving up, so scoping itself can never be what stops a deploy.
+#    On failure, stop BEFORE the reload -- same rule as always.
+SYNC_SCOPE=()
+if [ -n "$WORKSPACE" ]; then
+  scope_ok=1
+  if [ "${#APPS[@]}" -eq 0 ]; then
+    log "no apps hosted here — syncing the whole workspace"
+    scope_ok=""
+  else
+    for app in "${APPS[@]}"; do
+      dir=$(app_dir "$app")
+      if ! grep -qxF "name = \"$app\"" "$dir/pyproject.toml" 2>/dev/null; then
+        log "WARNING '$app' is not a workspace member ($dir/pyproject.toml does not declare it) — syncing the whole workspace rather than scoping it"
+        scope_ok=""
+        break
+      fi
+    done
+  fi
+  if [ -n "$scope_ok" ]; then
+    for app in "${APPS[@]}"; do SYNC_SCOPE+=(--package "$app"); done
+  fi
+fi
 # shellcheck disable=SC2086
-$UV sync $UV_ARGS || { log "uv sync failed; NOT reloading"; exit 1; }
-
-# 4. Rebuild Tailwind CSS only for apps that have it (auto-skips apps with no static/src.css).
-# `tailwindcss -o` truncates and rewrites in place, and static/app.css is served
-# `immutable`. A run that exits 0 having emitted a near-empty file — a bad
-# content glob, a missing config — therefore ships an unstyled site AND gets a
-# cache purge to spread it (crhkguru shipped 34,958 B -> 6,695 B with exit 0).
-# So: build to a temp file, compare it against what it would replace, and only
-# then rename. The rename is atomic, so no request is ever served a half-written
-# stylesheet.
-if [ -f static/src.css ]; then
-  # Exit status is necessary but NOT sufficient. tailwindcss exits 0 with a
-  # drastically smaller stylesheet when an @source path does not resolve — a
-  # mistyped path is byte-identical to declaring no sources at all — and the
-  # size canary below has uneven reach: on an app whose src.css is mostly
-  # hand-written CSS the loss is a few percent, well inside the ratio. So every
-  # declared `@source "…"` is checked against the filesystem first, at its
-  # literal prefix (the part a typo lands in). `^@source` anchors past prose
-  # that discusses @source inside CSS comments. `@source not "…"` and
-  # `@source inline("…")` mean something else and are REPORTED rather than
-  # silently skipped: two parsers of one syntax will drift, and the count
-  # comparison is what stops drift becoming silence. Zero @source lines is
-  # deliberately fine — the size floor covers that.
-  declared=$(sed -n 's/^@source[[:space:]]\{1,\}"\([^"]*\)".*/\1/p' static/src.css)
-  n_lines=$(grep -c '^@source' static/src.css || true)
-  n_parsed=$(printf '%s' "$declared" | grep -c . || true)
-  if [ "$n_lines" != "$n_parsed" ]; then
-    log "static/src.css has an @source form this check does not model ($n_lines declared, $n_parsed parsed); NOT building, NOT reloading"
-    exit 1
+if ! $UV sync $UV_ARGS ${SYNC_SCOPE[@]+"${SYNC_SCOPE[@]}"}; then
+  if [ "${#SYNC_SCOPE[@]}" -gt 0 ]; then
+    log "scoped uv sync failed (${SYNC_SCOPE[*]}); retrying unscoped"
+    # shellcheck disable=SC2086
+    $UV sync $UV_ARGS || { log "uv sync failed; NOT reloading"; exit 1; }
+  else
+    log "uv sync failed; NOT reloading"; exit 1
   fi
-  while IFS= read -r src; do
-    [ -n "$src" ] || continue
-    lit=$src
-    # shellcheck disable=SC1083
-    case $src in *[][*?{]*) lit=${src%%[][*?{]*}; lit=${lit%/*};; esac
-    [ -n "$lit" ] || lit=.
-    if [ ! -e "static/$lit" ]; then
-      log "@source \"$src\" does not resolve on this box (static/$lit is missing) — tailwindcss would exit 0 with an unstyled site; NOT building, NOT reloading"
-      exit 1
-    fi
-  done <<EOF_SOURCES
-$declared
-EOF_SOURCES
-
-  # TAILWINDCSS_VERSION (site.toml `tailwindcss_version`) pins the compiler:
-  # pytailwindcss downloads releases/latest on first use with it unset, so the
-  # stylesheet every visitor gets is otherwise compiled by whichever version
-  # upstream had published when that box's venv was created.
-  [ -n "${TAILWINDCSS_VERSION:-}" ] || log "WARNING tailwindcss_version is not pinned in deploy/site.toml"
-  CSS_TMP=$(mktemp "static/.app.css.XXXXXX")   # removed by on_exit if we bail
-  # --frozen --no-dev: an unflagged `uv run` re-locks uv.lock inside the
-  # checkout on a pyproject/lock mismatch and wedges this very poller on
-  # `git merge --ff-only` forever. This is the site a grep for "uv run"
-  # misses, because it is spelled $UV.
-  $UV run --frozen --no-dev tailwindcss -i static/src.css -o "$CSS_TMP" --minify \
-    || { log "css build failed; NOT reloading"; exit 1; }
-  NEW_BYTES=$(wc -c < "$CSS_TMP")
-  if [ "$NEW_BYTES" -lt 1024 ]; then
-    log "css build produced only ${NEW_BYTES}B (floor 1024B) — refusing to install it; NOT reloading"
-    exit 1
-  fi
-  if [ -f static/app.css ]; then
-    OLD_BYTES=$(wc -c < static/app.css)
-    if [ "$OLD_BYTES" -gt 0 ] && [ $((NEW_BYTES * 100 / OLD_BYTES)) -lt "$CSS_MIN_RATIO" ]; then
-      log "css collapsed ${OLD_BYTES}B -> ${NEW_BYTES}B (under ${CSS_MIN_RATIO}%) — refusing to install it; NOT reloading"
-      exit 1
-    fi
-  fi
-  mv -f "$CSS_TMP" static/app.css
-  CSS_TMP=""
 fi
 
-# 4b. Converge box config from the repo, BEFORE the reload. Opt-in per app via
-#     `converge = true` in deploy/site.toml (declared in the app repo, where a pull
-#     request reviews it — same reasoning as every other knob in that file).
+# 4b. Converge the SITE's own box config from the repo, BEFORE any app's
+#     reload. Opt-in via `converge = true` in the site's OWN deploy/site.toml
+#     (declared in the repo, where a pull request reviews it — same reasoning
+#     as every other knob in that file). One converge DECISION per site
+#     (`converge` is a SITE_ONLY_KEY, never read from a workspace app's own
+#     site.toml) applied here once, then again per hosted app inside
+#     deploy_app below.
 #
 #     This is the half the host layer does not cover: host/provision.sh builds a box
 #     ONCE, and nothing afterwards keeps its units in step with the repo. webbsite's
@@ -543,14 +591,14 @@ fi
 #     all, so nobody noticed it carried no Restart=, and a single OOM kill became
 #     five days of 521s while the app underneath stayed healthy.
 #
-#     Failure stops the deploy before the reload, exactly like `uv sync` and the CSS
-#     canary above: converging half the config and then reloading onto it is the
-#     worst of both outcomes.
+#     Failure stops the deploy before any reload, exactly like `uv sync` above:
+#     converging half the config and then reloading onto it is the worst of both
+#     outcomes.
 #
 #     TRUST BOUNDARY. A repo-declared systemd unit's ExecStart runs as root, so on a
-#     converging box merge access to the app repo IS root on that box. That is the
+#     converging box merge access to the repo IS root on that box. That is the
 #     same bargain dataguru-converge makes and it is fine where it is already true,
-#     but it must be a deliberate per-app choice, which is why this is opt-in and why
+#     but it must be a deliberate per-site choice, which is why this is opt-in and why
 #     it needs its own sudoers grant rather than riding on the systemctl one.
 #     "True" is first because site-config.py renders values with Python's str(), so a
 #     TOML `converge = true` arrives as the capitalised form; the others accept a
@@ -565,7 +613,15 @@ if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] ||
   # engine that installs deploy/systemd/* would otherwise install a unit nobody
   # committed. Refusing leaves the old code serving, like every other pre-reload
   # failure; the marker makes the next tick retry once the tree is clean.
-  DIRTY=$(git status --porcelain --untracked-files=all -- deploy/)
+  #
+  # Workspace mode widens the pathspec to every HOSTED app's own deploy/ tree
+  # too (each app's converge, below, runs root out of ITS directory), not
+  # only the site's top-level one.
+  dirty_paths=(deploy/)
+  if [ -n "$WORKSPACE" ]; then
+    for a in "${APPS[@]}"; do dirty_paths+=("$(app_dir "$a")/deploy/"); done
+  fi
+  DIRTY=$(git status --porcelain --untracked-files=all -- "${dirty_paths[@]}")
   if [ -n "$DIRTY" ]; then
     log "REFUSING to converge: deploy/ in $SRV differs from the commit (edited on the box?); NOT reloading"
     echo "$DIRTY" | sed "s/^/auto-deploy[$APP]:   /"
@@ -599,64 +655,254 @@ if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] ||
   fi
 fi
 
-# 4c. The reload contract. `reload = "reload"` is `systemctl reload <app>`, which
-#     is the unit's ExecReload= — and a unit with none makes the verb a silent
-#     no-op, so every deploy "succeeds" while the old workers keep serving
-#     (the way one box ran for months). And gunicorn's SIGHUP re-imports the app
-#     only when preload_app is False; with preload the arbiter keeps the modules
-#     it imported at boot and re-forks the old code. Both are checked HERE,
-#     after converge (the deploying commit may be the one that adds ExecReload=)
-#     and before the verb is sent. The stub in tests answers the show query.
-if [ "$RELOAD" = reload ]; then
-  if [ -z "$(${SYSCTL_QUERY:-systemctl} show -p ExecReload --value "$SERVICE" 2>/dev/null)" ]; then
-    log "site.toml says reload = \"reload\" but $SERVICE has no ExecReload= — the verb would be a no-op and the old workers would keep serving; declare one, or set reload = \"restart\". NOT reloading"
-    exit 1
-  fi
-  if [ -f gunicorn.conf.py ] && grep -qE '^[[:space:]]*preload_app[[:space:]]*=[[:space:]]*True' gunicorn.conf.py; then
-    log "site.toml says reload = \"reload\" but gunicorn.conf.py sets preload_app = True — SIGHUP would re-fork the OLD code; set preload_app = False, or reload = \"restart\". NOT reloading"
-    exit 1
-  fi
-fi
+# --- deploy_app: one hosted app's apply (CSS, per-app converge, reload, ----
+#     health, purge, build dispatch). Single-app mode calls this ONCE,
+#     directly (its `return 1`/`exit 1` therefore ends the whole script,
+#     exactly as this code always has); workspace mode calls it once per
+#     hosted app inside a subshell (its failures end only that subshell, so
+#     one app's bad deploy cannot strand the others -- but the OVERALL tick
+#     still ends non-zero, see the loop below).
+deploy_app() {   # <app> <dir>
+  local app=$1 dir=$2
+  cd "$dir" || { log "$app: no directory at $dir, skipping"; return 1; }
 
-# 5. Apply: reload onto the new code IMMEDIATELY, even when a snapshot rebuild is coming. Jinja
-#    reads templates from disk, so from the moment the merge landed the old workers were already
-#    rendering the NEW templates — deferring the reload leaves old Python under new templates,
-#    which 500s on any template that needs new Python (live incident, crescira 2026-07-12: new
-#    template kwarg + old templates_config). The app-side contract making this safe: new code
-#    must degrade gracefully on the previous snapshot schema (feature-detect tables/columns).
-$RELOAD_CMD "$RELOAD" "$SERVICE" || { log "systemctl $RELOAD $SERVICE failed"; exit 1; }
-
-# Purging before the origin serves the new code just refills the edge from
-# stale — or worse, from a 500. So the purge is gated on the app actually
-# answering, and an unhealthy app fails the unit with the edge left intact,
-# which is the strictly better failure: visitors keep getting the cached old
-# site instead of a cold broken one.
-if [ -n "$HEALTH_PATH" ] && [ -n "${PORT:-}" ]; then
-  HEALTH_URL="http://127.0.0.1:${PORT}${HEALTH_PATH}"
-  if ! health_ok "$HEALTH_URL"; then
-    log "unhealthy after $RELOAD: $HEALTH_URL did not answer${DEPLOY_HEALTH_MATCH:+ with '$DEPLOY_HEALTH_MATCH'} in ${HEALTH_TRIES}s — NOT purging"
-    exit 1
+  if [ -n "$WORKSPACE" ]; then
+    # Per-app config, read from THIS app's own site.toml (the merge already
+    # landed, so this is the NEW copy -- a commit changing an app's own
+    # config governs its own deploy, the same rule the site-level fatal
+    # re-read already applies to the site's config). --app-keys: the
+    # site-only knobs make no sense in an app's own file and are warned
+    # about, not silently read.
+    local rendered
+    if ! rendered=$(python3 "$SELF/bin/site-config.py" --app-keys deploy/site.toml 2>&1); then
+      log "$app: $rendered"
+      log "$app: refusing to deploy blind on an unreadable deploy/site.toml"
+      return 1
+    fi
+    eval "$rendered"
+    RELOAD="${DEPLOY_RELOAD:-reload}"
+    SERVICE="${DEPLOY_SERVICE:-$APP@$app.service}"
+    HEALTH_PATH="${DEPLOY_HEALTH_PATH-/health}"
+    HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-10}"
+    CSS_MIN_RATIO="${DEPLOY_CSS_MIN_RATIO:-50}"
+    BUILD_INPUTS="${DEPLOY_BUILD_INPUTS:-data/build_db.py}"
+    # DEPLOY_CONVERGE is deliberately NOT re-set here: --app-keys never
+    # renders it (it is a SITE_ONLY_KEY), so whatever the site-level
+    # load_site_config already put there survives untouched -- one
+    # converge decision, applied per app below.
   fi
-  log "health ok ($HEALTH_URL)"
-else
-  log "WARNING health gate disabled (no PORT/DEPLOY_HEALTH_PATH) — purging unverified"
-fi
 
-rm -f "$PENDING_RELOAD"
-SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
-if [ -n "$CF_CHANGED" ]; then
-  log "deploy/cloudflare.json changed -> dispatching cf-converge@$APP.service"
-  $RELOAD_CMD start --no-block "cf-converge@$APP.service" \
-    || log "could not start cf-converge@$APP.service (edge config convergence will retry via cf-drift@.timer)"
+  # The verb this app's marker actually owes. `restart` is never downgraded
+  # (see the write loop above): a lock change forces it regardless of what
+  # the app itself declares, because SIGHUP cannot re-exec the arbiter onto
+  # a newly synced dependency.
+  if [ "$(cat "$PENDING_DIR/$app" 2>/dev/null)" = restart ]; then
+    [ "$RELOAD" = restart ] || log "$app: uv.lock changed -> restart, not $RELOAD (a reload cannot re-exec the arbiter)"
+    RELOAD=restart
+  fi
+
+  # Does this deploy change $app's OWN build inputs? Detected from the
+  # site-wide $CHANGED via git pathspecs relative to $app's directory --
+  # single-app mode's dir is ".", so these are repo-root paths exactly as
+  # before; a directory prefix here fails OPEN into one extra rebuild (the
+  # safe direction), an allow-list of exact files fails CLOSED into a
+  # silently stale snapshot (renavon gfrmin/dataguru#344).
+  # `git -C "$SRV" diff` explicitly, not a bare `git diff`: pathspecs are
+  # CWD-relative, and we are already `cd`'d into $app's own directory above
+  # -- a bare `git diff ... -- apps/foo/data/build_db.py` from inside
+  # apps/foo/ resolves to apps/foo/apps/foo/data/build_db.py and silently
+  # matches nothing. -C pins the repo root so these repo-root-relative
+  # paths mean what they say regardless of CWD.
+  local schema_changed="" build_paths=() bp cf_rel
+  while IFS= read -r bp; do [ -n "$bp" ] && build_paths+=("$([ "$dir" = . ] && printf '%s' "$bp" || printf '%s/%s' "$dir" "$bp")"); done <<< "$BUILD_INPUTS"
+  if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ "${#build_paths[@]}" -gt 0 ] \
+     && [ -n "$(git -C "$SRV" diff --name-only "$LOCAL" "$REMOTE" -- "${build_paths[@]}")" ]; then
+    schema_changed=1
+  fi
+  # Same idea for the Cloudflare zone config: dispatch cf-converge@<app>
+  # (root, out of the toolkit, --no-block so a slow Cloudflare API never
+  # delays this reload) only when THIS deploy actually touched it.
+  cf_rel=$([ "$dir" = . ] && printf 'deploy/cloudflare.json' || printf '%s/deploy/cloudflare.json' "$dir")
+  local cf_changed=""
+  [ -n "$(git -C "$SRV" diff --name-only "$LOCAL" "$REMOTE" -- "$cf_rel")" ] && cf_changed=1
+
+  # 4. Rebuild Tailwind CSS only for apps that have it (auto-skips apps with no static/src.css).
+  # `tailwindcss -o` truncates and rewrites in place, and static/app.css is served
+  # `immutable`. A run that exits 0 having emitted a near-empty file — a bad
+  # content glob, a missing config — therefore ships an unstyled site AND gets a
+  # cache purge to spread it (crhkguru shipped 34,958 B -> 6,695 B with exit 0).
+  # So: build to a temp file, compare it against what it would replace, and only
+  # then rename. The rename is atomic, so no request is ever served a half-written
+  # stylesheet.
+  if [ -f static/src.css ]; then
+    # Exit status is necessary but NOT sufficient. tailwindcss exits 0 with a
+    # drastically smaller stylesheet when an @source path does not resolve — a
+    # mistyped path is byte-identical to declaring no sources at all — and the
+    # size canary below has uneven reach: on an app whose src.css is mostly
+    # hand-written CSS the loss is a few percent, well inside the ratio. So every
+    # declared `@source "…"` is checked against the filesystem first, at its
+    # literal prefix (the part a typo lands in). `^@source` anchors past prose
+    # that discusses @source inside CSS comments. `@source not "…"` and
+    # `@source inline("…")` mean something else and are REPORTED rather than
+    # silently skipped: two parsers of one syntax will drift, and the count
+    # comparison is what stops drift becoming silence. Zero @source lines is
+    # deliberately fine — the size floor covers that.
+    local declared n_lines n_parsed src lit CSS_TMP NEW_BYTES OLD_BYTES
+    declared=$(sed -n 's/^@source[[:space:]]\{1,\}"\([^"]*\)".*/\1/p' static/src.css)
+    n_lines=$(grep -c '^@source' static/src.css || true)
+    n_parsed=$(printf '%s' "$declared" | grep -c . || true)
+    if [ "$n_lines" != "$n_parsed" ]; then
+      log "$app: static/src.css has an @source form this check does not model ($n_lines declared, $n_parsed parsed); NOT building, NOT reloading"
+      return 1
+    fi
+    while IFS= read -r src; do
+      [ -n "$src" ] || continue
+      lit=$src
+      # shellcheck disable=SC1083
+      case $src in *[][*?{]*) lit=${src%%[][*?{]*}; lit=${lit%/*};; esac
+      [ -n "$lit" ] || lit=.
+      if [ ! -e "static/$lit" ]; then
+        log "$app: @source \"$src\" does not resolve on this box (static/$lit is missing) — tailwindcss would exit 0 with an unstyled site; NOT building, NOT reloading"
+        return 1
+      fi
+    done <<EOF_SOURCES
+$declared
+EOF_SOURCES
+
+    # TAILWINDCSS_VERSION (site.toml `tailwindcss_version`, a site-level knob)
+    # pins the compiler: pytailwindcss downloads releases/latest on first use
+    # with it unset, so the stylesheet every visitor gets is otherwise
+    # compiled by whichever version upstream had published when that box's
+    # venv was created.
+    [ -n "${TAILWINDCSS_VERSION:-}" ] || log "$app: WARNING tailwindcss_version is not pinned in deploy/site.toml"
+    CSS_TMP=$(mktemp "static/.app.css.XXXXXX")   # removed by on_exit if we bail
+    # --frozen --no-dev: an unflagged `uv run` re-locks uv.lock inside the
+    # checkout on a pyproject/lock mismatch and wedges this very poller on
+    # `git merge --ff-only` forever. This is the site a grep for "uv run"
+    # misses, because it is spelled $UV.
+    if ! $UV run --frozen --no-dev tailwindcss -i static/src.css -o "$CSS_TMP" --minify; then
+      log "$app: css build failed; NOT reloading"; rm -f "$CSS_TMP"; return 1
+    fi
+    NEW_BYTES=$(wc -c < "$CSS_TMP")
+    if [ "$NEW_BYTES" -lt 1024 ]; then
+      log "$app: css build produced only ${NEW_BYTES}B (floor 1024B) — refusing to install it; NOT reloading"
+      rm -f "$CSS_TMP"; return 1
+    fi
+    if [ -f static/app.css ]; then
+      OLD_BYTES=$(wc -c < static/app.css)
+      if [ "$OLD_BYTES" -gt 0 ] && [ $((NEW_BYTES * 100 / OLD_BYTES)) -lt "$CSS_MIN_RATIO" ]; then
+        log "$app: css collapsed ${OLD_BYTES}B -> ${NEW_BYTES}B (under ${CSS_MIN_RATIO}%) — refusing to install it; NOT reloading"
+        rm -f "$CSS_TMP"; return 1
+      fi
+    fi
+    mv -f "$CSS_TMP" static/app.css
+  fi
+
+  # 4b'. Per-app converge: the SAME three-way rule as the site-level one
+  # above, scoped to THIS app's own deploy/ tree (already checked clean as
+  # part of the site-wide dirty-tree refusal, before any converge ran this
+  # tick). Workspace mode only -- single-app mode's one converge call above
+  # already covers its one app, and calling it again here would run
+  # deploy/converge.sh (or bin/converge.sh $APP) a second time for nothing.
+  if [ -n "$WORKSPACE" ] && { [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] || [ "${DEPLOY_CONVERGE:-}" = "1" ]; }; then
+    if [ -x deploy/converge.sh ]; then
+      ${CONVERGE_CMD:-sudo -n} "$SRV/$dir/deploy/converge.sh" \
+        || { log "$app: deploy/converge.sh failed; NOT reloading"; return 1; }
+    elif [ -e deploy/converge.sh ]; then
+      log "$app: converge is on but deploy/converge.sh is not executable; NOT reloading"
+      return 1
+    else
+      ${CONVERGE_ENGINE_CMD:-sudo -n "$SELF/bin/converge.sh"} "$app" \
+        || { log "$app: bin/converge.sh failed; NOT reloading"; return 1; }
+    fi
+  fi
+
+  # 4c. The reload contract. `reload = "reload"` is `systemctl reload <service>`,
+  #     which is the unit's ExecReload= — and a unit with none makes the verb a
+  #     silent no-op, so every deploy "succeeds" while the old workers keep
+  #     serving (the way one box ran for months). And gunicorn's SIGHUP
+  #     re-imports the app only when preload_app is False; with preload the
+  #     arbiter keeps the modules it imported at boot and re-forks the old code.
+  #     Both are checked HERE, after converge (the deploying commit may be the
+  #     one that adds ExecReload=) and before the verb is sent.
+  if [ "$RELOAD" = reload ]; then
+    if [ -z "$(${SYSCTL_QUERY:-systemctl} show -p ExecReload --value "$SERVICE" 2>/dev/null)" ]; then
+      log "$app: site.toml says reload = \"reload\" but $SERVICE has no ExecReload= — the verb would be a no-op and the old workers would keep serving; declare one, or set reload = \"restart\". NOT reloading"
+      return 1
+    fi
+    if [ -f gunicorn.conf.py ] && grep -qE '^[[:space:]]*preload_app[[:space:]]*=[[:space:]]*True' gunicorn.conf.py; then
+      log "$app: site.toml says reload = \"reload\" but gunicorn.conf.py sets preload_app = True — SIGHUP would re-fork the OLD code; set preload_app = False, or reload = \"restart\". NOT reloading"
+      return 1
+    fi
+  fi
+
+  # 5. Apply: reload onto the new code IMMEDIATELY, even when a snapshot rebuild is coming. Jinja
+  #    reads templates from disk, so from the moment the merge landed the old workers were already
+  #    rendering the NEW templates — deferring the reload leaves old Python under new templates,
+  #    which 500s on any template that needs new Python (live incident, crescira 2026-07-12: new
+  #    template kwarg + old templates_config). The app-side contract making this safe: new code
+  #    must degrade gracefully on the previous snapshot schema (feature-detect tables/columns).
+  $RELOAD_CMD "$RELOAD" "$SERVICE" || { log "$app: systemctl $RELOAD $SERVICE failed"; return 1; }
+
+  # Purging before the origin serves the new code just refills the edge from
+  # stale — or worse, from a 500. So the purge is gated on the app actually
+  # answering, and an unhealthy app fails the unit with the edge left intact,
+  # which is the strictly better failure: visitors keep getting the cached old
+  # site instead of a cold broken one.
+  if [ -n "$HEALTH_PATH" ] && [ -n "${PORT:-}" ]; then
+    local HEALTH_URL="http://127.0.0.1:${PORT}${HEALTH_PATH}"
+    if ! health_ok "$HEALTH_URL"; then
+      log "$app: unhealthy after $RELOAD: $HEALTH_URL did not answer${DEPLOY_HEALTH_MATCH:+ with '$DEPLOY_HEALTH_MATCH'} in ${HEALTH_TRIES}s — NOT purging"
+      return 1
+    fi
+    log "$app: health ok ($HEALTH_URL)"
+  else
+    log "$app: WARNING health gate disabled (no PORT/DEPLOY_HEALTH_PATH) — purging unverified"
+  fi
+
+  rm -f "$PENDING_DIR/$app"
+  SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
+  if [ -n "$cf_changed" ]; then
+    log "$app: deploy/cloudflare.json changed -> dispatching cf-converge@$app.service"
+    $RELOAD_CMD start --no-block "cf-converge@$app.service" \
+      || log "$app: could not start cf-converge@$app.service (edge config convergence will retry via cf-drift@.timer)"
+  fi
+  # If the deploy changed a build input, also rebuild — its --reload-service
+  # swaps the new snapshot in atomically and runs its own cf-purge when done.
+  # Routed through the same helper the EXIT-trap drain uses, so "busy" and
+  # "dispatch failed" are handled identically whether the trigger was this
+  # tick's own diff or a flag left over from an earlier one.
+  if [ -n "$schema_changed" ]; then
+    queue_or_dispatch_build "$app"
+  fi
+  log "$app: deployed ${REMOTE:0:9} ($RELOAD)"
+}
+
+# One call per app carrying a marker -- fresh from this tick's diff, or
+# resumed from an earlier tick that could not finish. Single-app mode calls
+# deploy_app DIRECTLY (its exit ends the whole script, as always); workspace
+# mode wraps each call in a subshell so one app's failure cannot strand the
+# others, but still counts it: "partial success is failure" -- the tick's
+# own exit code, and therefore the deploy dead-man, must reflect that the
+# box is not fully at the ref it should be at, even though every OTHER app
+# deployed cleanly in the same tick.
+FAILED_APPS=()
+for app in "${APPS[@]}"; do
+  [ -f "$PENDING_DIR/$app" ] || continue
+  dir=$(app_dir "$app")
+  if [ -n "$WORKSPACE" ]; then
+    ( cd "$SRV" && deploy_app "$app" "$dir" ) || FAILED_APPS+=("$app")
+  else
+    # Single-app mode: deploy_app's `return 1` must end THIS script, exactly
+    # as every inline `exit 1` here always has -- there is no subshell to
+    # contain it, and no other app to keep going for.
+    deploy_app "$app" "$dir" || exit 1
+  fi
+done
+
+if [ "${#FAILED_APPS[@]}" -gt 0 ]; then
+  log "NOT fully deployed: ${FAILED_APPS[*]} still failing (each reason is above)"
+  exit 1
 fi
-# If the deploy changed a build input, also rebuild — its --reload-service swaps
-# the new snapshot in atomically and runs its own cf-purge when done. Routed
-# through the same helper the EXIT-trap drain uses, so "busy" and "dispatch
-# failed" are handled identically whether the trigger was this tick's own diff
-# or a flag left over from an earlier one.
-if [ -n "$SCHEMA_CHANGED" ]; then
-  queue_or_dispatch_build "$APP"
-fi
-log "deployed ${REMOTE:0:9} ($RELOAD)"
 report_level "deployed ${REMOTE:0:9}"
 DRAIN_OK=1   # healthy end of a deploy tick: the EXIT trap may now drain the rebuild queue
