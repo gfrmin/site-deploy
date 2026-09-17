@@ -113,9 +113,38 @@ port         = 8000
 health_path  = "/health"           # probed on 127.0.0.1:$port after the reload
 health_match = '"ok"'              # a 200 from a half-booted worker is not health
 cf_zone_id   = "..."               # non-secret half of the purge
+tailwindcss_version = "4.3.3"      # apps with static/src.css: pin the compiler (see below)
 # build_service = "<app>-build.service"   # snapshot-backed apps only
 # converge      = true                    # apply deploy/ to the box each tick (see below)
 ```
+
+### The health contract
+
+`health_path` gates the reload → purge step. **With `health_match` set, the body is the datum and
+the status code is ignored**: a snapshot-backed app's `/health` answers 503 on a stale snapshot
+while serving every page, and a status-code probe would call it down, skip the purge, and strand
+the deploy's templates at the edge for a full TTL. Without `health_match` the status code is all
+there is, and a non-2xx is down. Keep this endpoint *shallow* (is the new code up?): a stale
+feed must not wedge the deploy that carries the fix. Point the external probe (`health-probe.sh`)
+at the *deep* variant if the app has one.
+
+### Dependencies, stylesheets, and the things `uv` will do to you
+
+- **A deploy that changes `uv.lock` restarts instead of reloading.** SIGHUP re-forks gunicorn's
+  workers under the interpreter and gunicorn the arbiter was started with; only a restart execs
+  the newly synced ones. `install.sh` grants both verbs for this reason. A resumed deploy remembers
+  the verb in its marker.
+- **A `uv.lock` re-locked in place on the box is discarded before the merge.** Every `uv run` here
+  carries `--frozen --no-dev`, because an unflagged one rewrites the lock on a pyproject mismatch,
+  after which every fast-forward fails forever as "drift". An operator pasting an unflagged
+  `uv run` from a runbook gets the same recovery.
+- **Every `@source "…"` in `static/src.css` must resolve on the box before the build runs.**
+  `tailwindcss` exits 0 with a near-empty stylesheet when a source path is mistyped, and the size
+  canary alone misses apps whose src.css is mostly hand-written CSS. `@source not` / `inline()`
+  forms are reported rather than skipped, so two parsers of one syntax cannot drift silently.
+- **Pin `tailwindcss_version`.** Unset, `pytailwindcss` fetches `releases/latest` when the venv is
+  first created, so each box compiles with whatever upstream had published that day. The pin takes
+  effect on a box's next fresh venv (the download is cached by version).
 
 ### `converge = true` — keeping a box in step with its repo
 
