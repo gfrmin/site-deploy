@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read an app's deploy/site.toml and emit shell assignments for auto-deploy.sh.
+"""Read a site's deploy/site.toml and emit shell assignments for auto-deploy.sh.
 
 Why a file in the app repo rather than more lines in /etc/<app>/env: the env
 file lives only on the box. Nothing reviews it, nothing diffs it, and nothing
@@ -15,6 +15,22 @@ rather than silently resolved: a box quietly behaving differently from what the
 repo says is the failure this file exists to end.
 
     eval "$(site-config.py /srv/app/deploy/site.toml)"
+
+Workspace mode (Phase D item 14: several apps served from one checkout) adds
+two more things this file understands:
+
+  --app-keys   render only the per-app subset of [deploy] — the site-wide
+               knobs (deploy_ref, uv_args, tailwindcss_version, converge) make
+               no sense in an app's OWN site.toml (one checkout has one ref,
+               one venv, one converge decision), so a workspace app's file
+               declaring one is reported and ignored rather than silently
+               read. Used against <apps_dir>/<app>/deploy/site.toml.
+
+  [workspace]  a SITE-level table (never rendered under --app-keys), read
+               from the site's own deploy/site.toml:
+                 apps_dir     = "apps"                  # where members live
+                 shared       = ["packages/"]           # reloads every app
+                 build_inputs = ["packages/x/src/"]     # rebuilds every app
 """
 from __future__ import annotations
 
@@ -23,8 +39,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-# site.toml key -> the environment variable auto-deploy.sh already reads, so the
-# script keeps one way of getting its knobs and this stays a thin adapter.
+# site.toml [deploy] key -> the environment variable auto-deploy.sh reads.
 KEYS = {
     "reload": "DEPLOY_RELOAD",
     "uv_args": "DEPLOY_UV_ARGS",
@@ -43,23 +58,44 @@ KEYS = {
     "build_inputs": "DEPLOY_BUILD_INPUTS",
 }
 
+# One checkout has one ref, one venv, one converge decision — these four are
+# meaningless in a workspace app's own site.toml, so --app-keys drops them
+# (with a warning, not a silent ignore) rather than letting an app believe it
+# controls something only the site can.
+SITE_ONLY_KEYS = {"deploy_ref", "uv_args", "tailwindcss_version", "converge"}
 
-def render(config: dict, environ: dict) -> list[str]:
+# site.toml [workspace] key -> the environment variable lib/workspace.sh reads.
+WORKSPACE_KEYS = {
+    "apps_dir": "WORKSPACE_APPS_DIR",
+    "shared": "WORKSPACE_SHARED",
+    "build_inputs": "WORKSPACE_BUILD_INPUTS",
+}
+
+
+def _render_value(value: object) -> str:
+    # A list (e.g. `build_inputs = ["data/", "packages/x/"]`) is joined
+    # newline-separated: shlex.quote below keeps embedded newlines intact in
+    # the exported string, and the shell side reads them back with
+    # `while IFS= read -r`.
+    if isinstance(value, list):
+        return "\n".join(str(v) for v in value)
+    return "" if value is None else str(value)
+
+
+def render(config: dict, environ: dict, app_keys: bool = False) -> list[str]:
     """Return `export VAR=value` lines, plus warnings for anything it overrides."""
     lines, warnings = [], []
     deploy = config.get("deploy", {})
     for key, var in KEYS.items():
         if key not in deploy:
             continue
-        value = deploy[key]
-        # A list (e.g. `build_inputs = ["data/", "packages/x/"]`) is joined
-        # newline-separated: shlex.quote below keeps embedded newlines intact
-        # inside the exported string, and the shell side reads them back with
-        # `while IFS= read -r`.
-        if isinstance(value, list):
-            value = "\n".join(str(v) for v in value)
-        else:
-            value = "" if value is None else str(value)
+        if app_keys and key in SITE_ONLY_KEYS:
+            warnings.append(
+                f"{key!r} is a site-level knob and is ignored in an app's own "
+                f"site.toml (set it in the site's deploy/site.toml instead)"
+            )
+            continue
+        value = _render_value(deploy[key])
         existing = environ.get(var)
         if existing is not None and existing != value:
             warnings.append(
@@ -67,16 +103,27 @@ def render(config: dict, environ: dict) -> list[str]:
                 f"— using site.toml (the repo is the source of truth)"
             )
         lines.append(f"export {var}={shlex.quote(value)}")
+
+    if not app_keys:
+        workspace = config.get("workspace", {})
+        for key, var in WORKSPACE_KEYS.items():
+            if key not in workspace:
+                continue
+            lines.append(f"export {var}={shlex.quote(_render_value(workspace[key]))}")
+
     # shlex.quote the whole message: the warnings embed repr()'d values, whose
     # own quotes would otherwise close the echo and inject shell.
     return [f"echo {shlex.quote('auto-deploy: ' + w)} >&2" for w in warnings] + lines
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("usage: site-config.py <path to site.toml>", file=sys.stderr)
+    args = argv[1:]
+    app_keys = "--app-keys" in args
+    args = [a for a in args if a != "--app-keys"]
+    if len(args) != 1:
+        print("usage: site-config.py [--app-keys] <path to site.toml>", file=sys.stderr)
         return 2
-    path = Path(argv[1])
+    path = Path(args[0])
     if not path.is_file():
         return 0  # no site.toml is fine — the app keeps its knobs in /etc/<app>/env
     try:
@@ -90,7 +137,7 @@ def main(argv: list[str]) -> int:
         print(f"{path} is unreadable: {exc}", file=sys.stderr)
         return 1
     import os
-    print("\n".join(render(config, dict(os.environ))))
+    print("\n".join(render(config, dict(os.environ), app_keys=app_keys)))
     return 0
 
 
