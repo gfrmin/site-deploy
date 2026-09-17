@@ -57,6 +57,13 @@ host/harden.sh          key-only sshd + ufw (tailnet + Cloudflare ranges only)
 **Confirm `ssh g@<box>` works over Tailscale SSH before running `harden.sh`.** It closes public
 `:22`, and doing that first is a live lockout needing the provider's recovery console.
 
+`harden.sh` raises ufw (deny incoming, tailnet allowed) and calls `bin/ufw-cloudflare-sync.sh` for
+the initial 80/443 allow-list, then enables `ufw-cloudflare-sync.timer` so the list stays in step
+daily — Cloudflare's ranges change occasionally, and a box that never re-fetches them silently
+drifts either into rejecting a new range or trusting one Cloudflare has since given back. The sync
+script only ever touches rules it tagged itself (`comment cf-sync`): never `ufw reset`, never the
+tailnet rule, never anything an operator added by hand.
+
 The host layer is promoted from dataguru's `deploy/host/`, which had absorbed the incident fixes.
 What stayed behind is the part that is genuinely dataguru-shaped: a uv *workspace* of four apps
 under one lock, and `/etc/dataguru/apps`.
@@ -74,10 +81,12 @@ lib/hc.sh            the ping leaf + http_probe, sourced by every reporter
 bin/host-converge.sh converge the box below the app every tick: units, grants, journald, swap, packages, Caddy policy, timers (root)
 bin/install.sh       bootstrap: root-own the toolkit, first host-converge, env-check (admin, once)
 bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
+bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's current ranges (root)
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
 systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
 systemd/site-probe@.service , site-probe@.timer            per-app active probe (every 5 min)
 systemd/site-checks-armed@.service , site-checks-armed@.timer   alarm-armed sweep (every 15 min)
+systemd/ufw-cloudflare-sync.service , ufw-cloudflare-sync.timer   daily Cloudflare range sync (root)
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt, and the files host-converge installs
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
@@ -338,6 +347,7 @@ when current and loud when it refuses.
 ./tests/test-env-check.sh
 ./tests/test-checks-armed.sh
 ./tests/test-host-converge.sh
+./tests/test-ufw-cloudflare-sync.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,
