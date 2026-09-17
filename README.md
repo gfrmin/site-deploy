@@ -476,6 +476,131 @@ ReadWritePaths=<whatever this unit actually writes>
 a WAL SQLite database can itself require creating its `-shm` file if no writer currently has one open,
 which is not a read-only filesystem operation despite being a "read".
 
+## Workspace mode: several apps from one checkout
+
+A **site** is a checkout: `/srv/<site>`, service user `<site>`, `site-deploy@<site>.timer`. By
+default a site serves exactly one app, itself, and everything above this section describes that
+shape in full. **Workspace mode** is the same poller, host-converge and converge engine serving
+*several* apps out of that one checkout — a uv workspace of members, one lock, one venv, one
+`git fetch`, per-app diff scoping, reload and health. It exists for a box that already builds one
+shared package into several deployables (renavon-monorepo's `dataguru` checkout is the motivating
+case), not for apps that merely happen to live in the same GitHub org.
+
+Workspace mode is **opt-in per site**, triggered by nothing but the presence of a `[workspace]`
+table in the site's own `deploy/site.toml`. Every other site on the same box, and every existing
+single-app site, is completely unaffected — this is additive, not a new required shape.
+
+### The three files
+
+**`deploy/site.toml`** (site-level, in the site's own repo root) gains one table alongside its
+existing `[deploy]`:
+```toml
+[workspace]
+apps_dir     = "apps"                # members live at apps/<app>/, default "apps"
+shared       = ["packages/"]         # a change under here reloads EVERY hosted app
+build_inputs = ["packages/core/src/"] # a change under here rebuilds EVERY hosted app's snapshot
+```
+The site's own `[deploy]` table keeps the knobs that only make sense once per checkout —
+`deploy_ref`, `uv_args`, `tailwindcss_version`, `converge` — because one checkout has one ref, one
+venv, one converge decision. Any of those four declared in an *app's own* `deploy/site.toml`
+(below) is ignored with a warning, not silently read.
+
+**`<apps_dir>/<app>/deploy/site.toml`** (one per hosted app, in the same repo, under its own
+directory) is the *same* `[deploy]` schema every single-app site already uses — `reload`, `port`,
+`health_path`, `health_match`, `cf_zone_id`, `build_service`, and two knobs new in this mode:
+```toml
+[deploy]
+service       = "<site>@<app>.service"   # the unit reloaded/restarted (this default, or set your own)
+build_inputs  = ["data/build_db.py"]     # paths (relative to the app's own dir) that dispatch build_service
+```
+`service` defaults to `<site>@<app>.service` (an instance of a shared template unit — see
+`systemd/app@.service` and the migration recipe below) rather than `<app>.service`, since a
+workspace app has no unit of its own by default.
+
+**`deploy/fleet.toml`** (site-level) is which host runs which apps, exact `hostname` match:
+```toml
+[hosts."box-a"]
+apps = ["foo", "bar"]
+[hosts."box-b"]
+apps = ["baz"]
+```
+A host absent from the file, or one whose entry lists no apps, hosts nothing — every tick says so
+on stderr rather than guessing, and the sync falls back to the whole workspace unscoped (see
+below). **Break-glass override**: `/etc/<site>/apps`, whitespace-separated, read as a WHOLE file
+(never line-by-line — a name on its own line must never be silently dropped). It wins over
+`fleet.toml` and is deliberately **never converged**, so a later tick cannot undo it out from
+under an operator mid-incident; its presence is nagged every tick it is in effect.
+
+### Identity: a workspace app has no checkout of its own
+
+`host-converge.sh` derives, every tick, for each hosted app:
+
+- `/srv/<app>` → a **symlink** into `/srv/<site>/<apps_dir>/<app>/`. A real directory, or a
+  symlink pointing anywhere else, is a name collision and a **counted failure** — never silently
+  overwritten (it might be another site's app, or a leftover from before this app moved between
+  sites).
+- `/var/lib/<app>` (state: converge's install manifest, the backup stamp).
+- A `User=<site>`/`Group=<site>` systemd drop-in for the two `%i`-templated units that run as the
+  service user: `site-probe@<app>`, `site-checks-armed@<app>`.
+- Every other per-app piece — `/etc/<app>/{env,cf-env,backup-env,ops-env}`, the alarm timers
+  (`site-probe@<app>.timer`, `cf-drift@<app>.timer`, `site-backup@<app>.timer`), sudoers grants,
+  `<apps_dir>/<app>/deploy/packages.txt` — is keyed on the app's own name, exactly as it already
+  is for a single-app site.
+
+An app that leaves `fleet.toml` has its symlink removed and its alarm timers disarmed on the next
+converge tick. There is **never** a per-app `site-deploy@<app>.timer` — the site's own poller
+timer is what fetches and applies for every app it hosts.
+
+### The queue contract
+
+One checkout, one `git fetch`, one `uv sync` — but each hosted app applies independently. Under
+`/var/lib/site-deploy/<site>/`:
+
+- `pending/<app>` — this app's apply is unfinished; content `reload` or `restart`. Written when
+  the diff touches the app's own directory, the site's top-level `deploy/` (fleet-wide policy),
+  the shared venv files (`uv.lock`, `pyproject.toml`), or a declared `[workspace]` `shared`
+  prefix. `restart` is **never downgraded** by a later tick that didn't itself touch `uv.lock` —
+  the obligation survives until it is actually applied, however many ticks a CSS failure or
+  similar makes that take.
+- `rebuild-pending/<app>` — a queued-but-not-yet-dispatched snapshot rebuild. **One
+  poller-started build per box per tick**, tracked by a file rather than a shell variable (each
+  app's apply runs in its own subshell, so state has to survive that boundary): a busy build
+  queues instead of blocking, and the EXIT-trap drain that retries queued builds also respects the
+  one-per-tick limit.
+
+`uv sync` is scoped with one `--package <app>` per hosted app (renavon's #409 three soft rules,
+ported unchanged): a name that is not a real workspace member, or an empty hosted-app list, emits
+**no** `--package` flags at all — sync the whole workspace rather than invent a scope nothing
+declared; a scoped failure retries unscoped once before giving up.
+
+### "Partial success is failure"
+
+One app's failed apply (a CSS canary trip, an unhealthy reload, a converge refusal) does **not**
+stop the others in the same tick — but the tick's own exit code still reflects it. The deploy
+dead-man (`HEALTHCHECKS_DEPLOY_URL`) pings `/fail` whenever any hosted app is not fully at the ref
+it should be at, even though every other app on the box deployed cleanly. This is a deliberate
+asymmetry from renavon's own poller, which let one app's failure pass silently as long as the
+*box* overall looked fine — a box that is not fully converged should never read as healthy.
+
+### Migrating a renavon-shaped box
+
+renavon's `dataguru` checkout — a uv workspace of `hkjcguru`/`crescira`/`bechirot`/`crhkguru` under
+one lock, `/etc/dataguru/apps` naming which a box runs — is the shape this mode exists to replace
+(Phase D item 15's remaining two adoption issues). The recipe, once a box's `deploy/site.toml`
+gains `[workspace]` and `deploy/fleet.toml` names its apps:
+
+1. Rename each app's per-box config from `/etc/dataguru/<app>.env` to `/etc/<app>/env` (host-converge
+   derives `/etc/<app>/*` as the per-app config root, not `/etc/<site>/<app>.*`).
+2. Give each app a `service` knob (or accept the `<site>@<app>.service` default) and copy
+   `systemd/app@.service` into the repo as that template, adjusting its `ExecStart=` per app the way
+   `dataguru@.service` already does via `EnvironmentFile=`.
+3. Move each app's `build_service`/`build_inputs` into its own `<apps_dir>/<app>/deploy/site.toml`;
+   move anything genuinely site-wide (a shared package's own source tree) into the site's
+   `[workspace]` table instead.
+4. Leave `/etc/dataguru/apps` in place until the fleet.toml-based hosting is confirmed identical on
+   a tick-by-tick basis, then delete it — `ws_apps()` prefers the site's own `/etc/<site>/apps`
+   override if present, so both can coexist during the migration.
+
 ## Monitoring: two checks per app, and why neither is enough alone
 
 Nothing here reports a success it has not verified, and a missing dead-man does not fail — it
