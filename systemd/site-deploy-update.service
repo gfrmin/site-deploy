@@ -1,0 +1,18 @@
+# Keep /srv/site-deploy on the toolkit's tested ref. Runs as ROOT, because the
+# toolkit is root-owned: root executes scripts out of it (deploy/converge.sh via
+# the poller, host-converge later), so the service user must not be able to
+# write it. One unit per box, not per app — there is one toolkit checkout.
+#
+# SITE_DEPLOY_REF=master is the operator escape hatch when CI itself is broken:
+#   systemctl edit site-deploy-update.service   ->   [Service]\nEnvironment=SITE_DEPLOY_REF=master
+[Unit]
+Description=Update the site-deploy toolkit onto its tested ref
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=SITE_DEPLOY_REF=ci-green
+ExecStart=/srv/site-deploy/bin/self-update.sh
+TimeoutStartSec=5min
+Nice=19

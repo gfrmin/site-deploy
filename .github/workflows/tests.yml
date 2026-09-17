@@ -32,4 +32,27 @@ jobs:
         run: shellcheck -S warning bin/*.sh host/*.sh tests/*.sh
 
       - name: scenario tests
-        run: ./tests/test-auto-deploy.sh
+        run: |
+          ./tests/test-auto-deploy.sh
+          ./tests/test-self-update.sh
+
+  # Advance `ci-green` to this commit once the suite is green on master. The
+  # boxes track that ref (bin/self-update.sh), so a red run here means the
+  # toolkit simply stops updating rather than shipping a broken poller to every
+  # box in two minutes. No `paths:` filter on the trigger, ever: it would skip
+  # the run that advances the ref and stall every box silently.
+  green:
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # fetch-depth: 0 is load-bearing: a depth-1 clone holds the tip and no
+      # history, so git cannot prove the push to ci-green is a fast-forward and
+      # the server rejects it with "(fetch first)".
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Point ci-green at this commit
+        run: git push origin HEAD:refs/heads/ci-green

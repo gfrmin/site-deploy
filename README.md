@@ -64,11 +64,39 @@ under one lock, and `/etc/dataguru/apps`.
 ## Layout
 ```
 bin/auto-deploy.sh   generic poller (run by the timer, as the service user)
+bin/self-update.sh   keeps /srv/site-deploy on the toolkit's tested ref (run by a root timer)
 bin/cf-purge.sh      Cloudflare edge purge (no-op unless CF_* set in /etc/<app>/env)
-bin/install.sh       install units + sudoers grant + enable the timer (run by an admin, once)
-systemd/site-deploy@.service , site-deploy@.timer   shared instance units
+bin/health-probe.sh  active public probe -> healthchecks.io (see below)
+bin/install.sh       root-own the toolkit, install units + sudoers grant, enable timers (admin, once)
+bin/site-config.py   deploy/site.toml -> DEPLOY_* env for the poller
+systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
+systemd/site-deploy-update.service , site-deploy-update.timer   per-box toolkit updater (root)
+host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
+
+## The toolkit gates itself
+
+A merge to this repo's `master` used to reach every box within two minutes: the poller pulled
+the toolkit itself, as the service user, best-effort and silently. Now `.github/workflows/tests.yml`
+advances `refs/heads/ci-green` only after the suite passes on `master`, and a root timer
+(`site-deploy-update.timer` → `bin/self-update.sh`) fast-forwards `/srv/site-deploy` onto that
+ref. A box can only ever run a toolkit commit whose whole suite was green.
+
+**There is no fallback to `master` if the ref is missing.** A gate that opens when it cannot find
+its own lock is not a gate. The updater refuses, loudly, every tick, and the box keeps the last
+known-good toolkit. Escape hatch when CI itself is broken:
+
+```
+sudo systemctl edit site-deploy-update.service     # [Service] Environment=SITE_DEPLOY_REF=master
+```
+
+**Trust boundary, restated for the toolkit.** Root executes scripts out of `/srv/site-deploy`
+(the app's `deploy/converge.sh` today, more later), so the toolkit is **root-owned** and the
+service user cannot write it; `install.sh` does the one-time `chown` on boxes bootstrapped before
+this. For the same reason the poller refuses to run `deploy/converge.sh` unless the app's `deploy/`
+tree is byte-identical to the merged commit (no modified tracked files, nothing untracked): an RCE
+in the app must not become root two minutes later by editing a script in place.
 
 ## Per-app config: `deploy/site.toml` in the app repo
 
@@ -131,9 +159,8 @@ DEPLOY_UV_ARGS=--frozen --no-dev   # or just: --frozen
 ## Bootstrap (per box, one-time)
 ```bash
 APP=<app>
-# 1. Clone the toolkit next to the app checkout, owned by the service user.
-sudo install -d -o "$APP" -g "$APP" /srv/site-deploy
-sudo -u "$APP" git clone <this-repo-url> /srv/site-deploy
+# 1. Clone the toolkit next to the app checkout, as root (root runs scripts out of it).
+sudo git clone <this-repo-url> /srv/site-deploy
 #    (private fork? clone over SSH with a read-only deploy key, like the app repo.)
 
 # 2. Add the DEPLOY_* knobs (see example.env) to /etc/$APP/env.
@@ -142,13 +169,15 @@ sudo -u "$APP" git clone <this-repo-url> /srv/site-deploy
 /srv/site-deploy/bin/install.sh "$APP"
 journalctl -fu "site-deploy@$APP.service"
 ```
-Toolkit updates land automatically — `auto-deploy.sh` self-pulls `/srv/site-deploy` each tick
-(silent best-effort).
+Toolkit updates land automatically: `site-deploy-update.timer` fast-forwards `/srv/site-deploy`
+onto `origin/ci-green` every ~2 min (see above). `journalctl -u site-deploy-update` is silent
+when current and loud when it refuses.
 
 ## Tests
 
 ```sh
 ./tests/test-auto-deploy.sh
+./tests/test-self-update.sh
 ```
 
 No network, no root, no systemd, no Cloudflare: a throwaway bare git origin stands in for GitHub,

@@ -21,10 +21,21 @@ RELOAD="$(envval DEPLOY_RELOAD)"; RELOAD="${RELOAD:-reload}"
 BUILD_SVC="$(envval DEPLOY_BUILD_SERVICE)"
 echo "installing auto-deploy for $APP (verb: systemctl $RELOAD $APP${BUILD_SVC:+; rebuild via $BUILD_SVC})"
 
-# 1. Shared instance units (installed once per box; harmless to re-copy).
-sudo cp "$HERE/systemd/site-deploy@.service" "$HERE/systemd/site-deploy@.timer" /etc/systemd/system/
+# 1. The toolkit itself is ROOT-owned and read-only to everyone else: root runs
+#    scripts out of it (deploy/converge.sh via the poller), so the service user
+#    must not be able to write it. A box bootstrapped before this was cloned as
+#    the service user; the chown is the one-time migration and is idempotent.
+#    Its updates come from site-deploy-update.timer (root, tracks the toolkit's
+#    tested ref) — see bin/self-update.sh.
+sudo chown -R root:root "$HERE"
+sudo chmod -R u=rwX,go=rX "$HERE"
 
-# 2. NOPASSWD grants so the service user can reload/restart itself, and (for apps with a snapshot
+# 2. Shared units (installed once per box; harmless to re-copy).
+sudo cp "$HERE/systemd/site-deploy@.service" "$HERE/systemd/site-deploy@.timer" \
+        "$HERE/systemd/site-deploy-update.service" "$HERE/systemd/site-deploy-update.timer" \
+        /etc/systemd/system/
+
+# 3. NOPASSWD grants so the service user can reload/restart itself, and (for apps with a snapshot
 #    build) dispatch a rebuild when a deploy changes data/build_db.py. Validated before install.
 tmp="$(mktemp)"
 {
@@ -36,8 +47,9 @@ sudo visudo -cf "$tmp" >/dev/null
 sudo install -m 440 -o root -g root "$tmp" "/etc/sudoers.d/${APP}-deploy"
 rm -f "$tmp"
 
-# 3. Enable the timer (first run within ~2 min deploys whatever the box is behind by).
+# 4. Enable the timers (first run within ~2 min deploys whatever the box is behind by).
 sudo systemctl daemon-reload
+sudo systemctl enable --now site-deploy-update.timer
 sudo systemctl enable --now "site-deploy@${APP}.timer"
 
 echo

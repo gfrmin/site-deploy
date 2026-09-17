@@ -268,6 +268,39 @@ check "exit non-zero"           [ "$(rc)" != 0 ]
 check "did NOT reload"          not_called "systemctl restart app"
 check "named the problem"       grep -qi "converge.sh is missing or not executable" "$T/out.txt"
 
+echo "12e. root never runs a converge script out of a checkout that differs from the commit"
+# converge.sh runs as root via NOPASSWD from a directory the service user can
+# write. An RCE in the app would edit deploy/converge.sh in place and wait two
+# minutes for the poller to hand it root. The guard: the working tree under
+# deploy/ must match HEAD byte for byte before root touches it.
+( cd "$WORK" || exit 1; chmod +x deploy/converge.sh; git update-index --chmod=+x deploy/converge.sh
+  git commit -qam "fix converge"; git push -q origin master )
+reset_log; run_deploy CONVERGE_CMD=env
+check "sane baseline: converged"  called "CONVERGE RAN"
+echo 'echo PWNED >> "$STUB_LOG"' >> "$SRV/deploy/converge.sh"    # a tracked file, edited on the box
+push_commit c12e; reset_log; run_deploy CONVERGE_CMD=env
+check "exit non-zero"             [ "$(rc)" != 0 ]
+check "did NOT run converge"      not_called "CONVERGE RAN"
+check "did NOT reload"            not_called "systemctl restart app"
+check "named the modified file"   grep -q "deploy/converge.sh" "$T/out.txt"
+( cd "$SRV" || exit 1; git checkout -q -- deploy/converge.sh )
+
+echo "12f. an UNTRACKED file under deploy/ is the same refusal"
+# Untracked is not "not a problem": a converge engine that installs deploy/systemd/*
+# would happily install a unit nobody committed.
+echo "[Unit]" > "$SRV/deploy/rogue.service"
+push_commit c12f; reset_log; run_deploy CONVERGE_CMD=env
+check "exit non-zero"             [ "$(rc)" != 0 ]
+check "did NOT run converge"      not_called "CONVERGE RAN"
+check "named the untracked file"  grep -q "deploy/rogue.service" "$T/out.txt"
+rm -f "$SRV/deploy/rogue.service"
+
+echo "12g. clean again -> converges and finishes the deploy it refused"
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                    [ "$(rc)" = 0 ]
+check "converged"                 called "CONVERGE RAN"
+check "reloaded"                  called "systemctl restart app"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))

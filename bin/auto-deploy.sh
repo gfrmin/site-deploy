@@ -107,8 +107,10 @@ health_ok() {
   return 1
 }
 
-# 0. Self-update the toolkit (best-effort + silent; a toolkit change lands on the NEXT tick).
-git -C "$SELF" pull --ff-only --quiet 2>/dev/null || true
+# The toolkit no longer updates itself from here. /srv/site-deploy is root-owned
+# and site-deploy-update.timer (root) keeps it on the toolkit's tested ref — see
+# bin/self-update.sh for why the service user must not own a directory root
+# executes from.
 
 # 0b. Retry a queued snapshot rebuild. `systemctl start` on an activating oneshot is a silent
 #     no-op (live miss, crescira 2026-07-13: the nightly was mid-run — on pre-push code — when a
@@ -230,6 +232,21 @@ fi
 #     TOML `converge = true` arrives as the capitalised form; the others accept a
 #     hand-set /etc/<app>/env override.
 if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] || [ "${DEPLOY_CONVERGE:-}" = "1" ]; then
+  # Root runs deploy/converge.sh out of a checkout the SERVICE USER can write.
+  # "Merge access is root" is the bargain converge makes on purpose; "an RCE in
+  # the app is root two minutes later" is not, and without this check it would
+  # be: edit deploy/converge.sh in place, wait for the next tick. So root only
+  # ever executes a deploy/ tree that is byte-identical to the commit just
+  # merged — tracked files unmodified AND nothing untracked, because a converge
+  # engine that installs deploy/systemd/* would otherwise install a unit nobody
+  # committed. Refusing leaves the old code serving, like every other pre-reload
+  # failure; the marker makes the next tick retry once the tree is clean.
+  DIRTY=$(git status --porcelain --untracked-files=all -- deploy/)
+  if [ -n "$DIRTY" ]; then
+    log "REFUSING to converge: deploy/ in $SRV differs from the commit (edited on the box?); NOT reloading"
+    echo "$DIRTY" | sed "s/^/auto-deploy[$APP]:   /"
+    exit 1
+  fi
   if [ -x deploy/converge.sh ]; then
     ${CONVERGE_CMD:-sudo -n} "$SRV/deploy/converge.sh" \
       || { log "deploy/converge.sh failed; NOT reloading"; exit 1; }
