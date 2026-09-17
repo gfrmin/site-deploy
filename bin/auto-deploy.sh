@@ -476,6 +476,12 @@ if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] ||
     echo "$DIRTY" | sed "s/^/auto-deploy[$APP]:   /"
     exit 1
   fi
+  # The box below the app first: the toolkit's own units, the grants, the
+  # journald cap, swap, packages, the Caddy restart policy. Root, out of the
+  # root-owned toolkit — never out of the app checkout. A failure here stops
+  # the deploy like any other pre-reload failure.
+  ${HOST_CONVERGE_CMD:-sudo -n "$SELF/bin/host-converge.sh"} "$APP" \
+    || { log "host-converge failed; NOT reloading"; exit 1; }
   if [ -x deploy/converge.sh ]; then
     ${CONVERGE_CMD:-sudo -n} "$SRV/deploy/converge.sh" \
       || { log "deploy/converge.sh failed; NOT reloading"; exit 1; }

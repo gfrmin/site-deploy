@@ -107,10 +107,21 @@ reset_log() { : > "$STUB_LOG"; }
 called() { grep -qF -e "$1" "$STUB_LOG"; }
 not_called() { ! grep -qF -e "$1" "$STUB_LOG"; }
 
+# Every privileged hook is stubbed HERE, unconditionally, and not only in the
+# runs that exercise it: the poller's defaults are `sudo -n ...`, and on a dev
+# box with passwordless sudo an unstubbed run converges the REAL host. It
+# happened once. A stub that is always present cannot be forgotten by a run.
+cat > "$T/bin/host-converge" <<'STUB'
+#!/usr/bin/env bash
+echo "HOST-CONVERGE RAN $*" >> "$STUB_LOG"
+exit ${FAKE_HOST_CONVERGE_RC:-0}
+STUB
+chmod +x "$T/bin/host-converge"
 run_deploy() {
   env APP=app APP_DIR="$SRV" SITE_DEPLOY_DIR="$ROOT" UV="$T/bin/uv" CURL="$T/bin/curl" \
       RELOAD_CMD="$T/bin/systemctl" PORT=8000 DEPLOY_HEALTH_TRIES=2 \
       CF_ZONE_ID=zone1 CF_CACHE_PURGE_TOKEN=tok1 \
+      CONVERGE_CMD=env HOST_CONVERGE_CMD="$T/bin/host-converge" DEPLOY_REF_FILE="$T/deploy-ref" \
       "$@" bash "$ROOT/bin/auto-deploy.sh" > "$T/out.txt" 2>&1
   echo $? > "$T/rc.txt"
 }
@@ -545,6 +556,25 @@ site_toml "${BASE[@]/reload = \"reload\"/reload = \"restart\"}" 'deploy_ref = "c
 reset_log; run_deploy CONVERGE_CMD=env STUB_EXEC_RELOAD=""
 check "exit 0"                     [ "$(rc)" = 0 ]
 check "restarted"                  called "systemctl restart app"
+
+# ── host-converge runs BEFORE the app's converge, and its failure stops the deploy ──
+echo "17a. converge = true also converges the host, first"
+site_toml "${BASE[@]}" 'deploy_ref = "ci-green"'
+( cd "$WORK" || exit 1; printf 'preload_app = False\n' > gunicorn.conf.py; git commit -qam "fix preload"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "host converged"             called "HOST-CONVERGE RAN app"
+check "host before app"            bash -c 'h=$(grep -n "HOST-CONVERGE RAN" "$STUB_LOG" | head -1 | cut -d: -f1); a=$(grep -n "CONVERGE RAN" "$STUB_LOG" | grep -v HOST | head -1 | cut -d: -f1); [ -n "$h" ] && [ -n "$a" ] && [ "$h" -lt "$a" ]'
+
+echo "17b. a failing host-converge stops the deploy before the app converge and the reload"
+push_commit c17b; ( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy FAKE_HOST_CONVERGE_RC=1
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "app converge NOT run"       bash -c '! grep -v HOST "$STUB_LOG" | grep -q "CONVERGE RAN"'
+check "did NOT reload"             not_called "systemctl reload app"
+check "said why"                   grep -qi "host-converge" "$T/out.txt"
+reset_log; run_deploy
+check "resumes once fixed"         called "systemctl reload app"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

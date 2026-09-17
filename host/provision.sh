@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Provision a site host: system packages + uv + service user + swap. Idempotent,
-# safe to re-run. Run as root, once /srv/site-deploy and /srv/<app> are cloned.
+# Provision a site host: system packages + uv + service user. Idempotent,
+# safe to re-run. Everything that must stay in step with the repo afterwards
+# (swap, sysctl, journald, needrestart, units, grants) is bin/host-converge.sh. Run as root, once /srv/site-deploy and /srv/<app> are cloned.
 #
 #   bash /srv/site-deploy/host/provision.sh <app>
 #
@@ -51,42 +52,10 @@ install -d -o root -g root -m0755 "/etc/${APP}"
 install -d -o root -g root -m0755 /etc/caddy/sites /etc/caddy/certs
 install -d -o "$APP" -g "$APP" -m0755 "$SRV/.uv-cache"
 
-# --- swap --------------------------------------------------------------------
-# DO droplets ship with none. On 2026-08-24 a 7.8 GiB box with no swap had the
-# kernel OOM-kill a build mid-promote AND SIGKILL a live web worker two minutes
-# later, which Caddy served as 502s (dataguru RCA #287). Swap does not make an
-# oversized job fit; it gives the kernel somewhere to put cold anonymous pages
-# instead of reaching for the OOM killer on a transient spike.
-if [ -z "$(swapon --show=NAME --noheadings)" ]; then
-  if [ ! -e /swapfile ]; then
-    fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
-    chmod 0600 /swapfile
-    mkswap /swapfile >/dev/null
-  fi
-  # Non-fatal on purpose: under `set -e` a bare `swapon` aborts the whole
-  # installer before the user and dirs exist — and it CAN fail on a re-run, on
-  # an existing but unformatted /swapfile (a killed fallocate). Losing swap is
-  # worth a warning; losing provisioning is not.
-  if swapon /swapfile; then
-    echo "provision: enabled 4G /swapfile"
-  else
-    echo "provision: WARNING /swapfile exists but swapon failed; no swap on this box" >&2
-  fi
-fi
-# Gated on the file existing, not on the block above having run: a box that
-# already had swap under a different name must not get an fstab entry for a
-# /swapfile nobody created, or the next boot's `swapon -a` fails on it.
-if [ -e /swapfile ]; then
-  grep -qxF '/swapfile none swap sw 0 0' /etc/fstab \
-    || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-fi
-# swappiness=10, not the default 60: a serving box's hot set is page cache, which
-# is cheap to re-read, so evicting the app's anonymous memory to hold more of it
-# is precisely backwards.
-install -m0644 /dev/stdin /etc/sysctl.d/60-site-swappiness.conf <<'SYSCTL'
-vm.swappiness = 10
-SYSCTL
-sysctl -q -p /etc/sysctl.d/60-site-swappiness.conf
+# --- swap, swappiness, journald, needrestart, packages-on-diff, timers ------
+# All of that is bin/host-converge.sh, which runs on every deploy tick as well
+# as from install.sh: a box is a function of the repo every two minutes, not
+# only on the day it was built.
 
 echo "provision: $APP ready. Next: /etc/${APP}/env, then bin/install.sh ${APP},"
 echo "           then CONFIRM tailscale ssh, then host/harden.sh."
