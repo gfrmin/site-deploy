@@ -218,7 +218,11 @@ tmp_sudo=$(mktemp)
                      | sed -n "s/^export DEPLOY_BUILD_SERVICE=//p" | tr -d "'\"")
       [ -n "$toml_build" ] && build_svc=$toml_build
     fi
-    echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $APP, /usr/bin/systemctl restart $APP"
+    # The unit auto-deploy.sh actually reloads: site.toml `service`, else $APP.service. sudo
+    # matches arguments literally, so granting the bare "$APP" while the poller runs
+    # `systemctl reload $APP.service` refuses every deploy ("sudo: a password is required").
+    svc=$(app_service "$APP")
+    echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
     [ -n "$build_svc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
     echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
   else
