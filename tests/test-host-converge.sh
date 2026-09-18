@@ -97,7 +97,12 @@ check "probe units installed"           [ -f "$HR/etc/systemd/system/site-probe@
 check "daemon-reloaded"                 called "systemctl daemon-reload"
 check "sudoers written"                 [ -f "$HR/etc/sudoers.d/app-deploy" ]
 check "sudoers validated first"         called "visudo -cf"
-check "grants reload AND restart"       bash -c 'grep -q "systemctl reload app" "$HR/etc/sudoers.d/app-deploy" && grep -q "systemctl restart app" "$HR/etc/sudoers.d/app-deploy"'
+# Exact, not a substring: "systemctl reload app" also matches "systemctl reload app.service",
+# which is how a grant for the wrong unit name went unnoticed (sudo matches literally).
+check "grants reload AND restart of the unit the poller reloads (app.service)" \
+  grep -qF "NOPASSWD: /usr/bin/systemctl reload app.service, /usr/bin/systemctl restart app.service" "$HR/etc/sudoers.d/app-deploy"
+check "no grant for the bare name the poller never runs" \
+  bash -c '! grep -qE "systemctl (reload|restart) app(,|$)" "$HR/etc/sudoers.d/app-deploy"'
 check "grants host-converge"            grep -q "host-converge.sh app" "$HR/etc/sudoers.d/app-deploy"
 check "journald capped"                 grep -q "SystemMaxUse" "$HR/etc/systemd/journald.conf.d/site-deploy.conf"
 check "needrestart exempts batch units" grep -q 'qr(^app-)' "$HR/etc/needrestart/conf.d/site-deploy.conf"
@@ -206,13 +211,22 @@ check "exit 1"                          [ "$(rc)" = 1 ]
 check "one greppable line"              grep -q "HOST-CONVERGE FAILED" "$T/out.txt"
 check "named the step"                  grep -qi "sudoers" "$T/out.txt"
 check "later work still happened"       bash -c '! grep -q drift "$HR/etc/systemd/system/site-probe@.service"'
-check "sudoers left untouched"          grep -q "systemctl reload app" "$HR/etc/sudoers.d/app-deploy"
+check "sudoers left untouched"          grep -qF "systemctl reload app.service," "$HR/etc/sudoers.d/app-deploy"
 
 echo "10. apt failing is counted too"
 printf 'libgomp1\ncurl\nnewpkg\n' > "$HR/srv/app/deploy/packages.txt"
 reset_log; run STUB_FAIL_APT=1
 check "exit 1"                          [ "$(rc)" = 1 ]
 check "named packages"                  grep -qi "packages" "$T/out.txt"
+
+echo "10b. site.toml \`service\` names the unit -> the grant follows it (bare name here)"
+printf '[deploy]\nreload = "reload"\nservice = "app"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "grants the declared bare unit"   grep -qF "NOPASSWD: /usr/bin/systemctl reload app, /usr/bin/systemctl restart app" "$HR/etc/sudoers.d/app-deploy"
+check "and not the .service default"    bash -c '! grep -qF "systemctl reload app.service" "$HR/etc/sudoers.d/app-deploy"'
+rm -f "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "default restored without it"     grep -qF "systemctl reload app.service," "$HR/etc/sudoers.d/app-deploy"
 
 echo "11. with HOST_ROOT unset the constants are the production paths"
 check "/etc and /srv literal"           grep -qF 'ROOT="${HOST_ROOT:-}"' "$ROOT/bin/host-converge.sh"
