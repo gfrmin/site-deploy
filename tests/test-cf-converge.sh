@@ -79,14 +79,41 @@ class Fake:
 
 
 def run(desired, fake, apply=True, public_ip=IP, verbose=False, rule_scope=None):
-    """reconcile() against the fake -> (changes, failed, stdout, stderr)."""
+    """reconcile() against the fake -> (changes, failed, stdout, stderr).
+
+    Drift (a refused scoped rule not live as declared) is left out of the
+    tuple so the older scenarios read unchanged; run_drift() returns it.
+    """
+    changes, _, failed, o, e = run_drift(desired, fake, apply, public_ip, verbose, rule_scope)
+    return changes, failed, o, e
+
+
+def run_drift(desired, fake, apply=True, public_ip=IP, verbose=False, rule_scope=None):
+    """reconcile() against the fake -> (changes, drift, failed, stdout, stderr)."""
     cfc.api = fake
     o, e = io.StringIO(), io.StringIO()
     cf = cfc.Ctx(token="t", zone=ZONE, domain="site.example",
                  public_ip=public_ip, apply=apply, rule_scope=rule_scope)
     with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
-        changes, failed = cfc.reconcile(cf, desired, verbose)
-    return changes, failed, o.getvalue(), e.getvalue()
+        changes, drift, failed = cfc.reconcile(cf, desired, verbose)
+    return changes, drift, failed, o.getvalue(), e.getvalue()
+
+
+def run_main(desired, fake, *extra):
+    """main() on a temp cloudflare.json -> (rc, stdout, stderr)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(desired, fh)
+        path = fh.name
+    cfc.api = fake
+    os.environ["CF_CONFIG_TOKEN"] = "t"
+    o, e = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            rc = cfc.main(["--desired", path, "--domain", "site.example", "--zone", ZONE,
+                           "--public-ip", IP, *extra])
+    finally:
+        os.unlink(path)
+    return rc, o.getvalue(), e.getvalue()
 
 
 results = []
@@ -348,6 +375,70 @@ def unscoped_desired_is_still_whole_phase_ownership():
     check(failed == 0 and changes == 1, "unscoped: the declared list wholly replaces the phase")
     check(f.bodies()[0]["rules"] == [cfc.norm_rule(A_RULE)],
           "the foreign rule is NOT preserved when no rule_scope is set")
+
+
+# --- drift as a status, not as output volume (issue #23) ----------------------
+
+
+@scenario
+def a_converged_dry_run_prints_ok_lines_and_exits_0():
+    """--verbose output on a zone with no drift is not drift."""
+    f = Fake({("GET", ep(CACHE)): {"rules": [A_CACHE_RULE]}})
+    rc, out, _ = run_main({"cache_rules": [A_CACHE_RULE]}, f, "--verbose", "--detailed-exitcode")
+    check(rc == 0, f"a converged zone exits 0 under --detailed-exitcode (rc={rc})")
+    check("ok -- cache_rules match" in out, "while still printing its ok line")
+
+
+@scenario
+def a_one_rule_diff_dry_run_exits_3():
+    f = Fake({("GET", ep(CACHE)): {"rules": []}})
+    rc, out, _ = run_main({"cache_rules": [A_CACHE_RULE]}, f, "--verbose", "--detailed-exitcode")
+    check(rc == 3, f"a one-rule diff exits 3 under --detailed-exitcode (rc={rc})")
+    check("[dry-run]" in out and not f.bodies(), "reported, and nothing written")
+
+
+@scenario
+def without_detailed_exitcode_a_diff_still_exits_0():
+    f = Fake({("GET", ep(CACHE)): {"rules": []}})
+    rc, _, _ = run_main({"cache_rules": [A_CACHE_RULE]}, f)
+    check(rc == 0, f"the default exit status is unchanged for other callers (rc={rc})")
+
+
+@scenario
+def a_failure_exits_2_even_with_detailed_exitcode():
+    desired = {"cache_rules": [A_CACHE_RULE],
+               "waf_custom_rules": [dict(CHALLENGE, expression="ip.src ne __NOPE__")]}
+    f = Fake({("GET", ep(CACHE)): {"rules": []}})
+    rc, _, _ = run_main(desired, f, "--detailed-exitcode")
+    check(rc == 2, f"a failed phase wins over drift: exit 2 (rc={rc})")
+
+
+@scenario
+def a_refused_rule_already_live_is_agreement_not_drift():
+    """The shared Free-plan rate-limit rule: refused here, owned elsewhere, live as declared."""
+    f = Fake({("GET", ep(RL)): {"rules": [dict(AMBIGUOUS_RULE, id="r1", version="2")]}})
+    changes, drift, failed, out, err = run_drift({"rate_limit_rules": [AMBIGUOUS_RULE]}, f,
+                                                 apply=False, verbose=True, rule_scope=SCOPE)
+    check(changes == 0 and drift == 0 and failed == 0,
+          f"no change, no drift, no failure (changes={changes} drift={drift} failed={failed})")
+    check("WARNING" not in err, "no WARNING line")
+    check("live as declared" in out, "an ok line says why under --verbose")
+    check(not f.bodies(), "and nothing is written")
+
+
+@scenario
+def a_refused_rule_not_live_is_drift():
+    edited = dict(AMBIGUOUS_RULE, enabled=False)
+    f = Fake({("GET", ep(RL)): {"rules": [edited]}})
+    changes, drift, failed, _, err = run_drift({"rate_limit_rules": [AMBIGUOUS_RULE]}, f,
+                                               apply=False, rule_scope=SCOPE)
+    check(drift == 1 and changes == 0 and failed == 0,
+          f"a refused rule edited at the dashboard is drift (drift={drift})")
+    check("WARNING" in err and "not live as declared" in err, "and says so")
+    rc, _, _ = run_main({"rule_scope": {"host": "a.example"},
+                         "rate_limit_rules": [AMBIGUOUS_RULE]},
+                        Fake({("GET", ep(RL)): {"rules": [edited]}}), "--detailed-exitcode")
+    check(rc == 3, f"which exits 3 under --detailed-exitcode (rc={rc})")
 
 
 for fn in SCENARIOS:

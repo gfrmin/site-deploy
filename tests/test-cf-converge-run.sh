@@ -113,9 +113,10 @@ reset_log; run ""
 check "apply passed"           called -- "--apply"
 check "not verbose"            not_called "--verbose"
 
-echo "10. --dry-run passes --verbose, never --apply"
+echo "10. --dry-run passes --verbose and --detailed-exitcode, never --apply"
 reset_log; run "--dry-run"
 check "verbose passed"         called -- "--verbose"
+check "detailed exit passed"   called -- "--detailed-exitcode"
 check "not apply"              not_called "--apply"
 
 echo "11. --dry-run, no drift, a healthchecks URL set: pings clean (root), not /fail"
@@ -123,8 +124,14 @@ reset_log; HEALTHCHECKS_CF_DRIFT_URL=https://hc.example/d1 run "--dry-run"
 check "pinged root"            called "https://hc.example/d1"
 check "not /fail"              not_called "/d1/fail"
 
-echo "12. --dry-run, drift reported (cfc printed a change): pings /fail"
-reset_log; STUB_CFC_OUT="cf[a]: ssl mode strict -> full" HEALTHCHECKS_CF_DRIFT_URL=https://hc.example/d1 run "--dry-run"
+echo "11b. --dry-run, no drift but verbose ok/refusal lines printed: still pings clean (issue #23)"
+reset_log; STUB_CFC_OUT="cf[a]: ok -- cache_rules match (3 rule(s))" HEALTHCHECKS_CF_DRIFT_URL=https://hc.example/d1 run "--dry-run"
+check "pinged root"            called "https://hc.example/d1"
+check "not /fail"              not_called "/d1/fail"
+check "ok lines ride in the success body" called "cache_rules match"
+
+echo "12. --dry-run, drift reported (cfc exit 3): pings /fail"
+reset_log; STUB_CFC_RC=3 STUB_CFC_OUT="cf[a]: ssl mode strict -> full" HEALTHCHECKS_CF_DRIFT_URL=https://hc.example/d1 run "--dry-run"
 check "exit 0 (dry-run itself did not fail)" [ "$(rc)" = 0 ]
 check "pinged /fail"           called "https://hc.example/d1/fail"
 check "body carries the diff"  called "ssl mode strict -> full"
@@ -141,6 +148,10 @@ check "no curl to hc.example"  not_called "hc.example"
 echo "15. the reconciler's exit code propagates"
 reset_log; STUB_CFC_RC=2 run ""
 check "exit 2"                 [ "$(rc)" = 2 ]
+
+echo "16. --dry-run drift with no healthchecks URL: exit 0, drift is not a unit failure"
+reset_log; STUB_CFC_RC=3 run "--dry-run"
+check "exit 0"                 [ "$(rc)" = 0 ]
 
 rm -f "$HR/srv/app/deploy/site.toml"
 
