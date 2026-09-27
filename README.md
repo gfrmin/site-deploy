@@ -172,6 +172,12 @@ a green run on `master` (a ~15-line job; this repo's own `tests.yml` is the temp
 - **A ref that stops moving is not "where the box should be."** While `master` is ahead, the
   poller logs how far behind the ref is; once the ref has not moved for an hour (`REF_FROZEN_SECONDS`),
   a level tick sends `/fail` instead of the root ping. A busy day of green merges never trips it.
+- **Ahead of the ref is not a hiding place.** The transition deploy (the old site.toml still said
+  `master`) and removing a `deploy-ref = master` override both leave the box *ahead* of the ref, on
+  master's commits the gate never passed. There, a frozen ref still sends `/fail`, and an unfinished
+  deploy (a pending marker) is resumed in place, never advanced — but only when every checked-out
+  commit is on `origin/master`, since the resume runs `deploy/converge.sh` as root. A marker on top
+  of a commit made on the box is a stranded deploy: `/fail`, not a resume.
 - **Emergency override:** a ref name in `/etc/<app>/deploy-ref` wins over site.toml (write
   `master` when CI itself is broken). Deliberately a file, not a converged setting.
 - The fetch uses an explicit `+refs/heads/*` refspec, so a `--single-branch` clone cannot starve

@@ -666,6 +666,64 @@ check "legacy reload marker is gone"    [ ! -e "$SRV/.site-deploy-reload-pending
 check "legacy build marker is gone"     [ ! -e "$SRV/.site-deploy-build-pending" ]
 check "queue dir has the state now"     [ ! -e "$SRV/.site-deploy-state/pending/app" ]
 
+# ── ahead of the gate (issue #29) ─────────────────────────────────────────────
+# The box can sit AHEAD of origin/$REF on commits master has and the gate never
+# passed: the transition deploy (the pre-merge read of site.toml still said
+# master), or a removed /etc deploy-ref = master override. Ahead must not be a
+# place where the frozen-gate alarm and the pending-marker resume stop working.
+echo "23a. ahead of the gate on master's commits, gate not yet frozen: level, says so"
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\nconverge = true\ndeploy_ref = "ci-green"\n' > deploy/site.toml
+  git commit -qam "arm the gate"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "gate armed, level: exit 0"  [ "$(rc)" = 0 ]
+push_commit c23
+echo master > "$T/deploy-ref"; reset_log; run_deploy CONVERGE_CMD=env DEPLOY_REF_FILE="$T/deploy-ref"
+rm -f "$T/deploy-ref" "$SRV/.site-deploy-state/ref-frozen-since"
+check "box took master's untested commit" bash -c 'cd "'"$SRV"'" && [ "$(git rev-parse @)" = "$(git rev-parse origin/master)" ] && [ "$(git rev-parse @)" != "$(git rev-parse origin/ci-green)" ]'
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "said ahead"                 grep -qi "ahead" "$T/out.txt"
+check "not yet /fail"              not_called "deploy1/fail"
+
+echo "23b. a pending marker while ahead of the gate is resumed, not stranded"
+mkdir -p "$SRV/.site-deploy-state/pending"; printf 'reload' > "$SRV/.site-deploy-state/pending/app"
+head_before=$(git -C "$SRV" rev-parse @)
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "resumed"                    grep -qi "resuming" "$T/out.txt"
+check "restarted (site.toml: restart)" called "systemctl restart app.service"
+check "converged (from master's own commits)" called "HOST-CONVERGE RAN"
+check "marker cleared"             [ ! -e "$SRV/.site-deploy-state/pending/app" ]
+check "checkout did not move"      [ "$(git -C "$SRV" rev-parse @)" = "$head_before" ]
+
+echo "23b2. a marker on top of a commit made ON the box is NOT resumed (root never converges it): /fail"
+( cd "$SRV" || exit 1; echo evil >> deploy/local.txt; git add -A; git commit -qm "local-only" )
+printf 'reload' > "$SRV/.site-deploy-state/pending/app"
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "did not restart"            not_called "systemctl restart app"
+check "did not converge"           not_called "HOST-CONVERGE RAN"
+check "said NOT RESUMED"           grep -q "NOT RESUMED" "$T/out.txt"
+check "dead-man got /fail"         called "deploy1/fail"
+rm -f "$SRV/.site-deploy-state/pending/app"; git -C "$SRV" reset -q --hard HEAD~1
+
+echo "23c. ahead of a gate frozen for an hour: the dead-man gets /fail, never level"
+echo "$(git -C "$SRV" rev-parse origin/ci-green) 1000000000" > "$SRV/.site-deploy-state/ref-frozen-since"
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0 (nothing to do)"     [ "$(rc)" = 0 ]
+check "said FROZEN"                grep -q "FROZEN" "$T/out.txt"
+check "said it serves untested"    grep -qi "ahead" "$T/out.txt"
+check "dead-man got /fail"         called "deploy1/fail"
+check "no root ping"               bash -c '! grep -q "https://hc.example/deploy1 *$" "$STUB_LOG"'
+
+echo "23d. the gate catches up -> level again, clock cleared"
+( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "no /fail"                   not_called "deploy1/fail"
+check "clock cleared"              [ ! -f "$SRV/.site-deploy-state/ref-frozen-since" ]
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))
