@@ -261,7 +261,7 @@ www.example.org {
   shed). It bounds the queue; it is not a semaphore.
 - **`dial_timeout 5s`, `response_header_timeout 65s`** (above gunicorn's 60 s worker timeout, so the
   app's own timeout fires first). They bound how long a request's buffers live in Caddy.
-- **A caddy-owned JSON access log**, rolled at 100 MB × 5: the origin's own record of a flood, with
+- **A caddy-owned JSON access log**, rolled at `roll_size 100mb` × 5: the origin's own record of a flood, with
   Referer and `Sec-Fetch-*` that Free-plan Cloudflare analytics withhold. Cookie and Authorization are
   redacted by default.
 
@@ -269,7 +269,7 @@ Two traps, encoded rather than rediscovered:
 
 1. **`caddy validate` opens every log file** to prove it can write it. Run as root, it creates the
    file root-owned 0600 and the daemon's next reload fails on it. `host-converge` pre-creates each
-   app's log caddy-owned and repairs one it finds owned by anyone else; the `[converge]` engine
+   app's log owned by the caddy unit's `User=` and repairs one it finds owned by anyone else; the `[converge]` engine
    already validates as the caddy unit's `User=`. Validating by hand: `sudo -u caddy caddy validate
    --config /etc/caddy/Caddyfile`.
 2. **The cap counts what Caddy holds.** A client that hangs up frees its slot while the app finishes

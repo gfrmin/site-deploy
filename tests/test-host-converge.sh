@@ -86,7 +86,8 @@ export CADDY_USER=no-such-user-here
 # stat reports STUB_STAT_OWNER for %U (a root-owned log without being root), the real answer otherwise.
 cat > "$T/bin/stat" <<'STUB'
 #!/usr/bin/env bash
-[ "${1:-}" = "-c" ] && [ "${2:-}" = "%U" ] && [ -n "${STUB_STAT_OWNER:-}" ] && { echo "$STUB_STAT_OWNER"; exit 0; }
+case " $* " in *" -c %U "*) is_owner=1 ;; esac
+[ -n "${is_owner:-}" ] && [ -n "${STUB_STAT_OWNER:-}" ] && { echo "$STUB_STAT_OWNER"; exit 0; }
 exec /usr/bin/stat "$@"
 STUB
 chmod +x "$T/bin"/*; export PATH="$T/bin:$PATH"

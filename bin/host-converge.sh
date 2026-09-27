@@ -345,7 +345,10 @@ if systemctl cat caddy.service >/dev/null 2>&1; then
   # it can write it, so one run as root leaves it root-owned 0600 and the
   # daemon's next reload fails on it. Created if missing, repaired if found
   # owned by anyone else. Harmless for an app whose Caddyfile does not log.
-  caddy_user=${CADDY_USER:-caddy}
+  # The user the caddy unit actually runs as (a box may override User=), the
+  # same lookup bin/converge.sh uses to validate as it.
+  caddy_user=${CADDY_USER:-$(systemctl show -p User --value caddy.service 2>/dev/null)}
+  caddy_user=${caddy_user:-caddy}
   if id -u "$caddy_user" >/dev/null 2>&1; then
     logdir="$ROOT/var/log/caddy"
     if [ ! -d "$logdir" ]; then
@@ -357,8 +360,8 @@ if systemctl cat caddy.service >/dev/null 2>&1; then
       if [ ! -e "$f" ]; then
         { : > "$f" && chown "$caddy_user:" "$f" && chmod 0640 "$f"; } \
           && say "created $f (owned by $caddy_user)" || note_failure "could not create $f"
-      elif [ "$(stat -c %U "$f")" != "$caddy_user" ]; then
-        was=$(stat -c %U "$f")
+      elif [ "$(stat -L -c %U "$f")" != "$caddy_user" ]; then
+        was=$(stat -L -c %U "$f")
         { chown "$caddy_user:" "$f" && chmod 0640 "$f"; } \
           && say "repaired $f: was owned by $was, now $caddy_user (a \`caddy validate\` run as root does this, and the next reload fails on it)" \
           || note_failure "could not repair ownership of $f (owned by $was)"
