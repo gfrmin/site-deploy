@@ -56,6 +56,7 @@ KEYS = {
     "deploy_ref": "DEPLOY_REF",
     "service": "DEPLOY_SERVICE",
     "build_inputs": "DEPLOY_BUILD_INPUTS",
+    "probe_external": "PROBE_EXTERNAL",
 }
 
 # One checkout has one ref, one venv, one converge decision — these four are

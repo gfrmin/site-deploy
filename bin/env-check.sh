@@ -3,7 +3,13 @@
 # the RUNNING app on it?
 #
 #   env-check.sh <app>        reads /srv/<app>/deploy/required-env.txt against /etc/<app>/*
-#   ETC=, MANIFEST=, UNIT=, PROC_ROOT=   overrides for fixtures and tests
+#   ETC=, MANIFEST=, UNIT=, PROC_ROOT=, SITE_TOML=   overrides for fixtures and tests
+#
+# One knob outside the manifest: an app whose site.toml declares
+# `probe_external` is probed from off the box, so an absent PROBE_URL /
+# HEALTHCHECKS_PROBE_URL in `env` is satisfied even where the manifest grades
+# them required (host-converge.sh disarms the on-box probe; site-checks-armed
+# verifies the external check).
 #
 # WHY THIS EXISTS. A site rendered no purchase CTA of any kind for four days
 # after a droplet rebuild reconstructed its env file with 16 of the 31
@@ -69,7 +75,12 @@ ETC="${ETC:-/etc/$app}"
 MANIFEST="${MANIFEST:-/srv/$app/deploy/required-env.txt}"
 UNIT="${UNIT:-$app.service}"
 PROC_ROOT="${PROC_ROOT:-/proc}"
+SITE_TOML="${SITE_TOML:-/srv/$app/deploy/site.toml}"
 say() { echo "env-check: $app: $*"; }
+
+probe_external=""
+[ -r "$SITE_TOML" ] && probe_external=$(python3 "$(dirname "${BASH_SOURCE[0]}")/site-config.py" --app-keys "$SITE_TOML" 2>/dev/null \
+                                          | sed -n "s/^export PROBE_EXTERNAL=//p" | tail -1 | tr -d "'\"")
 
 [ -r "$MANIFEST" ] || { say "BLIND: cannot read $MANIFEST"; exit 2; }
 
@@ -139,7 +150,10 @@ for key in "${ORDER[@]}"; do
   [ -e "$ETC/$f" ] || continue
   case ${GRADE[$key]} in
     required)
-      if [ -z "${HAS[$key]:-}" ]; then
+      if [ -z "${HAS[$key]:-}" ] && [ -z "${BLANK[$key]:-}" ] && [ -n "$probe_external" ] && [ "$f" = env ] \
+         && { [ "$name" = PROBE_URL ] || [ "$name" = HEALTHCHECKS_PROBE_URL ]; }; then
+        say "$f: $name absent — satisfied: probed externally ($probe_external)"
+      elif [ -z "${HAS[$key]:-}" ]; then
         rc=1
         if [ -n "${BLANK[$key]:-}" ]; then
           say "$f: REQUIRED $name is set to an EMPTY VALUE, which is not the same as leaving it out — ${REASON[$key]}"

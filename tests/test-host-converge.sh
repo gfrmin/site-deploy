@@ -300,6 +300,21 @@ check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
 check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
 check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
 
+echo "20. probe_external (issue #24): the on-box probe is disarmed, not nagged UNPROBED"
+printf '[deploy]\nreload = "reload"\nprobe_external = "foo.example-probe"\n' > "$HR/srv/site/apps/foo/deploy/site.toml"
+reset_log; run_ws
+check "exit 0"                       [ "$(rc)" = 0 ]
+check "foo's on-box probe disarmed"  [ ! -e "$STUB_UNITS/site-probe@foo.timer.enabled" ]
+check "said why"                     grep -q "probed externally (foo.example-probe)" "$T/out.txt"
+check "foo NOT named unprobed"       bash -c '! grep -q "foo: .*UNPROBED" "$T/out.txt"'
+check "the leftover pair is named"   grep -q "foo: .*are ignored" "$T/out.txt"
+check "no sweep: UNVERIFIED nag"     grep -q "foo: .*UNVERIFIED" "$T/out.txt"
+: > "$HR/etc/foo/env"
+printf 'HEALTHCHECKS_API_KEY=k\nHEALTHCHECKS_SWEEP_TAG=fleet\n' > "$HR/etc/foo/ops-env"
+reset_log; run_ws
+check "with the sweep armed: no foo probe nag at all" bash -c '! grep -qE "foo: .*(UNPROBED|UNVERIFIED|ignored)" "$T/out.txt"'
+check "foo's sweep armed"            [ -e "$STUB_UNITS/site-checks-armed@foo.timer.enabled" ]
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))

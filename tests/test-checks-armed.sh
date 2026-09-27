@@ -53,6 +53,26 @@ run_case "a never-pinged check is reported as such, not as stale" 1 1 "{\"checks
 run_case "a cron-scheduled check is not judged for staleness" 0 1 "{\"checks\":[$cron]}" "all armed"
 run_case "the happy path passes" 0 2 "{\"checks\":[$up,$cron]}" "all armed"
 
+# probe_external (issue #24): the named off-box check is looked up among ALL
+# visible checks and judged like a swept one; absent means nobody probes the app.
+ext_case() {  # <name> <expected_exit> <all-json> <must-contain>
+  local name=$1 want=$2 all=$3 needle=$4 out rc f
+  f=$(mktemp); printf '%s' "$all" > "$f"
+  out=$(printf '%s' "{\"checks\":[$up]}" | EXPECTED_MIN=1 SWEEP_TAG=fleet REQUIRED=ext-probe \
+          ALL_CHECKS_FILE="$f" python3 -c "$py_block" 2>&1); rc=$?
+  rm -f "$f"
+  if [ "$rc" != "$want" ]; then fail "$name: exit $rc, wanted $want ($out)"
+  elif ! printf '%s' "$out" | grep -qF "$needle"; then fail "$name: output lacked '$needle' ($out)"
+  else pass "$name"; fi
+}
+ext_up='{"name":"ext-probe","status":"up","timeout":300,"grace":600,"last_ping":"2099-01-01T00:00:00+00:00"}'
+ext_paused='{"name":"ext-probe","status":"paused","timeout":300,"grace":600,"last_ping":"2099-01-01T00:00:00+00:00"}'
+ext_slug='{"name":"Ext Probe","slug":"ext-probe","status":"up","timeout":300,"grace":600,"last_ping":"2099-01-01T00:00:00+00:00"}'
+ext_case "an external probe that exists and pings passes" 0 "{\"checks\":[$ext_up]}" "2 check(s)"
+ext_case "an external probe that is missing is a violation" 1 "{\"checks\":[]}" "UNPROBED"
+ext_case "an external probe that is paused is a violation" 1 "{\"checks\":[$ext_paused]}" "PAUSED"
+ext_case "an external probe is also found by slug" 0 "{\"checks\":[$ext_slug]}" "all armed"
+
 echo "── the shell half, with a curl stub ──"
 T=$(mktemp -d); export T; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin"; export STUB_LOG="$T/calls.log"
@@ -60,6 +80,8 @@ cat > "$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
 case "$*" in
+  *"/checks/ "*|*"/checks/") [ -n "${STUB_ALL_FAIL:-}" ] && exit 22
+                     printf '%s' "${STUB_ALL_BODY:-{\"checks\":[]\}}"; exit 0 ;;
   *"/checks/?tag="*) [ -n "${STUB_API_FAIL:-}" ] && exit 22
                      body=${STUB_API_BODY:-}; [ -n "$body" ] || body='{"checks":[]}'
                      printf '%s' "$body"; exit 0 ;;
@@ -67,7 +89,7 @@ esac
 exit 0
 STUB
 chmod +x "$T/bin/curl"; export PATH="$T/bin:$PATH"
-run_sh() { env "$@" bash "$SRC" > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
+run_sh() { env SITE_TOML="$T/site.toml" "$@" bash "$SRC" app > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
 ok_body='{"checks":[{"name":"a","status":"up","timeout":300,"grace":600,"last_ping":"2099-01-01T00:00:00+00:00"}]}'
 
 : > "$STUB_LOG"; run_sh
@@ -91,6 +113,21 @@ check "API unreachable: exit 1, /fail"      bash -c '[ "$(cat "$T/rc.txt")" = 1 
 
 : > "$STUB_LOG"; run_sh HEALTHCHECKS_API_URL=https://hc.example/api/v3 HEALTHCHECKS_API_KEY=k
 check "no sweep tag: exit 0, says so"       bash -c '[ "$(cat "$T/rc.txt")" = 0 ] && grep -qi "SWEEP_TAG" "$T/out.txt"'
+
+echo "── probe_external, end to end ──"
+HC_ENV=(HEALTHCHECKS_API_URL=https://hc.example/api/v3 HEALTHCHECKS_API_KEY=k HEALTHCHECKS_SWEEP_TAG=fleet HEALTHCHECKS_ARMED_URL=https://hc.example/armed)
+: > "$STUB_LOG"; run_sh "${HC_ENV[@]}" STUB_API_BODY="$ok_body"
+check "no site.toml: no unfiltered read"    bash -c '! grep -qE "/checks/( |$)" "$STUB_LOG"'
+printf '[deploy]\nprobe_external = "ext-probe"\n' > "$T/site.toml"
+: > "$STUB_LOG"; run_sh "${HC_ENV[@]}" STUB_API_BODY="$ok_body" STUB_ALL_BODY="{\"checks\":[$ext_up]}"
+check "declared + present: exit 0"          [ "$(cat "$T/rc.txt")" = 0 ]
+check "read every visible check"            grep -qE "/checks/( |$)" "$STUB_LOG"
+: > "$STUB_LOG"; run_sh "${HC_ENV[@]}" STUB_API_BODY="$ok_body"
+check "declared + absent: exit 1"           [ "$(cat "$T/rc.txt")" = 1 ]
+check "pinged /fail naming it"              bash -c 'grep -q "armed/fail" "$STUB_LOG" && grep -q "ext-probe" "$STUB_LOG"'
+: > "$STUB_LOG"; run_sh "${HC_ENV[@]}" STUB_API_BODY="$ok_body" STUB_ALL_FAIL=1
+check "unfiltered read fails: exit 1"       [ "$(cat "$T/rc.txt")" = 1 ]
+rm -f "$T/site.toml"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
