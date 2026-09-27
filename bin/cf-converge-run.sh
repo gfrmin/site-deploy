@@ -13,6 +13,11 @@
 #                          caught even on a day nobody deploys. A DIFF is
 #                          itself the alertable condition here, not just a
 #                          crash: drift IS what this check exists to catch.
+#                          Drift is read from the reconciler's exit status
+#                          (--detailed-exitcode: 3 = differs), never from
+#                          whether it printed: --verbose prints an `ok --`
+#                          line per converged phase, so "any output" was a
+#                          /fail every day on a zone with no drift at all.
 set -uo pipefail
 
 APP=${1:?usage: cf-converge-run.sh <app> [--dry-run]}
@@ -72,19 +77,24 @@ PUBLIC_IP=$(derive_public_ip)
 [ -n "$PUBLIC_IP" ] || say "WARNING could not derive public IP; A-record content and any __PUBLIC_IP__ rule left as-is"
 
 args=(--desired "$DESIRED" --domain "$CF_DOMAIN" --public-ip "$PUBLIC_IP")
-if [ -n "$DRY_RUN" ]; then args+=(--verbose); else args+=(--apply); fi
+if [ -n "$DRY_RUN" ]; then args+=(--verbose --detailed-exitcode); else args+=(--apply); fi
 
 out=$("$PYTHON" "$CFC" "${args[@]}" 2>&1)
 rc=$?
 printf '%s\n' "$out"
 
+# 0 no drift, 3 drift, anything else the check itself failed. The ok lines
+# ride along as the success ping's body, so the check's log still shows what
+# was compared.
 if [ -n "$DRY_RUN" ] && [ -n "${HEALTHCHECKS_CF_DRIFT_URL:-}" ]; then
   # shellcheck disable=SC1091
   . "$SELF/lib/hc.sh"
-  if [ "$rc" != 0 ] || [ -n "$out" ]; then
-    hc_ping "$HEALTHCHECKS_CF_DRIFT_URL" /fail "cf-drift[$APP]: $out"
-  else
-    hc_ping "$HEALTHCHECKS_CF_DRIFT_URL" "" "cf-drift[$APP]: no drift"
-  fi
+  case $rc in
+    0) hc_ping "$HEALTHCHECKS_CF_DRIFT_URL" "" "cf-drift[$APP]: no drift"$'\n'"$out" ;;
+    3) hc_ping "$HEALTHCHECKS_CF_DRIFT_URL" /fail "cf-drift[$APP]: DRIFT"$'\n'"$out" ;;
+    *) hc_ping "$HEALTHCHECKS_CF_DRIFT_URL" /fail "cf-drift[$APP]: reconciler failed (exit $rc)"$'\n'"$out" ;;
+  esac
 fi
+# Drift is a finding the ping reports, not a failure of this unit.
+[ -n "$DRY_RUN" ] && [ "$rc" = 3 ] && exit 0
 exit $rc

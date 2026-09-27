@@ -361,14 +361,19 @@ does not is refused and reported, never applied under the wrong scope. Rules fou
 some *other* host are left untouched, in their original relative position — only the previously-owned
 rules are replaced, as a block. A rule naming both this scope's host and a host outside
 `shared_with` is ambiguous: refused and reported by name, same as one naming no scoped host at all.
-`shared_with` is the "we agreed to co-own this one" escape hatch.
+`shared_with` is the "we agreed to co-own this one" escape hatch. A refused rule that is already
+live exactly as declared (say the one rate-limit rule a Free-plan zone allows, naming both apps'
+hosts and converged by the other app) counts as agreement: an `ok --` line, not a warning. A
+refused rule that is *not* live as declared is a `WARNING` and counts as drift.
 
 **Units.** `cf-converge@.service` (root, `--apply`) is started `--no-block` by the poller when a
 deploy's fast-forward range touches `deploy/cloudflare.json` — not every tick, since an API
 round-trip is not something a 2-minute poller should pay for when nothing declared changed.
 `cf-drift@.timer` runs the same reconciler in dry-run daily, so a hand-edit at the dashboard is
 caught even on a day nobody deploys; a reported diff pings `HEALTHCHECKS_CF_DRIFT_URL` the same way
-a failure would, because drift **is** the failure mode that check exists to catch. Both are armed by
+a failure would, because drift **is** the failure mode that check exists to catch. Drift is read
+from the reconciler's exit status (`--detailed-exitcode`: 0 converged, 3 differs, 2 failed), never
+from whether it printed anything; the dry run's `ok --` lines go out as the success ping's body. Both are armed by
 `host-converge.sh` iff `deploy/cloudflare.json` exists and `CF_CONFIG_TOKEN` is set in
 `/etc/<app>/cf-env` — a declared file with no token nags instead (Cloudflare-as-code itself is
 opt-in, so its total absence is not a nag).

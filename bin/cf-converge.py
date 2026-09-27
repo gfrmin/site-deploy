@@ -60,6 +60,12 @@ Shared zones -- rule_scope:
   refused and reported by name, same as one naming no scoped host at all.
   `shared_with` is the "unless listed explicitly" escape hatch for a rule
   the two apps have deliberately agreed to co-own.
+  A refused rule that is ALREADY LIVE exactly as declared is not reported
+  as a problem: that is a rule this app documents but another app (or a
+  person) owns -- e.g. the one rate-limit rule a Free-plan zone allows,
+  naming both apps' hosts -- and the zone agrees with the repo about it. It
+  prints as an `ok --` line under --verbose. Only a refused rule that is
+  NOT live as declared is a WARNING, and it counts as drift (see Exit).
   Without `rule_scope`, behaviour is unchanged: the declared list wholly
   replaces the phase, as it always has for a zone one app owns outright.
 
@@ -93,6 +99,13 @@ it from the box's own metadata rather than from a hand-set value.
 Exit status: 0 on success (converged or would-converge), 2 on a usage error
 or if any phase failed. The caller treats a failure as non-fatal -- a
 converge problem must not strand an otherwise-fine deploy.
+
+With --detailed-exitcode, 3 instead of 0 when the zone differed from the
+declaration: a change was made (or, in a dry run, would be), or a refused
+scoped rule is not live as declared. That is the drift signal for the daily
+dry run (bin/cf-converge-run.sh --dry-run) -- decided from a status, never
+from whether anything was printed, since --verbose prints `ok --` lines on a
+zone with no drift at all. A failure still exits 2, and wins over 3.
 """
 from __future__ import annotations
 
@@ -144,6 +157,11 @@ HOST_IN = re.compile(r'http\.host\s+in\s*\{([^}]*)\}')
 NO_RULESET = 10003
 
 RuleScope = collections.namedtuple("RuleScope", "host shared_with")
+# What one phase found. acted: changes made (or, dry-run, that would be).
+# oks: converged checks, printed only under --verbose. drift: the zone
+# disagrees with the repo in a way this run will NOT fix (a refused scoped
+# rule that is not live as declared) -- printed always, and counted.
+Outcome = collections.namedtuple("Outcome", "acted oks drift", defaults=((), (), ()))
 Ctx = collections.namedtuple("Ctx", "token zone domain public_ip apply rule_scope")
 
 
@@ -259,16 +277,27 @@ def phase_rules(token, zone, phase):
     return entrypoint.get("rules", [])
 
 
+def live_as_declared(rule, cur_norm, public_ip):
+    """Is this declared rule present, verbatim after expansion, in the live phase?
+
+    An unresolvable placeholder raises (the phase FAILS), exactly as it does
+    for an owned rule: with no --public-ip the question cannot be answered,
+    and answering "not live" would report DRIFT when the real cause is a box
+    that could not derive its own IP.
+    """
+    return expand(norm_rule(rule), {"PUBLIC_IP": public_ip}) in cur_norm
+
+
 def converge_ssl(cf, desired):
     want = desired.get("ssl_mode")
     if not want:
-        return [], ["ssl_mode not declared; left untouched"]
+        return Outcome(oks=["ssl_mode not declared; left untouched"])
     cur = api(cf.token, f"/zones/{cf.zone}/settings/ssl")["value"]
     if cur == want:
-        return [], [f"ssl mode already {cur}"]
+        return Outcome(oks=[f"ssl mode already {cur}"])
     if cf.apply:
         api(cf.token, f"/zones/{cf.zone}/settings/ssl", "PATCH", {"value": want})
-    return [f"ssl mode {cur} -> {want}"], []
+    return Outcome(acted=[f"ssl mode {cur} -> {want}"])
 
 
 def converge_dns(cf, desired):
@@ -306,13 +335,13 @@ def converge_dns(cf, desired):
                      "proxied": proxied, "ttl": 1})
         else:
             oks.append(f"dns A {fqdn} -> {r['content']} (proxied={r['proxied']})")
-    return changes, oks
+    return Outcome(acted=changes, oks=oks)
 
 
 def converge_rules_scoped(cf, want, *, section, phase):
     """The rule_scope path of converge_rules: see the module docstring."""
     scope = cf.rule_scope
-    owned_desired = []
+    owned_desired, refused = [], []
     for r in want:
         cls = classify(r, scope)
         if cls == "owned":
@@ -324,14 +353,25 @@ def converge_rules_scoped(cf, want, *, section, phase):
                       f"(host={scope.host!r}, shared_with={list(scope.shared_with)})")
         else:
             reason = f"does not name rule_scope host {scope.host!r} (hosts found: {hosts})"
-        print(f"cf[{cf.domain}]: WARNING declared {section} rule refused -- {reason}",
-              file=sys.stderr)
+        refused.append((r, hosts, reason))
     # Expand (and so possibly abort) BEFORE the read, same reasoning as the
     # unscoped path: a rule we would refuse to ship should cost no API call.
     want_norm = [expand(norm_rule(r), {"PUBLIC_IP": cf.public_ip}) for r in owned_desired]
 
     cur_all = phase_rules(cf.token, cf.zone, phase)
     cur_norm_full = [norm_rule(r) for r in cur_all]
+
+    # A refused rule is judged against the live phase: already there exactly
+    # as declared is agreement (another owner's rule this repo documents),
+    # anything else is drift nobody here will fix. See the module docstring.
+    refused_oks, drift = [], []
+    for r, hosts, reason in refused:
+        if live_as_declared(r, cur_norm_full, cf.public_ip):
+            refused_oks.append(f"{section} rule naming {hosts} is outside rule_scope "
+                               "but live as declared; left to its owner")
+        else:
+            drift.append(f"WARNING declared {section} rule refused -- {reason} "
+                         "-- and it is not live as declared")
 
     result = []
     inserted = False
@@ -348,19 +388,24 @@ def converge_rules_scoped(cf, want, *, section, phase):
         result.extend(want_norm)
 
     if result == cur_norm_full:
-        return [], [f"{section} (scoped to {scope.host}) match ({len(want_norm)} owned rule(s))"]
+        return Outcome(
+            oks=refused_oks + [f"{section} (scoped to {scope.host}) match "
+                               f"({len(want_norm)} owned rule(s))"],
+            drift=drift)
     if cf.apply:
         api(cf.token, f"/zones/{cf.zone}/rulesets/phases/{phase}/entrypoint",
             "PUT", {"rules": result})
     foreign_kept = len(result) - len(want_norm)
-    return [f"{section} (scoped to {scope.host}): {len(want_norm)} owned rule(s) applied, "
-            f"{foreign_kept} foreign rule(s) kept"], []
+    return Outcome(
+        acted=[f"{section} (scoped to {scope.host}): {len(want_norm)} owned rule(s) applied, "
+               f"{foreign_kept} foreign rule(s) kept"],
+        oks=refused_oks, drift=drift)
 
 
 def converge_rules(cf, desired, *, section, phase):
     want = desired.get(section)
     if want is None:
-        return [], [f"{section} not declared; {phase} left untouched"]
+        return Outcome(oks=[f"{section} not declared; {phase} left untouched"])
     if cf.rule_scope is not None:
         return converge_rules_scoped(cf, want, section=section, phase=phase)
     # Expand (and so possibly abort) BEFORE the read: a rule we would refuse to
@@ -368,11 +413,11 @@ def converge_rules(cf, desired, *, section, phase):
     want_norm = [expand(norm_rule(r), {"PUBLIC_IP": cf.public_ip}) for r in want]
     cur = [norm_rule(r) for r in phase_rules(cf.token, cf.zone, phase)]
     if cur == want_norm:
-        return [], [f"{section} match ({len(cur)} rule(s))"]
+        return Outcome(oks=[f"{section} match ({len(cur)} rule(s))"])
     if cf.apply:
         api(cf.token, f"/zones/{cf.zone}/rulesets/phases/{phase}/entrypoint",
             "PUT", {"rules": want_norm})
-    return [f"{section} {len(cur)} rule(s) -> {len(want_norm)} rule(s)"], []
+    return Outcome(acted=[f"{section} {len(cur)} rule(s) -> {len(want_norm)} rule(s)"])
 
 
 PHASES = (
@@ -385,7 +430,7 @@ PHASES = (
 
 
 def reconcile(cf, desired, verbose):
-    """Run every phase, isolating failures. -> (changes, failed phase count).
+    """Run every phase, isolating failures. -> (changes, drift, failed phase count).
 
     A phase that raises is reported and skipped; the others still converge.
     Sharing one try/except across every phase would mean a single bad WAF
@@ -393,21 +438,24 @@ def reconcile(cf, desired, verbose):
     cache from converging on every tick until someone notices.
     """
     tag = "" if cf.apply else "[dry-run] "
-    changes = failed = 0
+    changes = drift = failed = 0
     for name, run in PHASES:
         try:
-            acted, oks = run(cf, desired)
+            got = run(cf, desired)
         except CFError as e:
             failed += 1
             print(f"cf[{cf.domain}]: {name} FAILED -- {e}", file=sys.stderr)
             continue
-        changes += len(acted)
-        for msg in acted:
+        changes += len(got.acted)
+        drift += len(got.drift)
+        for msg in got.acted:
             print(f"cf[{cf.domain}]: {tag}{msg}")
+        for msg in got.drift:
+            print(f"cf[{cf.domain}]: {msg}", file=sys.stderr)
         if verbose:
-            for msg in oks:
+            for msg in got.oks:
                 print(f"cf[{cf.domain}]: ok -- {msg}")
-    return changes, failed
+    return changes, drift, failed
 
 
 def parse_rule_scope(desired):
@@ -425,6 +473,8 @@ def main(argv=None):
     p.add_argument("--public-ip", default="", help="serving box public IP for A records and rule exemptions")
     p.add_argument("--apply", action="store_true", help="write changes (default: dry-run)")
     p.add_argument("--verbose", action="store_true", help="also print converged (no-op) checks")
+    p.add_argument("--detailed-exitcode", action="store_true",
+                   help="exit 3 (not 0) when the zone differed from the declaration")
     args = p.parse_args(argv)
 
     token = os.environ.get("CF_CONFIG_TOKEN", "")
@@ -445,13 +495,15 @@ def main(argv=None):
     cf = Ctx(token=token, zone=zone, domain=args.domain,
              public_ip=args.public_ip, apply=args.apply,
              rule_scope=parse_rule_scope(desired))
-    changes, failed = reconcile(cf, desired, args.verbose)
+    changes, drift, failed = reconcile(cf, desired, args.verbose)
     if failed:
         # The count is what makes this line worth printing: it says how much of
         # the run DID land, which a single "converge failed" never could.
         print(f"cf-converge[{args.domain}]: {failed} phase(s) failed; "
               f"{changes} change(s) applied in the rest", file=sys.stderr)
         return 2
+    if args.detailed_exitcode and (changes or drift):
+        return 3
     return 0
 
 
