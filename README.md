@@ -100,6 +100,7 @@ systemd/site-backup@.service , site-backup@.timer   daily off-box backup, dispat
 systemd/app@.service   reference gunicorn unit for an app (copy, do not converge — see below)
 systemd/site-build@.service   reference build unit: reload -> /fail -> purge, ordering pinned by tests
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt, and the files host-converge installs
+host/caddy/reverse-proxy.caddy  reference reverse_proxy block every site's Caddyfile imports (see below)
 example.env          the per-app DEPLOY_* knobs to append to /etc/<app>/env
 ```
 
@@ -233,11 +234,52 @@ owns, every tick:
 - a 4G swapfile and `vm.swappiness=10` (moved here from `provision.sh`)
 - wherever Caddy is installed, a drop-in with `Restart=always` and a memory ceiling, so an OOM
   kill of the proxy is local and recoverable instead of five days of 521s
-  (`CADDY_MEMORY_HIGH`/`CADDY_MEMORY_MAX` in `/etc/site-deploy/host.env` for a different box size)
+  (`CADDY_MEMORY_HIGH`/`CADDY_MEMORY_MAX` in `/etc/site-deploy/host.env` for a different box size),
+  and each app's `/var/log/caddy/<app>.access.log` pre-created caddy-owned (repaired if found
+  owned by anyone else — see the reference block below)
 - the timers: the toolkit updater and the poller always; the probe and the alarm sweep iff their
   env names are set (the probe never when site.toml declares `probe_external`), disarmed when they
   are removed. A stopped alarm timer is re-armed: to stand
   a probe down, blank its env pair and pause the check. Missing monitoring is nagged every tick.
+
+### The reference `reverse_proxy` block
+
+The drop-in above is how Caddy survives a flood. `host/caddy/reverse-proxy.caddy` is the other half:
+how the proxy treats requests *during* one. Every site's Caddyfile imports it rather than copying it:
+
+```caddyfile
+www.example.org {
+	import /srv/site-deploy/host/caddy/reverse-proxy.caddy <app> 127.0.0.1:8000 <N>
+}
+```
+
+- **`unhealthy_request_count N`: shed, don't queue.** At most about N requests reach the app at once;
+  the rest get a 503 in under a millisecond, and the next request goes through as soon as a slot
+  frees (nothing is sticky). Without it nothing between the edge and the app bounds the queue, and a
+  crawl from tens of thousands of IPs defeats per-IP rate limits and the cache alike. Size N as what
+  the app can serve at once (workers × threads, or its connection pool) times a small queue factor.
+  It is a **soft** cap: Caddy checks the count before it counts the request, so a truly simultaneous
+  burst can overshoot by a few (measured on 2.11.4: cap 2, six at once, 3–4 served and the rest
+  shed). It bounds the queue; it is not a semaphore.
+- **`dial_timeout 5s`, `response_header_timeout 65s`** (above gunicorn's 60 s worker timeout, so the
+  app's own timeout fires first). They bound how long a request's buffers live in Caddy.
+- **A caddy-owned JSON access log**, rolled at `roll_size 100mb` × 5: the origin's own record of a flood, with
+  Referer and `Sec-Fetch-*` that Free-plan Cloudflare analytics withhold. Cookie and Authorization are
+  redacted by default.
+
+Two traps, encoded rather than rediscovered:
+
+1. **`caddy validate` opens every log file** to prove it can write it. Run as root, it creates the
+   file root-owned 0600 and the daemon's next reload fails on it. `host-converge` pre-creates each
+   app's log owned by the caddy unit's `User=` and repairs one it finds owned by anyone else; the `[converge]` engine
+   already validates as the caddy unit's `User=`. Validating by hand: `sudo -u caddy caddy validate
+   --config /etc/caddy/Caddyfile`.
+2. **The cap counts what Caddy holds.** A client that hangs up frees its slot while the app finishes
+   the work (uvicorn does not cancel on disconnect), so a flood that hangs up early can still queue
+   inside the app. That belongs to an edge challenge, or to uvicorn's own `limit_concurrency`.
+
+Each shed request logs one `no upstreams available` line to Caddy's journal. journald's rate limit
+bounds that, and the same logger carries real upstream failures, so don't silence it.
 
 `install.sh` is now just the bootstrap: root-own the toolkit, run the first converge, run
 `env-check`. "Installed" and "converged" are one state, which is what makes a rebuilt box

@@ -347,6 +347,35 @@ if systemctl cat caddy.service >/dev/null 2>&1; then
   sed "s/__MEMORY_HIGH__/$mh/; s/__MEMORY_MAX__/$mm/" "$SELF/host/caddy/override.conf" > "$tmp_caddy"
   sync_file "$tmp_caddy" "$ETC/systemd/system/caddy.service.d/site-deploy.conf" && units_changed=1
   rm -f "$tmp_caddy"
+
+  # Each app's access log (host/caddy/reverse-proxy.caddy), caddy-owned before
+  # anything else can create it. `caddy validate` OPENS every log file to prove
+  # it can write it, so one run as root leaves it root-owned 0600 and the
+  # daemon's next reload fails on it. Created if missing, repaired if found
+  # owned by anyone else. Harmless for an app whose Caddyfile does not log.
+  # The user the caddy unit actually runs as (a box may override User=), the
+  # same lookup bin/converge.sh uses to validate as it.
+  caddy_user=${CADDY_USER:-$(systemctl show -p User --value caddy.service 2>/dev/null)}
+  caddy_user=${caddy_user:-caddy}
+  if id -u "$caddy_user" >/dev/null 2>&1; then
+    logdir="$ROOT/var/log/caddy"
+    if [ ! -d "$logdir" ]; then
+      install -d -m0755 "$logdir" && chown "$caddy_user:" "$logdir" && say "created $logdir" \
+        || note_failure "could not create $logdir"
+    fi
+    for a in "${APPS[@]}"; do
+      f="$logdir/$a.access.log"
+      if [ ! -e "$f" ]; then
+        { : > "$f" && chown "$caddy_user:" "$f" && chmod 0640 "$f"; } \
+          && say "created $f (owned by $caddy_user)" || note_failure "could not create $f"
+      elif [ "$(stat -L -c %U "$f")" != "$caddy_user" ]; then
+        was=$(stat -L -c %U "$f")
+        { chown "$caddy_user:" "$f" && chmod 0640 "$f"; } \
+          && say "repaired $f: was owned by $was, now $caddy_user (a \`caddy validate\` run as root does this, and the next reload fails on it)" \
+          || note_failure "could not repair ownership of $f (owned by $was)"
+      fi
+    done
+  fi
 fi
 
 # --- 9. timers: enabled iff their configuration exists -------------------------------------

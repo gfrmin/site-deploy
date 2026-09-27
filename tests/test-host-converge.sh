@@ -80,6 +80,16 @@ echo "visudo $*" >> "$STUB_LOG"
 [ -n "${STUB_FAIL_VISUDO:-}" ] && exit 1
 exit 0
 STUB
+# Hermetic by default: a dev box may have a real `caddy` user, and chown to it
+# needs root. Scenario 7b opts in with CADDY_USER=<the test's own user>.
+export CADDY_USER=no-such-user-here
+# stat reports STUB_STAT_OWNER for %U (a root-owned log without being root), the real answer otherwise.
+cat > "$T/bin/stat" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *" -c %U "*) is_owner=1 ;; esac
+[ -n "${is_owner:-}" ] && [ -n "${STUB_STAT_OWNER:-}" ] && { echo "$STUB_STAT_OWNER"; exit 0; }
+exec /usr/bin/stat "$@"
+STUB
 chmod +x "$T/bin"/*; export PATH="$T/bin:$PATH"
 
 reset_log() { : > "$STUB_LOG"; }
@@ -195,6 +205,22 @@ check "memory cap present"              grep -q "MemoryMax=" "$HR/etc/systemd/sy
 check "daemon-reloaded"                 called "daemon-reload"
 reset_log; run
 check "idempotent"                      not_called "daemon-reload"
+
+echo "7b. the app's caddy access log is pre-created caddy-owned, and repaired if root-owned"
+ME=$(id -un)
+reset_log; run CADDY_USER="$ME"
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "log created"                     [ -f "$HR/var/log/caddy/app.access.log" ]
+check "owned by the caddy user"         [ "$(stat -c %U "$HR/var/log/caddy/app.access.log")" = "$ME" ]
+check "said so"                         grep -q "created .*app.access.log" "$T/out.txt"
+reset_log; run CADDY_USER="$ME"
+check "idempotent: silent"              bash -c '! grep -q "access.log" "$T/out.txt"'
+echo "some lines" > "$HR/var/log/caddy/app.access.log"
+reset_log; run CADDY_USER="$ME" STUB_STAT_OWNER=root
+check "root-owned: repaired"            grep -q "repaired .*app.access.log: was owned by root" "$T/out.txt"
+check "contents kept"                   grep -q "some lines" "$HR/var/log/caddy/app.access.log"
+reset_log; run CADDY_USER=no-such-user-here
+check "no caddy user: nothing attempted" bash -c '! grep -q "access.log" "$T/out.txt"'
 
 echo "8. the app declares extra packages -> installed; already-installed ones are not re-requested"
 printf 'libgomp1\ncurl\n' > "$HR/srv/app/deploy/packages.txt"
