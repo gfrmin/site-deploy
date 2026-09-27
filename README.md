@@ -633,7 +633,8 @@ An app an external probe runner already watches (the stronger vantage point) sho
 on-box probe and drops the `UNPROBED` nag, and `env-check` accepts an absent
 `PROBE_URL`/`HEALTHCHECKS_PROBE_URL` even where the manifest grades them required. The external
 check still needs a watcher: the alarm-armed sweep (below) looks it up by name or slug among every
-check its API key can see, whatever its tag, and fails if it is missing, paused or stale. Without
+check its API key can see (one healthchecks project: the external check must be in the ops-env
+key's project), whatever its tag, and fails if it is missing, paused or stale. Without
 that sweep armed, `host-converge` nags `THE EXTERNAL PROBE IS UNVERIFIED` instead.
 
 **The alarm-armed sweep** (`HEALTHCHECKS_API_KEY` + `HEALTHCHECKS_SWEEP_TAG` in a root-only

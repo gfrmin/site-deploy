@@ -46,9 +46,10 @@
 # An app that is probed from OFF the box (site.toml `probe_external = "<check
 # name>"`, see host-converge.sh) has no on-box probe, so this is what notices
 # if that external check disappears: given the app name, it also looks the
-# named check up across every check the API key can see (it need not carry the
-# sweep tag -- it may belong to another fleet's probe runner) and holds it to
-# the same assertions. Absent is a violation: that is an app nobody probes.
+# named check up (by name or slug) across every check the API key can see and
+# holds it to the same assertions. It need not carry the sweep tag, but a
+# healthchecks API key sees ONE project, so the external check must live in
+# the ops-env key's project. Absent is a violation: that is an app nobody probes.
 #
 # Env (from a root-only /etc/<app>/ops-env; the systemd manager reads it, so
 # the service user never needs the file): HEALTHCHECKS_API_URL,
