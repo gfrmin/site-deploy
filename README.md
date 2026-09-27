@@ -148,6 +148,7 @@ tailwindcss_version = "4.3.3"      # apps with static/src.css: pin the compiler 
 # build_service = "<app>-build.service"   # snapshot-backed apps only
 # build_inputs  = ["data/build_db.py"]    # paths whose change dispatches build_service (default shown)
 # converge      = true                    # apply deploy/ to the box each tick (see below)
+# probe_external = "<healthchecks check name or slug>"  # probed off-box; no on-box probe (see Monitoring)
 ```
 
 `service` and `build_inputs` exist for workspace mode (Phase D item 14: several apps served from
@@ -234,7 +235,8 @@ owns, every tick:
   kill of the proxy is local and recoverable instead of five days of 521s
   (`CADDY_MEMORY_HIGH`/`CADDY_MEMORY_MAX` in `/etc/site-deploy/host.env` for a different box size)
 - the timers: the toolkit updater and the poller always; the probe and the alarm sweep iff their
-  env names are set, disarmed when they are removed. A stopped alarm timer is re-armed: to stand
+  env names are set (the probe never when site.toml declares `probe_external`), disarmed when they
+  are removed. A stopped alarm timer is re-armed: to stand
   a probe down, blank its env pair and pause the check. Missing monitoring is nagged every tick.
 
 `install.sh` is now just the bootstrap: root-own the toolkit, run the first converge, run
@@ -624,6 +626,15 @@ deep variant where the app has one. Size the check 300 s / grace 600 s. A dead b
 but a dead box also stops pinging, so the check goes DOWN at timeout+grace: both failure classes
 are covered. Pings are leaves (`lib/hc.sh`): they never change an exit code and never become a
 dependency of the work they report on.
+
+**Probed from off the box instead** (`probe_external = "<check>"` in the app's `deploy/site.toml`).
+An app an external probe runner already watches (the stronger vantage point) should not also arm
+`site-probe@`, a second alarm for the same outage. With the key set, `host-converge` disarms the
+on-box probe and drops the `UNPROBED` nag, and `env-check` accepts an absent
+`PROBE_URL`/`HEALTHCHECKS_PROBE_URL` even where the manifest grades them required. The external
+check still needs a watcher: the alarm-armed sweep (below) looks it up by name or slug among every
+check its API key can see, whatever its tag, and fails if it is missing, paused or stale. Without
+that sweep armed, `host-converge` nags `THE EXTERNAL PROBE IS UNVERIFIED` instead.
 
 **The alarm-armed sweep** (`HEALTHCHECKS_API_KEY` + `HEALTHCHECKS_SWEEP_TAG` in a root-only
 `/etc/<app>/ops-env`, `site-checks-armed@<app>.timer`, every 15 min). healthchecks accepts a ping

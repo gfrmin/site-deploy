@@ -43,6 +43,13 @@
 #   * the dead-man    — did the job actually RUN?         (per-job)
 # Each is blind to the other two's failure.
 #
+# An app that is probed from OFF the box (site.toml `probe_external = "<check
+# name>"`, see host-converge.sh) has no on-box probe, so this is what notices
+# if that external check disappears: given the app name, it also looks the
+# named check up across every check the API key can see (it need not carry the
+# sweep tag -- it may belong to another fleet's probe runner) and holds it to
+# the same assertions. Absent is a violation: that is an app nobody probes.
+#
 # Env (from a root-only /etc/<app>/ops-env; the systemd manager reads it, so
 # the service user never needs the file): HEALTHCHECKS_API_URL,
 # HEALTHCHECKS_API_KEY, HEALTHCHECKS_SWEEP_TAG, HEALTHCHECKS_ARMED_URL (this
@@ -54,6 +61,9 @@
 set -u
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/hc.sh"
+
+app=${1:-}
+SITE_TOML=${SITE_TOML:-/srv/$app/deploy/site.toml}
 
 tag="site-checks-armed"
 api=${HEALTHCHECKS_API_URL:-}
@@ -81,7 +91,27 @@ body=$(${CURL:-curl} -fsS --max-time 20 --retry 2 --retry-all-errors --retry-del
   exit 1
 }
 
-report=$(printf '%s' "$body" | EXPECTED_MIN="$expected_min" SWEEP_TAG="$sweep_tag" python3 -c '
+# The app's external probe, if it declares one. --app-keys: the key is per
+# app, and /srv/<app> is the app's own dir in workspace mode too.
+required=""
+if [ -n "$app" ] && [ -r "$SITE_TOML" ]; then
+  required=$(python3 "$(dirname "${BASH_SOURCE[0]}")/site-config.py" --app-keys "$SITE_TOML" 2>/dev/null \
+               | sed -n "s/^export PROBE_EXTERNAL=//p" | tail -1 | tr -d "'\"")
+fi
+all_file=""
+if [ -n "$required" ]; then
+  all_file=$(mktemp); trap 'rm -f "$all_file"' EXIT
+  ${CURL:-curl} -fsS --max-time 20 --retry 2 --retry-all-errors --retry-delay 2 \
+      --retry-max-time 45 -H "X-Api-Key: $key" "${api%/}/checks/" > "$all_file" || {
+    msg="could not read the healthchecks API at ${api%/}/checks/ to find $required (curl exit $?)"
+    echo "$tag: $msg" >&2
+    hc_ping "$hurl" /fail "$tag: $msg"
+    exit 1
+  }
+fi
+
+report=$(printf '%s' "$body" | EXPECTED_MIN="$expected_min" SWEEP_TAG="$sweep_tag" \
+           REQUIRED="$required" ALL_CHECKS_FILE="$all_file" python3 -c '
 import json, os, sys
 from datetime import datetime, timezone
 
@@ -100,6 +130,21 @@ if len(checks) < expected_min:
         f"below the floor of {expected_min} — a revoked key, a wrong API URL "
         f"or a retagged check would look exactly like this"
     )
+
+# An external probe named by the app (probe_external): looked up by name or
+# slug among every check the key can see, then judged like a swept one.
+required = os.environ.get("REQUIRED", "")
+if required:
+    with open(os.environ["ALL_CHECKS_FILE"]) as fh:
+        visible = json.load(fh).get("checks") or []
+    found = [c for c in visible if required in (c.get("name"), c.get("slug"))]
+    if not found:
+        problems.append(
+            f"{required}: declared as this app probe_external but no such check "
+            f"is visible to this API key — the app is UNPROBED"
+        )
+    names = {c.get("name") for c in checks}
+    checks = checks + [c for c in found[:1] if c.get("name") not in names]
 
 now = datetime.now(timezone.utc)
 firing = []

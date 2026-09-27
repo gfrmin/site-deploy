@@ -107,6 +107,14 @@ app_build_service() {   # <app>
   python3 "$SELF/bin/site-config.py" --app-keys "$SRV/$dir/deploy/site.toml" 2>/dev/null \
     | sed -n "s/^export DEPLOY_BUILD_SERVICE=//p" | tail -1 | tr -d "'\""
 }
+# <app>'s `probe_external` (site.toml): the name of an off-box healthchecks
+# check that already probes it. Same sed-extraction, same caution.
+app_probe_external() {   # <app>
+  local a=$1 dir
+  dir=$(app_dir "$a")
+  python3 "$SELF/bin/site-config.py" --app-keys "$SRV/$dir/deploy/site.toml" 2>/dev/null \
+    | sed -n "s/^export PROBE_EXTERNAL=//p" | tail -1 | tr -d "'\""
+}
 # Two kinds of timer, two policies for one an operator STOPPED without
 # disabling. An ALARM timer (probe, sweep) is re-armed: there is no sanctioned
 # stopped state for an alarm — a stopped timer is a silently dead alarm, and
@@ -370,13 +378,28 @@ for a in "${APPS[@]}"; do
   a_dir=$(app_dir "$a")
   a_srv="$SRV/$a_dir"
 
-  if [ -n "$(envval PROBE_URL "$a_etc/env")" ] && [ -n "$(envval HEALTHCHECKS_PROBE_URL "$a_etc/env")" ]; then
+  sweep_ok=""
+  [ -n "$(envval HEALTHCHECKS_API_KEY "$a_etc/ops-env")" ] && [ -n "$(envval HEALTHCHECKS_SWEEP_TAG "$a_etc/ops-env")" ] \
+    && sweep_ok=1
+  # probe_external: an off-box check already probes this app (the stronger
+  # vantage point), so the on-box probe would be a second alarm for the same
+  # outage. Disarm it and do not nag UNPROBED. What still needs a watcher is
+  # the external check itself -- site-checks-armed asserts it exists, is not
+  # paused and is pinging, so without that sweep the claim is unverified.
+  probe_ext=$(app_probe_external "$a")
+  if [ -n "$probe_ext" ]; then
+    disarm "site-probe@$a.timer" "probed externally ($probe_ext)"
+    [ -n "$(envval PROBE_URL "$a_etc/env")$(envval HEALTHCHECKS_PROBE_URL "$a_etc/env")" ] \
+      && say "$a: probe_external = $probe_ext in site.toml, so PROBE_URL/HEALTHCHECKS_PROBE_URL in $a_etc/env are ignored — remove them"
+    [ -n "$sweep_ok" ] \
+      || say "$a: probed externally ($probe_ext), but site-checks-armed is not armed (no HEALTHCHECKS_API_KEY/HEALTHCHECKS_SWEEP_TAG in $a_etc/ops-env) — THE EXTERNAL PROBE IS UNVERIFIED"
+  elif [ -n "$(envval PROBE_URL "$a_etc/env")" ] && [ -n "$(envval HEALTHCHECKS_PROBE_URL "$a_etc/env")" ]; then
     arm "site-probe@$a.timer" "PROBE_URL + HEALTHCHECKS_PROBE_URL set" rearm
   else
     disarm "site-probe@$a.timer" "PROBE_URL/HEALTHCHECKS_PROBE_URL unset"
-    say "$a: PROBE_URL/HEALTHCHECKS_PROBE_URL not set in $a_etc/env — THIS APP IS UNPROBED"
+    say "$a: PROBE_URL/HEALTHCHECKS_PROBE_URL not set in $a_etc/env (and no probe_external in site.toml) — THIS APP IS UNPROBED"
   fi
-  if [ -n "$(envval HEALTHCHECKS_API_KEY "$a_etc/ops-env")" ] && [ -n "$(envval HEALTHCHECKS_SWEEP_TAG "$a_etc/ops-env")" ]; then
+  if [ -n "$sweep_ok" ]; then
     arm "site-checks-armed@$a.timer" "ops-env carries an API key and a sweep tag" rearm
   else
     disarm "site-checks-armed@$a.timer" "ops-env gone or incomplete"

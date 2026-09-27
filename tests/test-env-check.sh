@@ -33,7 +33,7 @@ chmod +x "$T/bin/systemctl"; export PATH="$T/bin:$PATH"
 
 SECRET="s3cr3t-value-never-printed"
 run() {   # run [VAR=val ...]
-  env ETC="$ETC" MANIFEST="$MAN" PROC_ROOT="$PROC" "$@" bash "$ROOT/bin/env-check.sh" app > "$T/out.txt" 2>&1
+  env ETC="$ETC" MANIFEST="$MAN" PROC_ROOT="$PROC" SITE_TOML="$T/site.toml" "$@" bash "$ROOT/bin/env-check.sh" app > "$T/out.txt" 2>&1
   echo $? > "$T/rc.txt"
 }
 rc() { cat "$T/rc.txt"; }
@@ -147,6 +147,24 @@ export STUB_UNIT_ACTIVE=""; run
 check "unit not running: nothing to compare, exit 0" [ "$(rc)" = 0 ]
 export STUB_UNIT_STARTED=""; export STUB_UNIT_ACTIVE=1; run
 check "never-started unit (empty timestamp) is not 'today at midnight': exit 0" [ "$(rc)" = 0 ]
+
+echo "10. probe_external in site.toml satisfies an absent required probe pair (issue #24)"
+export STUB_UNIT_ACTIVE=""
+write_manifest <<EOM
+env           DATABASE_URL            required  the app
+env           PROBE_URL               required  site-probe@
+env           HEALTHCHECKS_PROBE_URL  required  site-probe@
+EOM
+printf 'DATABASE_URL=%s\n' "$SECRET" > "$ETC/env"; rm -f "$ETC/refresh-env" "$T/site.toml"
+run
+check "without it: absent probe pair fails" [ "$(rc)" = 1 ]
+printf '[deploy]\nprobe_external = "site.example-probe"\n' > "$T/site.toml"
+run
+check "with it: exit 0"                  [ "$(rc)" = 0 ]
+check "said probed externally"           says "probed externally (site.example-probe)"
+printf 'DATABASE_URL=%s\nPROBE_URL=\n' "$SECRET" > "$ETC/env"; run
+check "a BLANK pair is still reported"   [ "$(rc)" = 1 ]
+check "no value leaked"                  no_leak
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
