@@ -1,0 +1,66 @@
+# Reference reverse_proxy block for a site-deploy app. Import it, don't copy it:
+#
+#   www.example.org {
+#       import /srv/site-deploy/host/caddy/reverse-proxy.caddy <app> 127.0.0.1:8000 <N>
+#   }
+#
+#   {args[0]}  the app name: names the access log /var/log/caddy/<app>.access.log,
+#              which host-converge pre-creates caddy-owned (see TRAPS)
+#   {args[1]}  the upstream, host:port
+#   {args[2]}  N, the most requests allowed in flight to the app at once
+#
+# It lives in the root-owned toolkit checkout and reaches a box through
+# self-update like everything else; Caddy reads it at its next reload.
+#
+# WHY. host/caddy/override.conf is how Caddy survives a flood. This block is how
+# the proxy treats requests during one: it sheds instead of queueing, bounds how
+# long any request's buffers live in Caddy, and keeps the origin's own record.
+#
+# - unhealthy_request_count N: SHED, DON'T QUEUE. Nothing else between the edge
+#   and the app bounds the queue, and a crawl from tens of thousands of IPs
+#   defeats per-IP rate limits and the cache (every URL is fetched once). An
+#   asyncio worker accepts every connection it is offered, so a sibling site
+#   held ~13,300 requests open against an app that serves 8 at a time. It
+#   swapped, the event loop stalled, and gunicorn killed a worker every ~6 min,
+#   so the flood cost every visitor. With the cap, request N+1 gets a 503 in
+#   under a millisecond and the first N are served normally. Nothing is sticky:
+#   no fail_duration is set and lb_try_duration defaults to 0, so the next
+#   request goes through as soon as a slot frees (measured on caddy 2.11.4).
+#   Size N as what the app can serve at once (workers x threads, or its
+#   connection pool) times a small queue factor.
+# - dial_timeout 5s / response_header_timeout 65s: 65 is above gunicorn's 60 s
+#   worker timeout, so the app's own timeout fires first. They bound how long a
+#   request's buffers live in Caddy, which is how an OOM of the proxy built up.
+# - the JSON access log is the origin's record of a flood. Free-plan Cloudflare
+#   analytics withhold ASN and Referer, and the rule that finally stopped one
+#   flood came from reading request headers. Caddy redacts Cookie and
+#   Authorization by default.
+#
+# TRAPS
+# 1. `caddy validate` OPENS every log file to prove it can write it. Run as
+#    root it creates the file root-owned 0600, and the daemon's next reload
+#    fails on it. host-converge pre-creates /var/log/caddy/<app>.access.log
+#    caddy-owned and repairs one it finds root-owned. Validate as the caddy
+#    user anyway: `sudo -u caddy caddy validate --config /etc/caddy/Caddyfile`.
+# 2. The cap counts requests CADDY holds. A client that hangs up frees its slot
+#    while the app finishes the work (uvicorn does not cancel on disconnect),
+#    so a flood that hangs up early can still queue inside the app. That case
+#    belongs to an edge challenge, or to uvicorn's own limit_concurrency.
+# Each shed request logs one "no upstreams available" line to Caddy's journal.
+# journald's rate limit bounds it, and the same logger carries real upstream
+# failures, so don't silence it.
+
+log {
+	output file /var/log/caddy/{args[0]}.access.log {
+		roll_size 100mb
+		roll_keep 5
+	}
+	format json
+}
+reverse_proxy {args[1]} {
+	unhealthy_request_count {args[2]}
+	transport http {
+		dial_timeout 5s
+		response_header_timeout 65s
+	}
+}

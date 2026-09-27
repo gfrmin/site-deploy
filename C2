@@ -1,0 +1,9 @@
+{
+	admin off
+}
+:18080 {
+	reverse_proxy 127.0.0.1:18081 {
+		unhealthy_request_count 2
+		lb_try_duration 0
+	}
+}
