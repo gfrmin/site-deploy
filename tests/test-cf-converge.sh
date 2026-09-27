@@ -441,6 +441,18 @@ def a_refused_rule_not_live_is_drift():
     check(rc == 3, f"which exits 3 under --detailed-exitcode (rc={rc})")
 
 
+@scenario
+def a_refused_placeholder_rule_without_an_ip_fails_not_drifts():
+    """No --public-ip: cannot judge a refused __PUBLIC_IP__ rule -> FAILED, never DRIFT."""
+    ruled = dict(AMBIGUOUS_RULE, expression=AMBIGUOUS_RULE["expression"] + " and ip.src ne __PUBLIC_IP__")
+    live = dict(ruled, expression=ruled["expression"].replace("__PUBLIC_IP__", IP))
+    f = Fake({("GET", ep(RL)): {"rules": [live]}})
+    changes, drift, failed, _, err = run_drift({"rate_limit_rules": [ruled]}, f,
+                                               apply=False, public_ip="", rule_scope=SCOPE)
+    check(failed == 1 and drift == 0, f"failed, not drift (failed={failed} drift={drift})")
+    check("unresolved placeholder" in err, "and says why")
+
+
 for fn in SCENARIOS:
     try:
         fn()

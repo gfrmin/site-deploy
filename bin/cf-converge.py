@@ -280,14 +280,12 @@ def phase_rules(token, zone, phase):
 def live_as_declared(rule, cur_norm, public_ip):
     """Is this declared rule present, verbatim after expansion, in the live phase?
 
-    An unresolvable placeholder means it cannot be (the live copy would hold
-    the real value), so that reads as not live rather than aborting a phase
-    over a rule this app does not ship anyway.
+    An unresolvable placeholder raises (the phase FAILS), exactly as it does
+    for an owned rule: with no --public-ip the question cannot be answered,
+    and answering "not live" would report DRIFT when the real cause is a box
+    that could not derive its own IP.
     """
-    try:
-        return expand(norm_rule(rule), {"PUBLIC_IP": public_ip}) in cur_norm
-    except CFError:
-        return False
+    return expand(norm_rule(rule), {"PUBLIC_IP": public_ip}) in cur_norm
 
 
 def converge_ssl(cf, desired):
