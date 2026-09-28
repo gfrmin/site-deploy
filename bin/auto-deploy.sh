@@ -70,6 +70,14 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 # still owes, cleared once that app's health probe passes. rebuild-pending/<app>:
 # an empty flag for a queued-but-not-yet-dispatched snapshot rebuild.
 PENDING_DIR="$STATE_DIR/pending"
+# pending-base/<app>: the commit the app's pending deploy started FROM (the
+# pre-merge HEAD). A resumed deploy has no diff of its own (LOCAL = REMOTE),
+# so without this the path-triggered dispatches its merge owed -- cf-converge,
+# the snapshot rebuild -- were lost for good whenever the first attempt failed
+# (issue #32). Written with the marker, kept while pending (the OLDEST base
+# wins, so a second deploy stacked on a still-pending app diffs the whole
+# range), cleared with the marker.
+BASE_DIR="$STATE_DIR/pending-base"
 REBUILD_DIR="$STATE_DIR/rebuild-pending"
 RUNLOG=$(mktemp)
 CSS_TMP=""
@@ -546,7 +554,7 @@ git merge --ff-only --quiet "$REMOTE" || { log "fast-forward merge failed (drift
 # a later tick whose OWN diff didn't touch uv.lock -- the obligation from an
 # earlier lock change survives until it is actually applied, however many
 # ticks that takes (a CSS failure, say, retrying the same app).
-mkdir -p "$PENDING_DIR" 2>/dev/null || true
+mkdir -p "$PENDING_DIR" "$BASE_DIR" 2>/dev/null || true
 for app in "${APPS[@]}"; do
   in_scope=""
   if [ -n "$WORKSPACE" ]; then
@@ -559,6 +567,10 @@ for app in "${APPS[@]}"; do
     in_scope=1
   fi
   [ -n "$in_scope" ] || continue
+  # Keyed on the MARKER, not the base file: with no deploy pending, this tick
+  # starts a new one from LOCAL, whatever an orphaned base (a hand-deleted
+  # marker, an app that left and came back) says.
+  [ -f "$PENDING_DIR/$app" ] || printf '%s\n' "$LOCAL" > "$BASE_DIR/$app"
   if [ -n "$LOCK_CHANGED" ]; then
     echo restart > "$PENDING_DIR/$app"
   elif [ ! -f "$PENDING_DIR/$app" ] || [ "$(cat "$PENDING_DIR/$app" 2>/dev/null)" != restart ]; then
@@ -754,10 +766,19 @@ deploy_app() {   # <app> <dir>
   # apps/foo/ resolves to apps/foo/apps/foo/data/build_db.py and silently
   # matches nothing. -C pins the repo root so these repo-root-relative
   # paths mean what they say regardless of CWD.
-  local schema_changed="" build_paths=() bp cf_rel
+  local schema_changed="" build_paths=() bp cf_rel base
+  # Diff from where this app's pending deploy STARTED, not from this tick's
+  # LOCAL: on a resume they differ, and LOCAL..REMOTE is empty. Only a base
+  # that is a real ancestor of what we deploy is used; anything else (a
+  # marker from before this file existed, a rewritten history) falls back to
+  # this tick's own range, which is exactly the old behaviour.
+  base=$(tr -d '[:space:]' < "$BASE_DIR/$app" 2>/dev/null)
+  if ! [[ $base =~ ^[0-9a-f]{40}$ ]] || ! git -C "$SRV" merge-base --is-ancestor "$base" "$REMOTE" 2>/dev/null; then
+    base=$LOCAL
+  fi
   while IFS= read -r bp; do [ -n "$bp" ] && build_paths+=("$([ "$dir" = . ] && printf '%s' "$bp" || printf '%s/%s' "$dir" "$bp")"); done <<< "$BUILD_INPUTS"
   if [ -n "${DEPLOY_BUILD_SERVICE:-}" ] && [ "${#build_paths[@]}" -gt 0 ] \
-     && [ -n "$(git -C "$SRV" diff --name-only "$LOCAL" "$REMOTE" -- "${build_paths[@]}")" ]; then
+     && [ -n "$(git -C "$SRV" diff --name-only "$base" "$REMOTE" -- "${build_paths[@]}")" ]; then
     schema_changed=1
   fi
   # Same idea for the Cloudflare zone config: dispatch cf-converge@<app>
@@ -765,7 +786,7 @@ deploy_app() {   # <app> <dir>
   # delays this reload) only when THIS deploy actually touched it.
   cf_rel=$([ "$dir" = . ] && printf 'deploy/cloudflare.json' || printf '%s/deploy/cloudflare.json' "$dir")
   local cf_changed=""
-  [ -n "$(git -C "$SRV" diff --name-only "$LOCAL" "$REMOTE" -- "$cf_rel")" ] && cf_changed=1
+  [ -n "$(git -C "$SRV" diff --name-only "$base" "$REMOTE" -- "$cf_rel")" ] && cf_changed=1
 
   # 4. Rebuild Tailwind CSS only for apps that have it (auto-skips apps with no static/src.css).
   # `tailwindcss -o` truncates and rewrites in place, and static/app.css is served
@@ -901,7 +922,7 @@ EOF_SOURCES
     log "$app: WARNING health gate disabled (no PORT/DEPLOY_HEALTH_PATH) — purging unverified"
   fi
 
-  rm -f "$PENDING_DIR/$app"
+  rm -f "$PENDING_DIR/$app" "$BASE_DIR/$app"
   SERVICE_RESULT=success "$SELF/bin/cf-purge.sh" || true
   if [ -n "$cf_changed" ]; then
     log "$app: deploy/cloudflare.json changed -> dispatching cf-converge@$app.service"

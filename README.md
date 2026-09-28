@@ -617,6 +617,10 @@ One checkout, one `git fetch`, one `uv sync` — but each hosted app applies ind
   prefix. `restart` is **never downgraded** by a later tick that didn't itself touch `uv.lock` —
   the obligation survives until it is actually applied, however many ticks a CSS failure or
   similar makes that take.
+- `pending-base/<app>` — the commit this app's pending deploy started from (the pre-merge HEAD).
+  A resumed deploy has no diff of its own, so the `cf-converge` and snapshot-rebuild dispatches its
+  merge owed are decided from this base instead. Recorded whenever the app has no marker, kept
+  while one is pending (the oldest base wins), cleared with the marker.
 - `rebuild-pending/<app>` — a queued-but-not-yet-dispatched snapshot rebuild. **One
   poller-started build per box per tick**, tracked by a file rather than a shell variable (each
   app's apply runs in its own subshell, so state has to survive that boundary): a busy build
