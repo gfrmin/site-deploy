@@ -83,16 +83,36 @@ changed_timers=()
 # declared value must never reach sudoers, a command line or a path unless it
 # matches a strict allow-list. An app compromise must stay an app compromise
 # (issue #31). Anything that fails is a counted failure and is never used.
-# A unit this site may be granted: a .service (a bare name means one, as
-# systemctl reads it) named for the app or its site (<x>, <x>-..., <x>@...),
-# or the toolkit's own site-build@<x>. Shape alone is not enough: a
-# well-formed `reboot.target` or `sshd` must never become a grant. No ':'
-# (a sudoers separator), no space, comma, slash, backslash or glob.
+# A unit this site may be granted. Shape alone is not enough (a well-formed
+# `reboot.target` or `sshd` must never become a grant), and neither is a name
+# prefix (site `blog` must not claim site `blog-staging`'s unit). So:
+#   * a .service, or a bare name (which systemctl reads as one); no ':' (a
+#     sudoers separator), space, comma, slash, backslash or glob;
+#   * never an instance of one of the toolkit's own templates, which act on
+#     another app by name, except site-build@<this app>;
+#   * otherwise the unit is named for its OWNER, the longest site or app name
+#     under /srv that it equals or extends with '-' or '@', and that owner
+#     must be this SITE. A workspace app's own bare name is not enough: its
+#     name comes from the checkout, and `sshd` is a perfectly valid app name.
+stem_owner() {   # <stem> -> the longest /srv name N with stem = N, N-*, N@*
+  local stem=$1 best="" p n
+  for p in "$ROOT"/srv/*; do
+    n=${p##*/}
+    case $stem in "$n"|"$n"-*|"$n"@*) [ ${#n} -gt ${#best} ] && best=$n ;; esac
+  done
+  printf '%s' "$best"
+}
 owned_unit() {   # <app> <unit>
-  local a=$1 u=$2 stem
+  local a=$1 u=$2 stem f t
   [[ $u =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] || return 1
   case $u in *.service) stem=${u%.service} ;; *.*) return 1 ;; *) stem=$u ;; esac
-  [[ $stem =~ ^($a|$APP)([-@][A-Za-z0-9_.@-]*)?$ || $stem =~ ^site-build@($a|$APP)$ ]]
+  case $stem in site-build@*) [ "${stem#site-build@}" = "$a" ]; return ;; esac
+  for f in "$SELF"/systemd/*@.service; do
+    t=${f##*/}; t=${t%@.service}
+    [ "$t" = app ] && continue    # the copy-me reference unit, named for no one
+    case $stem in "$t"@*) return 1 ;; esac
+  done
+  [ "$(stem_owner "$stem")" = "$APP" ]
 }
 valid_pkg()  { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]+(:[a-z0-9]+)?$ ]]; }
 valid_app()  { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
@@ -185,11 +205,17 @@ if [ -n "$WORKSPACE" ]; then
     dir=$(app_dir "$a")
     link="$ROOT/srv/$a"
     target="$SRV/$dir"
+    # On a collision, nothing else below runs for this name either: no
+    # /var/lib dir, and above all no User= drop-in, which would re-point
+    # ANOTHER app's probe at this site's user.
     if [ -L "$link" ]; then
-      [ "$(readlink "$link")" = "$target" ] \
-        || note_failure "$a: /srv/$a is a symlink to $(readlink "$link"), not $target -- refusing to touch it (name collision)"
+      if [ "$(readlink "$link")" != "$target" ]; then
+        note_failure "$a: /srv/$a is a symlink to $(readlink "$link"), not $target -- refusing to touch it (name collision)"
+        continue
+      fi
     elif [ -e "$link" ]; then
       note_failure "$a: /srv/$a exists and is not a symlink -- refusing to touch it (name collision)"
+      continue
     else
       install -d -m0755 "$ROOT/srv" 2>/dev/null || true
       ln -s "$target" "$link" && say "$a: created /srv/$a -> $target"
@@ -204,6 +230,13 @@ if [ -n "$WORKSPACE" ]; then
       rm -f "$tmp_dropin"
     done
   done
+  # A colliding name is not this site's app: drop it, so nothing below
+  # grants, arms or converges anything in its name.
+  kept_apps=()
+  for a in "${APPS[@]}"; do
+    [ "$(readlink "$ROOT/srv/$a" 2>/dev/null)" = "$SRV/$(app_dir "$a")" ] && kept_apps+=("$a")
+  done
+  APPS=("${kept_apps[@]}")
   # Prune identity + alarm timers for an app this site no longer hosts. Only
   # symlinks pointing INTO this site's own apps_dir/ are ever considered --
   # never a name this site does not own.

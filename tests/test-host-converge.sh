@@ -321,6 +321,38 @@ check "named it"                     grep -q libbaronly1 "$T/out.txt"
 echo "19. bar leaves the fleet: its symlink and armed timers are pruned"
 printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
 
+reset_log; run_ws
+check "exit 0"                       [ "$(rc)" = 0 ]
+check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
+check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
+check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
+
+echo "19a. a site claiming ANOTHER app's name (or a system service's) gets no grant, drop-in or dir for it"
+mkdir -p "$HR/srv/victim"                                   # another site's checkout on the same box
+ln -s "$HR/srv/othersite/apps/victim2" "$HR/srv/victim2"     # another site's WORKSPACE app
+printf '[hosts."the-host"]\napps = ["foo", "victim", "victim2", "sshd"]\n' > "$HR/srv/site/deploy/fleet.toml"
+mkdir -p "$HR/srv/site/apps/victim/deploy" "$HR/srv/site/apps/sshd/deploy"
+printf '[deploy]\nbuild_service = "site-build@victim.service"\n' > "$HR/srv/site/apps/victim/deploy/site.toml"
+printf '[deploy]\nservice = "sshd.service"\n' > "$HR/srv/site/apps/sshd/deploy/site.toml"
+reset_log; run_ws
+check "exit 1"                           [ "$(rc)" = 1 ]
+check "named the collision"              grep -q "victim: .*name collision" "$T/out.txt"
+check "no grant over victim's units"     bash -c '! grep -q "victim" "$HR/etc/sudoers.d/site-deploy"'
+check "no drop-in re-pointing victim's probe" [ ! -e "$HR/etc/systemd/system/site-probe@victim.service.d/site-deploy.conf" ]
+check "nor victim2's (symlinked elsewhere)" [ ! -e "$HR/etc/systemd/system/site-probe@victim2.service.d/site-deploy.conf" ]
+check "an app named sshd gets no sshd.service grant" bash -c '! grep -qE "(reload|restart) sshd(\.service)?(,|$)" "$HR/etc/sudoers.d/site-deploy"'
+check "said REFUSED for it"              grep -q "sshd: REFUSED to grant reload/restart of sshd.service" "$T/out.txt"
+check "foo still granted"                grep -q "reload site@foo.service" "$HR/etc/sudoers.d/site-deploy"
+cp "$HR/srv/site/apps/foo/deploy/site.toml" "$T/foo-site.toml.bak"
+printf '[deploy]\nreload = "reload"\nbuild_service = "site-backup@victim.service"\n' > "$HR/srv/site/apps/foo/deploy/site.toml"
+reset_log; run_ws
+check "a toolkit template instance is never granted, even when the site's name prefixes it" \
+  bash -c '! grep -q "site-backup@victim" "$HR/etc/sudoers.d/site-deploy"'
+cp "$T/foo-site.toml.bak" "$HR/srv/site/apps/foo/deploy/site.toml"
+rm -rf "$HR/srv/victim" "$HR/srv/victim2" "$HR/srv/sshd" "$HR/srv/site/apps/victim" "$HR/srv/site/apps/sshd" "$HR/var/lib/sshd"
+printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
+reset_log; run_ws
+
 echo "19b. an apps_dir that climbs out of the site is refused"
 cp "$HR/srv/site/deploy/site.toml" "$T/ws-site.toml.bak"
 printf '[workspace]\napps_dir = "../../etc"\n' > "$HR/srv/site/deploy/site.toml"
@@ -328,11 +360,6 @@ reset_log; run_ws
 check "exit 1"                       [ "$(rc)" = 1 ]
 check "said REFUSED apps_dir"        grep -q "REFUSED \[workspace\] apps_dir" "$T/out.txt"
 cp "$T/ws-site.toml.bak" "$HR/srv/site/deploy/site.toml"
-reset_log; run_ws
-check "exit 0"                       [ "$(rc)" = 0 ]
-check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
-check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
-check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
 
 echo "19c. a hosted app name that is not a plain name is refused, never used as a path"
 printf '[hosts."the-host"]\napps = ["foo", "../../etc/evil"]\n' > "$HR/srv/site/deploy/fleet.toml"
@@ -368,7 +395,8 @@ check "build unit refused too"          grep -q "REFUSED to grant start of build
 check "no shell in sudoers"             bash -c '! grep -qE "/bin/bash|/usr/bin/env" "$HR/etc/sudoers.d/app-deploy"'
 check "refusal text not in sudoers"     bash -c '! grep -q REFUSED "$HR/etc/sudoers.d/app-deploy"'
 check "the safe grants still written"   grep -q "host-converge.sh app" "$HR/etc/sudoers.d/app-deploy"
-for bad in reboot.target sshd sshd.service poweroff site-backup@victim.service a:b other.service; do
+mkdir -p "$HR/srv/app-staging"                              # another site whose name extends this one's
+for bad in reboot.target sshd sshd.service poweroff site-backup@victim.service site-backup@app.service cf-drift@app a:b other.service app-staging.service app-staging-build.service; do
   printf '[deploy]\nbuild_service = "%s"\n' "$bad" > "$HR/srv/app/deploy/site.toml"
   reset_log; run
   check "well-formed but not ours: $bad refused" bash -c '[ "$(cat "$T/rc.txt")" = 1 ] && ! grep -qF -- "'"$bad"'" "$HR/etc/sudoers.d/app-deploy"'
@@ -378,6 +406,7 @@ for good in app app.service app-build.service app@x.service site-build@app.servi
   reset_log; run
   check "ours: $good granted" grep -qF -- "start --no-block $good" "$HR/etc/sudoers.d/app-deploy"
 done
+rmdir "$HR/srv/app-staging"
 cp "$T/site.toml.bak" "$HR/srv/app/deploy/site.toml"
 
 echo "22. an option smuggled in as a package name never reaches apt-get"
