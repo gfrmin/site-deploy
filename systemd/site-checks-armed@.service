@@ -20,9 +20,11 @@ Group=%i
 EnvironmentFile=-/etc/%i/ops-env
 # %i: so it can also verify the app's probe_external check (site.toml).
 ExecStart=/srv/site-deploy/bin/checks-armed.sh %i
-# Worst honest run: API read 45 + a full --max-time 20 = ~65s, then the ping
-# 20 + 10 = ~30s. 3min covers that and keeps a hung run from stacking.
-TimeoutStartSec=3min
+# Worst honest run: the /start ping ~30s (20 + a full --max-time 10), the tag
+# read ~65s (45 + a full --max-time 20), the probe_external read another ~65s,
+# then the final ping ~30s: ~190s. 4min covers that, so the /fail still goes
+# out, and keeps a hung run from stacking.
+TimeoutStartSec=4min
 Nice=19
 
 # Writes nothing at all, so no write paths.

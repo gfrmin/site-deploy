@@ -44,7 +44,10 @@
 # healthchecks records a start without touching last_ping (hc/api/models.py,
 # "Don't update last_ping"), and reports it as `started: true`. A check that
 # has never pinged but is started is a job on its first run, this one or any
-# other, and is listed as information. No URL-to-check matching is needed,
+# other, and is listed as information, but only while that start is its ONE
+# ping ever (n_pings == 1). A job that sends only /start, run after run (a
+# wrong success URL, or killed before it can report), keeps last_start fresh
+# and would otherwise never go down. No URL-to-check matching is needed,
 # which a read-only key could not do anyway (it gets no ping_url). If that
 # first run never finishes, healthchecks turns the start into `down` after
 # the grace period, which is the alarm firing.
@@ -179,7 +182,7 @@ for c in sorted(checks, key=lambda x: x.get("name", "")):
         # apostrophes anywhere in this block: it is shell single-quoted.)
         continue
     if not last:
-        if c.get("started"):
+        if c.get("started") and c.get("n_pings") == 1:
             first_run.append(name)   # a first run in progress; see the header
             continue
         problems.append(f"{name}: has never been pinged")

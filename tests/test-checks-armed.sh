@@ -52,10 +52,12 @@ run_case "a stale simple-period check is a violation" 1 1 "{\"checks\":[$stale]}
 run_case "a never-pinged check is reported as such, not as stale" 1 1 "{\"checks\":[$never]}" "never been pinged"
 # A first run in progress (started, never pinged) is not a violation: on a
 # fresh install that is this script's own check, which it has just /start-ed.
-first='{"name":"armed","status":"new","started":true,"timeout":86400,"grace":3600,"last_ping":null}'
-first_down='{"name":"hung","status":"down","started":true,"timeout":86400,"grace":3600,"last_ping":null}'
+first='{"name":"armed","status":"new","started":true,"n_pings":1,"timeout":86400,"grace":3600,"last_ping":null}'
+first_down='{"name":"hung","status":"down","started":true,"n_pings":1,"timeout":86400,"grace":3600,"last_ping":null}'
 run_case "a started never-pinged check is a first run, not a violation" 0 1 "{\"checks\":[$up,$first]}" "on a first run: armed"
 run_case "a first run that hung past grace is reported as firing" 0 1 "{\"checks\":[$up,$first_down]}" "currently firing: hung"
+only_starts='{"name":"g","status":"new","started":true,"n_pings":4000,"timeout":900,"grace":3600,"last_ping":null}'
+run_case "a job that only ever sends /start is still a violation" 1 1 "{\"checks\":[$up,$only_starts]}" "g: has never been pinged"
 run_case "never pinged and NOT started is still a violation" 1 1 "{\"checks\":[$up,$first,$never]}" "f: has never been pinged"
 run_case "a cron-scheduled check is not judged for staleness" 0 1 "{\"checks\":[$cron]}" "all armed"
 run_case "the happy path passes" 0 2 "{\"checks\":[$up,$cron]}" "all armed"
