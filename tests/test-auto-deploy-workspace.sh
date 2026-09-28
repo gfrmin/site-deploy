@@ -315,6 +315,58 @@ check "per-app converge for foo"  called "CONVERGE-ENGINE RAN foo"
 check "per-app converge for bar"  called "CONVERGE-ENGINE RAN bar"
 check "site-level converge too"   called "CONVERGE-ENGINE RAN site"
 
+# ── ahead of the gate, per app (issue #33; the single-app half is test-auto-deploy.sh 23) ──
+HC=https://hc.example/ws1
+push_master_only() { ( cd "$WORK" || exit 1; git push -q origin master 2>/dev/null ); }
+echo "19a. arm the gate; a master-only commit that fails foo's CSS lands via the override -> foo pending, box AHEAD of ci-green"
+( cd "$WORK" || exit 1
+  printf '[deploy]\nconverge = true\ndeploy_ref = "ci-green"\n\n[workspace]\napps_dir = "apps"\nshared = ["packages/"]\n' > deploy/site.toml
+  git add -A; git commit -qm "arm the gate"; ) && push_master
+reset_log; run_deploy                                                   # lands the gate (still read as master pre-merge)
+( cd "$WORK" || exit 1; echo ahead >> apps/foo/app.py; git add -A; git commit -qm "foo, master only"; ) && push_master_only
+echo master > "$T/deploy-ref"
+reset_log; run_deploy STUB_FAIL_CSS=1
+rm -f "$T/deploy-ref" "$SRV/.site-deploy-state/ref-frozen-since"
+check "foo failed and is pending"       [ -f "$SRV/.site-deploy-state/pending/foo" ]
+check "box is ahead of the gate"        [ "$(git -C "$SRV" rev-parse @)" != "$(git -C "$SRV" rev-parse origin/ci-green)" ]
+check "(strictly ahead, not diverged)"  git -C "$SRV" merge-base --is-ancestor origin/ci-green @
+
+echo "19b. the pending app is resumed in place; the other app is not touched"
+head_before=$(git -C "$SRV" rev-parse @)
+reset_log; run_deploy HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "resumed"                         grep -qi "resuming" "$T/out.txt"
+check "foo restarted"                   called "systemctl restart site@foo.service"
+check "bar not touched"                 not_called "systemctl restart site@bar.service"
+check "foo's marker cleared"            [ ! -f "$SRV/.site-deploy-state/pending/foo" ]
+check "checkout did not move"           [ "$(git -C "$SRV" rev-parse @)" = "$head_before" ]
+
+echo "19c. a marker on top of a commit made ON the box is not resumed: /fail, no converge"
+( cd "$SRV" || exit 1; echo evil >> apps/bar/deploy/local.txt; git add -A; git commit -qm "local-only" )
+: > "$SRV/.site-deploy-state/pending/bar"
+reset_log; run_deploy HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "said NOT RESUMED"                grep -q "NOT RESUMED" "$T/out.txt"
+check "no host converge"                not_called "HOST-CONVERGE RAN"
+check "no app converge"                 not_called "CONVERGE-ENGINE RAN"
+check "bar not restarted"               not_called "systemctl restart site@bar.service"
+check "dead-man got /fail"              called "ws1/fail"
+rm -f "$SRV/.site-deploy-state/pending/bar"; git -C "$SRV" reset -q --hard HEAD~1
+
+echo "19d. ahead of a gate frozen for an hour: /fail, never level"
+echo "$(git -C "$SRV" rev-parse origin/ci-green) 1000000000" > "$SRV/.site-deploy-state/ref-frozen-since"
+reset_log; run_deploy HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "said FROZEN"                     grep -q "FROZEN" "$T/out.txt"
+check "said AHEAD"                      grep -q "AHEAD of origin/ci-green" "$T/out.txt"
+check "dead-man got /fail"              called "ws1/fail"
+
+echo "19e. the gate catches up -> level, no /fail"
+( cd "$WORK" || exit 1; git push -q -f origin master:ci-green 2>/dev/null )
+reset_log; run_deploy HEALTHCHECKS_DEPLOY_URL=$HC
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "no /fail"                        not_called "ws1/fail"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))
