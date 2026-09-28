@@ -724,6 +724,25 @@ check "exit 0"                     [ "$(rc)" = 0 ]
 check "no /fail"                   not_called "deploy1/fail"
 check "clock cleared"              [ ! -f "$SRV/.site-deploy-state/ref-frozen-since" ]
 
+echo "24a. a deploy touching cloudflare.json whose health gate FAILS dispatches nothing yet (issue #32)"
+( cd "$WORK" || exit 1; echo '{"ssl_mode":"full"}' > deploy/cloudflare.json; git add -A; git commit -qm "cf json again"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; STUB_HEALTH_FAIL=1 run_deploy CONVERGE_CMD=env STUB_HEALTH_FAIL=1
+check "exit non-zero"              [ "$(rc)" != 0 ]
+check "no cf-converge yet"         not_called "cf-converge@app.service"
+check "base recorded"              [ -s "$SRV/.site-deploy-state/pending-base/app" ]
+
+echo "24b. the resume (no diff of its own) still owes and dispatches cf-converge"
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "resumed"                    grep -qi "resuming" "$T/out.txt"
+check "cf-converge dispatched"     called "start --no-block cf-converge@app.service"
+check "base cleared with marker"   [ ! -e "$SRV/.site-deploy-state/pending-base/app" ]
+
+echo "24c. the next ordinary tick does not dispatch it again"
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "no second dispatch"         not_called "cf-converge@app.service"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))
