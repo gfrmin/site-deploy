@@ -90,5 +90,70 @@ if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
   exit 1
 fi
 
+# A commit already refused for breaking the Caddyfile (below) is not retried:
+# merging it just to roll back again would put the broken snippet on disk for
+# a moment every tick, and a Caddy restart in that moment would load it. A new
+# commit on the ref retries.
+refused="$(git rev-parse --git-dir)/site-deploy-caddy-refused"
+if [ "$(cat "$refused" 2>/dev/null)" = "$REMOTE" ]; then
+  log "REFUSING TO UPDATE: ${REMOTE:0:9} breaks the Caddyfile (refused earlier; see" \
+      "above in this journal). Staying on ${LOCAL:0:9} until origin/$REF moves. Fix master."
+  exit 1
+fi
+
 git merge --ff-only --quiet "$REMOTE" || { log "fast-forward failed (${LOCAL:0:9} -> ${REMOTE:0:9}) — manual fix"; exit 1; }
 log "updated ${LOCAL:0:9} -> ${REMOTE:0:9} (origin/$REF)"
+
+# The Caddy snippet (host/caddy/*.caddy) is imported by site Caddyfiles
+# straight out of this checkout, so an update to it IS a change to every
+# importing site's proxy config, one nothing else applies or checks: an app's
+# converge only notices ITS Caddyfile changing. Unchecked, the edit sits
+# unapplied until the next reload, and if it is broken that reload fails, or
+# worse the next restart (Restart=always after an OOM kill) leaves Caddy DOWN.
+#
+# So: validate the live Caddyfile, as the unit's User= (validate opens every
+# log file, and root would leave them root-owned), and reload on success. On
+# failure, the question is whose fault it is. Roll back and validate again: if
+# the OLD snippet passes, this update broke it, so stay on the old commit and
+# refuse loudly every tick until master moves. If the old one fails too, the
+# Caddyfile is broken on its own and holding the toolkit back fixes nothing,
+# so go forward and say so. Both sides call the same validation, so a
+# Caddyfile that imports no snippet can never cause a rollback.
+git diff --quiet "$LOCAL" "$REMOTE" -- 'host/caddy/*.caddy' && exit 0
+caddyfile=${CADDYFILE:-${HOST_ROOT:-}/etc/caddy/Caddyfile}
+[ -f "$caddyfile" ] || exit 0
+if [ -z "${CADDY_VALIDATE:-}" ]; then
+  command -v caddy >/dev/null 2>&1 || exit 0
+  caddy_user=$(systemctl show -p User --value caddy.service 2>/dev/null)
+fi
+caddy_validate() {   # the live Caddyfile against whatever is checked out now
+  if [ -n "${CADDY_VALIDATE:-}" ]; then $CADDY_VALIDATE "$caddyfile"; return; fi
+  # No User= means the daemon runs as root, so validating as root is faithful
+  # (the same rule as validate_file in bin/converge.sh).
+  if [ -n "${caddy_user:-}" ]; then
+    runuser -u "$caddy_user" -- caddy validate --adapter caddyfile --config "$caddyfile"
+  else
+    caddy validate --adapter caddyfile --config "$caddyfile"
+  fi
+}
+if ! why=$(caddy_validate 2>&1); then
+  git reset --quiet --keep "$LOCAL" || { log "CADDY: $caddyfile fails validation after the update AND the rollback failed — manual fix"; exit 1; }
+  if caddy_validate >/dev/null 2>&1; then
+    echo "$REMOTE" > "$refused"
+    log "REFUSING TO UPDATE: ${REMOTE:0:9} changes host/caddy/ and $caddyfile no longer" \
+        "validates with it (it does with ${LOCAL:0:9}); rolled back, Caddy untouched. Fix master."
+    printf '%s\n' "$why" | tail -5 | sed 's/^/site-deploy-update:   /'
+    exit 1
+  fi
+  git merge --ff-only --quiet "$REMOTE" || { log "fast-forward failed (${LOCAL:0:9} -> ${REMOTE:0:9}) — manual fix"; exit 1; }
+  log "CADDY: $caddyfile fails validation with the old snippet too, so not this update's" \
+      "doing; NOT reloading. The next Caddy restart will fail until it is fixed."
+  printf '%s\n' "$why" | tail -5 | sed 's/^/site-deploy-update:   /'
+  exit 1
+fi
+${CADDY_ACTIVE:-systemctl is-active --quiet caddy.service} || exit 0
+if ${CADDY_RELOAD:-systemctl reload caddy.service}; then
+  log "reloaded Caddy: host/caddy/ changed and $caddyfile validates"
+else
+  log "CADDY: reload failed after a host/caddy/ change; Caddy is on its old config"; exit 1
+fi

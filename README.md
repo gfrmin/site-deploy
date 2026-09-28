@@ -296,7 +296,7 @@ www.example.org {
   crawl from tens of thousands of IPs defeats per-IP rate limits and the cache alike. Size N as what
   the app can serve at once (workers × threads, or its connection pool) times a small queue factor.
   It is a **soft** cap: Caddy checks the count before it counts the request, so a truly simultaneous
-  burst can overshoot by a few (measured on 2.11.4: cap 2, six at once, 3–4 served and the rest
+  burst can overshoot by a few (measured on 2.11.4, not re-measured on the fleet's 2.11.3: cap 2, six at once, 3–4 served and the rest
   shed). It bounds the queue; it is not a semaphore.
 - **`dial_timeout 5s`, `response_header_timeout 65s`** (above gunicorn's 60 s worker timeout, so the
   app's own timeout fires first). They bound how long a request's buffers live in Caddy.
@@ -311,7 +311,14 @@ Two traps, encoded rather than rediscovered:
    app's log owned by the caddy unit's `User=` and repairs one it finds owned by anyone else; the `[converge]` engine
    already validates as the caddy unit's `User=`. Validating by hand: `sudo -u caddy caddy validate
    --config /etc/caddy/Caddyfile`.
-2. **The cap counts what Caddy holds.** A client that hangs up frees its slot while the app finishes
+2. **A snippet change reaches every importing site at once**, and no app's converge sees it (each
+   compares only its own Caddyfile). So `self-update` handles it: when an update touches
+   `host/caddy/*.caddy` it validates `/etc/caddy/Caddyfile` as the caddy unit's `User=` and reloads
+   Caddy. If validation fails, it rolls back and validates again. If the old snippet passes, the
+   update broke it: the box stays on the old commit and logs `REFUSING` every tick until master
+   moves. If the old one fails too, the Caddyfile is broken on its own, so the update goes ahead,
+   Caddy is not reloaded, and the unit fails once with the reason.
+3. **The cap counts what Caddy holds.** A client that hangs up frees its slot while the app finishes
    the work (uvicorn does not cancel on disconnect), so a flood that hangs up early can still queue
    inside the app. That belongs to an edge challenge, or to uvicorn's own `limit_concurrency`.
 

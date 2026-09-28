@@ -25,7 +25,7 @@
 #   so the flood cost every visitor. With the cap, request N+1 gets a 503 in
 #   under a millisecond and the first N are served normally. Nothing is sticky:
 #   no fail_duration is set and lb_try_duration defaults to 0, so the next
-#   request goes through as soon as a slot frees (measured on caddy 2.11.4).
+#   request goes through as soon as a slot frees (measured on caddy 2.11.4; the fleet ran 2.11.3, not re-measured).
 #   Size N as what the app can serve at once (workers x threads, or its
 #   connection pool) times a small queue factor.
 # - dial_timeout 5s / response_header_timeout 65s: 65 is above gunicorn's 60 s

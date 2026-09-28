@@ -109,6 +109,63 @@ run_update HOST_ROOT="$HR" T_LOG="$T_LOG"
 check "second tick: silent"           bash -c '! grep -q "PINNED" "'"$T"'/out.txt"'
 rm -f "$SELF/bin/site-tree.sh"
 
+echo "C. a host/caddy/*.caddy change is validated against the live Caddyfile, then reloaded"
+# The validator stub fails if the snippet OR the Caddyfile says BROKEN, and
+# logs each call with the snippet it saw, so each side of the rollback shows.
+CV="$T/caddy.log"; CF="$T/Caddyfile"; echo "import $SELF/host/caddy/rp.caddy" > "$CF"
+cat > "$T/validate" <<STUB
+#!/usr/bin/env bash
+echo "VALIDATE \$1 \$(cat "$SELF/host/caddy/rp.caddy" 2>/dev/null)" >> "$CV"
+! grep -q BROKEN "\$1" "$SELF/host/caddy/rp.caddy" 2>/dev/null
+STUB
+printf '#!/usr/bin/env bash\necho RELOAD >> "%s"\n' "$CV" > "$T/reload"
+chmod +x "$T/validate" "$T/reload"
+push_caddy() { ( cd "$WORK" || exit 1; mkdir -p host/caddy; echo "$1" > host/caddy/rp.caddy; git add -A; git commit -qm "caddy $1"; git push -q origin master ); }
+run_caddy() { : > "$CV"; run_update CADDYFILE="$CF" CADDY_VALIDATE="$T/validate" CADDY_ACTIVE=true CADDY_RELOAD="$T/reload" "$@"; }
+
+push_master v5; green_to_master; run_caddy
+check "no snippet change: exit 0"          [ "$(rc)" = 0 ]
+check "no snippet change: not validated"   [ ! -s "$CV" ]
+
+push_caddy good1; green_to_master; run_caddy
+check "good snippet: exit 0"               [ "$(rc)" = 0 ]
+check "good snippet: validated the live Caddyfile" grep -q "VALIDATE $CF good1" "$CV"
+check "good snippet: reloaded"             grep -qx RELOAD "$CV"
+check "good snippet: logged the reload"    grep -q "reloaded Caddy" "$T/out.txt"
+
+good=$(at); push_caddy BROKEN; green_to_master; run_caddy
+check "broken snippet: exit 1"             [ "$(rc)" = 1 ]
+check "broken snippet: rolled back"        [ "$(at)" = "$good" ]
+check "broken snippet: old one back on disk" grep -qx good1 "$SELF/host/caddy/rp.caddy"
+check "broken snippet: validated the old one too" grep -q "VALIDATE $CF good1" "$CV"
+check "broken snippet: NOT reloaded"       bash -c '! grep -qx RELOAD "'"$CV"'"'
+check "broken snippet: said REFUSING"      grep -q "REFUSING" "$T/out.txt"
+run_caddy
+check "next tick: refuses again, loudly"   bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && grep -q REFUSING "'"$T"'/out.txt"'
+check "next tick: still on the good commit" [ "$(at)" = "$good" ]
+check "next tick: did not re-merge the refused commit" [ ! -s "$CV" ]
+
+push_caddy good2; green_to_master; run_caddy
+check "fixed on master: exit 0"            [ "$(rc)" = 0 ]
+check "fixed on master: now on it"         grep -qx good2 "$SELF/host/caddy/rp.caddy"
+check "fixed on master: reloaded"          grep -qx RELOAD "$CV"
+
+echo BROKEN >> "$CF"; push_caddy good3; green_to_master; run_caddy
+check "Caddyfile broken on its own: goes forward" grep -qx good3 "$SELF/host/caddy/rp.caddy"
+check "Caddyfile broken on its own: exit 1, says so" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && grep -q "old snippet too" "'"$T"'/out.txt"'
+check "Caddyfile broken on its own: NOT reloaded" bash -c '! grep -qx RELOAD "'"$CV"'"'
+echo "import $SELF/host/caddy/rp.caddy" > "$CF"
+
+push_caddy good4; green_to_master; run_caddy CADDY_ACTIVE=false
+check "Caddy not running: exit 0, no reload" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 0 ] && ! grep -qx RELOAD "'"$CV"'"'
+
+push_caddy good5; green_to_master; run_caddy CADDY_RELOAD=false
+check "reload fails: exit 1, says so"      bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && grep -q "reload failed" "'"$T"'/out.txt"'
+
+push_caddy good6; green_to_master; run_caddy CADDYFILE="$T/no-such-Caddyfile"
+check "no Caddyfile: updates, exit 0"      bash -c '[ "$(cat "'"$T"'/rc.txt")" = 0 ] && grep -qx good6 "'"$SELF"'/host/caddy/rp.caddy"'
+check "no Caddyfile: not validated"        [ ! -s "$CV" ]
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))
