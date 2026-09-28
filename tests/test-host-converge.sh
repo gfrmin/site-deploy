@@ -320,13 +320,21 @@ check "named it"                     grep -q libbaronly1 "$T/out.txt"
 
 echo "19. bar leaves the fleet: its symlink and armed timers are pruned"
 printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
+
+echo "19b. an apps_dir that climbs out of the site is refused"
+cp "$HR/srv/site/deploy/site.toml" "$T/ws-site.toml.bak"
+printf '[workspace]\napps_dir = "../../etc"\n' > "$HR/srv/site/deploy/site.toml"
+reset_log; run_ws
+check "exit 1"                       [ "$(rc)" = 1 ]
+check "said REFUSED apps_dir"        grep -q "REFUSED \[workspace\] apps_dir" "$T/out.txt"
+cp "$T/ws-site.toml.bak" "$HR/srv/site/deploy/site.toml"
 reset_log; run_ws
 check "exit 0"                       [ "$(rc)" = 0 ]
 check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
 check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
 check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
 
-echo "19b. a hosted app name that is not a plain name is refused, never used as a path"
+echo "19c. a hosted app name that is not a plain name is refused, never used as a path"
 printf '[hosts."the-host"]\napps = ["foo", "../../etc/evil"]\n' > "$HR/srv/site/deploy/fleet.toml"
 reset_log; run_ws
 check "exit 1"                       [ "$(rc)" = 1 ]
@@ -360,6 +368,16 @@ check "build unit refused too"          grep -q "REFUSED to grant start of build
 check "no shell in sudoers"             bash -c '! grep -qE "/bin/bash|/usr/bin/env" "$HR/etc/sudoers.d/app-deploy"'
 check "refusal text not in sudoers"     bash -c '! grep -q REFUSED "$HR/etc/sudoers.d/app-deploy"'
 check "the safe grants still written"   grep -q "host-converge.sh app" "$HR/etc/sudoers.d/app-deploy"
+for bad in reboot.target sshd sshd.service poweroff site-backup@victim.service a:b other.service; do
+  printf '[deploy]\nbuild_service = "%s"\n' "$bad" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "well-formed but not ours: $bad refused" bash -c '[ "$(cat "$T/rc.txt")" = 1 ] && ! grep -qF -- "'"$bad"'" "$HR/etc/sudoers.d/app-deploy"'
+done
+for good in app app.service app-build.service app@x.service site-build@app.service; do
+  printf '[deploy]\nbuild_service = "%s"\n' "$good" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "ours: $good granted" grep -qF -- "start --no-block $good" "$HR/etc/sudoers.d/app-deploy"
+done
 cp "$T/site.toml.bak" "$HR/srv/app/deploy/site.toml"
 
 echo "22. an option smuggled in as a package name never reaches apt-get"

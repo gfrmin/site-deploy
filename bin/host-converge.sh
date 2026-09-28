@@ -83,7 +83,17 @@ changed_timers=()
 # declared value must never reach sudoers, a command line or a path unless it
 # matches a strict allow-list. An app compromise must stay an app compromise
 # (issue #31). Anything that fails is a counted failure and is never used.
-valid_unit() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]*$ ]]; }   # a bare name is fine (systemctl adds .service); no space, comma, slash or glob
+# A unit this site may be granted: a .service (a bare name means one, as
+# systemctl reads it) named for the app or its site (<x>, <x>-..., <x>@...),
+# or the toolkit's own site-build@<x>. Shape alone is not enough: a
+# well-formed `reboot.target` or `sshd` must never become a grant. No ':'
+# (a sudoers separator), no space, comma, slash, backslash or glob.
+owned_unit() {   # <app> <unit>
+  local a=$1 u=$2 stem
+  [[ $u =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] || return 1
+  case $u in *.service) stem=${u%.service} ;; *.*) return 1 ;; *) stem=$u ;; esac
+  [[ $stem =~ ^($a|$APP)([-@][A-Za-z0-9_.@-]*)?$ || $stem =~ ^site-build@($a|$APP)$ ]]
+}
 valid_pkg()  { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]+(:[a-z0-9]+)?$ ]]; }
 valid_app()  { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
 
@@ -94,6 +104,11 @@ valid_app()  { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
 WORKSPACE=""
 ws_active "$SRV" && WORKSPACE=1
 APPS_DIR=$(ws_apps_dir "$SRV")
+# apps_dir becomes symlink targets under /srv: relative, plain segments, no '..'.
+if [ -n "$WORKSPACE" ] && { ! [[ $APPS_DIR =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$ ]] || [[ /$APPS_DIR/ == */../* ]]; }; then
+  say "REFUSED [workspace] apps_dir $(printf '%q' "$APPS_DIR"): must be a relative path of plain segments, no '..'; refusing"
+  exit 1
+fi
 if [ -n "$WORKSPACE" ]; then
   mapfile -t ws_names < <(ws_apps "$SRV" "$APP")
   APPS=()
@@ -246,16 +261,16 @@ tmp_sudo=$(mktemp)
     # matches arguments literally, so granting the bare "$APP" while the poller runs
     # `systemctl reload $APP.service` refuses every deploy ("sudo: a password is required").
     svc=$(app_service "$APP")
-    if valid_unit "$svc"; then
+    if owned_unit "$APP" "$svc"; then
       echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
     else
-      note_failure "REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a valid unit name" >&2
+      note_failure "REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a unit this app owns" >&2
     fi
     if [ -n "$build_svc" ]; then
-      if valid_unit "$build_svc"; then
+      if owned_unit "$APP" "$build_svc"; then
         echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
       else
-        note_failure "REFUSED to grant start of build unit $(printf '%q' "$build_svc"): not a valid unit name" >&2
+        note_failure "REFUSED to grant start of build unit $(printf '%q' "$build_svc"): not a unit this app owns" >&2
       fi
     fi
     echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
@@ -264,16 +279,16 @@ tmp_sudo=$(mktemp)
     # workspace app's default unit is $APP@<app>.service, not <app> bare).
     for a in "${APPS[@]}"; do
       svc=$(app_service "$a"); bsvc=$(app_build_service "$a")
-      if valid_unit "$svc"; then
+      if owned_unit "$a" "$svc"; then
         echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
       else
-        note_failure "$a: REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a valid unit name" >&2
+        note_failure "$a: REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a unit this app owns" >&2
       fi
       if [ -n "$bsvc" ]; then
-        if valid_unit "$bsvc"; then
+        if owned_unit "$a" "$bsvc"; then
           echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $bsvc"
         else
-          note_failure "$a: REFUSED to grant start of build unit $(printf '%q' "$bsvc"): not a valid unit name" >&2
+          note_failure "$a: REFUSED to grant start of build unit $(printf '%q' "$bsvc"): not a unit this app owns" >&2
         fi
       fi
       echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$a.service"
