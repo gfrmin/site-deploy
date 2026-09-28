@@ -141,12 +141,19 @@ if [ -n "$WORKSPACE" ]; then
     # site blog) would, once /srv/<name> exists, take ownership of that
     # site's own units (see owned_unit) and stop its deploys. Extending this
     # site's own name is fine: those units are ours either way.
+    # Only a NEW name is checked: one whose /srv link is already ours keeps
+    # it, so a later /srv/<prefix> (another site's new app) can never take an
+    # existing app away. And a name that is itself one of OUR links (shop,
+    # next to our shop-api) is no one else's to protect.
     squat=""
-    for p in "$ROOT"/srv/*; do
-      n=${p##*/}
-      [ "$n" = "$a" ] || [ "$n" = "$APP" ] && continue
-      case $a in "$n"-*|"$n"@*) squat=$n; break ;; esac
-    done
+    if [ "$(readlink "$ROOT/srv/$a" 2>/dev/null)" != "$SRV/$APPS_DIR/$a" ]; then
+      for p in "$ROOT"/srv/*; do
+        n=${p##*/}
+        [ "$n" = "$a" ] || [ "$n" = "$APP" ] && continue
+        [ "$(readlink "$p" 2>/dev/null)" = "$SRV/$APPS_DIR/$n" ] && continue
+        case $a in "$n"-*|"$n"@*) squat=$n; break ;; esac
+      done
+    fi
     if [ -n "$squat" ]; then
       note_failure "REFUSED hosted app name $a: it extends /srv/$squat, another site's or app's name, whose units it would take over"
       continue
