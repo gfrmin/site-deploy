@@ -76,6 +76,17 @@ envval() { [ -r "$2" ] && sed -n "s/^$1=//p" "$2" | tail -1 | tr -d '"'"'"'[:spa
 units_changed=0
 changed_timers=()
 
+# --- declarations are UNTRUSTED input -------------------------------------------
+# Everything read out of /srv/<site> (site.toml, fleet.toml, packages.txt) is
+# writable by the service user: /srv/<app> is its home. This script runs as
+# root and the service user can invoke it through its own sudo grant, so a
+# declared value must never reach sudoers, a command line or a path unless it
+# matches a strict allow-list. An app compromise must stay an app compromise
+# (issue #31). Anything that fails is a counted failure and is never used.
+valid_unit() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]*$ ]]; }   # a bare name is fine (systemctl adds .service); no space, comma, slash or glob
+valid_pkg()  { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]+(:[a-z0-9]+)?$ ]]; }
+valid_app()  { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
+
 # --- workspace mode (Phase D item 14): several apps out of one checkout -----
 # $APP is the SITE (the checkout); $APPS is what it hosts -- itself, under
 # dir ".", for a single-app site (today's shape, unchanged), or every name
@@ -84,7 +95,12 @@ WORKSPACE=""
 ws_active "$SRV" && WORKSPACE=1
 APPS_DIR=$(ws_apps_dir "$SRV")
 if [ -n "$WORKSPACE" ]; then
-  mapfile -t APPS < <(ws_apps "$SRV" "$APP")
+  mapfile -t ws_names < <(ws_apps "$SRV" "$APP")
+  APPS=()
+  for a in "${ws_names[@]}"; do
+    if valid_app "$a"; then APPS+=("$a")
+    else note_failure "REFUSED hosted app name $(printf '%q' "$a"): must match ^[a-z][a-z0-9_-]{0,31}\$"; fi
+  done
 else
   APPS=("$APP")
 fi
@@ -230,16 +246,36 @@ tmp_sudo=$(mktemp)
     # matches arguments literally, so granting the bare "$APP" while the poller runs
     # `systemctl reload $APP.service` refuses every deploy ("sudo: a password is required").
     svc=$(app_service "$APP")
-    echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
-    [ -n "$build_svc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
+    if valid_unit "$svc"; then
+      echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
+    else
+      note_failure "REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a valid unit name" >&2
+    fi
+    if [ -n "$build_svc" ]; then
+      if valid_unit "$build_svc"; then
+        echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
+      else
+        note_failure "REFUSED to grant start of build unit $(printf '%q' "$build_svc"): not a valid unit name" >&2
+      fi
+    fi
     echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
   else
     # One grant per hosted app, keyed on ITS OWN service/build_service (a
     # workspace app's default unit is $APP@<app>.service, not <app> bare).
     for a in "${APPS[@]}"; do
       svc=$(app_service "$a"); bsvc=$(app_build_service "$a")
-      echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
-      [ -n "$bsvc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $bsvc"
+      if valid_unit "$svc"; then
+        echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
+      else
+        note_failure "$a: REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a valid unit name" >&2
+      fi
+      if [ -n "$bsvc" ]; then
+        if valid_unit "$bsvc"; then
+          echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $bsvc"
+        else
+          note_failure "$a: REFUSED to grant start of build unit $(printf '%q' "$bsvc"): not a valid unit name" >&2
+        fi
+      fi
       echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$a.service"
       echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/converge.sh $a"
     done
@@ -290,6 +326,7 @@ fi
 missing=()
 while read -r pkg; do
   [ -n "$pkg" ] || continue
+  valid_pkg "$pkg" || { note_failure "packages: REFUSED $(printf '%q' "$pkg"): not a Debian package name"; continue; }
   dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || missing+=("$pkg")
 done < <(grep -hvE '^\s*#|^\s*$' "${PKG_FILES[@]}" | sort -u)
 if [ ${#missing[@]} -gt 0 ]; then

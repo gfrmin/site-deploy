@@ -326,6 +326,15 @@ check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
 check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
 check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
 
+echo "19b. a hosted app name that is not a plain name is refused, never used as a path"
+printf '[hosts."the-host"]\napps = ["foo", "../../etc/evil"]\n' > "$HR/srv/site/deploy/fleet.toml"
+reset_log; run_ws
+check "exit 1"                       [ "$(rc)" = 1 ]
+check "said REFUSED"                 grep -q "REFUSED hosted app name" "$T/out.txt"
+check "no path escape"               bash -c '[ ! -e "$HR/etc/evil" ] && ! ls -d "$HR"/srv/*evil* >/dev/null 2>&1'
+check "foo still converged"          [ -L "$HR/srv/foo" ]
+printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
+
 echo "20. probe_external (issue #24): the on-box probe is disarmed, not nagged UNPROBED"
 printf '[deploy]\nreload = "reload"\nprobe_external = "foo.example-probe"\n' > "$HR/srv/site/apps/foo/deploy/site.toml"
 reset_log; run_ws
@@ -340,6 +349,28 @@ printf 'HEALTHCHECKS_API_KEY=k\nHEALTHCHECKS_SWEEP_TAG=fleet\n' > "$HR/etc/foo/o
 reset_log; run_ws
 check "with the sweep armed: no foo probe nag at all" bash -c '! grep -qE "foo: .*(UNPROBED|UNVERIFIED|ignored)" "$T/out.txt"'
 check "foo's sweep armed"            [ -e "$STUB_UNITS/site-checks-armed@foo.timer.enabled" ]
+
+echo "21. declarations are untrusted: an injected unit name never reaches sudoers (issue #31)"
+cp "$HR/srv/app/deploy/site.toml" "$T/site.toml.bak" 2>/dev/null || : > "$T/site.toml.bak"
+printf '[deploy]\nservice = "app.service, /bin/bash"\nbuild_service = "x.service,/usr/bin/env"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "exit 1 (counted failure)"        [ "$(rc)" = 1 ]
+check "said REFUSED"                    grep -q "REFUSED to grant reload/restart" "$T/out.txt"
+check "build unit refused too"          grep -q "REFUSED to grant start of build unit" "$T/out.txt"
+check "no shell in sudoers"             bash -c '! grep -qE "/bin/bash|/usr/bin/env" "$HR/etc/sudoers.d/app-deploy"'
+check "refusal text not in sudoers"     bash -c '! grep -q REFUSED "$HR/etc/sudoers.d/app-deploy"'
+check "the safe grants still written"   grep -q "host-converge.sh app" "$HR/etc/sudoers.d/app-deploy"
+cp "$T/site.toml.bak" "$HR/srv/app/deploy/site.toml"
+
+echo "22. an option smuggled in as a package name never reaches apt-get"
+printf 'libok1\n-oDPkg::Pre-Invoke::=touch /pwned\n--allow-unauthenticated\n' > "$HR/srv/app/deploy/packages.txt"
+reset_log; run
+check "exit 1"                          [ "$(rc)" = 1 ]
+check "said REFUSED"                    grep -q "packages: REFUSED" "$T/out.txt"
+check "apt never saw the option"        not_called "Pre-Invoke"
+check "nor the flag"                    not_called "allow-unauthenticated"
+check "the valid package still installed" called "libok1"
+rm -f "$HR/srv/app/deploy/packages.txt"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
