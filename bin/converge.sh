@@ -39,10 +39,19 @@
 # declaring restart has already accepted the downtime a bad file costs.
 set -uo pipefail
 
-APP=${1:?usage: converge.sh <app>}
+APP=${1:?usage: converge.sh <app> [--tree <dir>]}
 ROOT="${HOST_ROOT:-}"
 SELF="$ROOT/srv/site-deploy"
 SRV="$ROOT/srv/$APP"
+# --tree <dir>: read site.toml and every src from root's verified export of
+# the deployed commit (bin/site-tree.sh), not from the service user's
+# checkout, which root must never apply (issue #31).
+if [ "${2:-}" = --tree ]; then
+  SRV=${3:?usage: converge.sh <app> --tree <dir>}
+  [ -d "$SRV" ] || { echo "converge[$APP]: --tree $SRV is not a directory" >&2; exit 1; }
+elif [ $# -gt 1 ]; then
+  echo "usage: converge.sh <app> [--tree <dir>]" >&2; exit 2
+fi
 TOML="$SRV/deploy/site.toml"
 STATE_DIR="${CONVERGE_STATE_DIR:-$ROOT/var/lib/$APP}"
 MANIFEST="$STATE_DIR/converge-installed-files"
