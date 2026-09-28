@@ -494,6 +494,12 @@ check "never an injected directive"     bash -c '! grep -q ExecStartPre "$1"' _ 
 printf '[deploy]\nbackup_timeout = "23h"\n' > "$HR/srv/app/deploy/site.toml"
 reset_log; run
 check "23h (the cap) is accepted"       grep -qx "TimeoutStartSec=23h" "$dropin"
+for broken in '[deploy]\nbackup_timeout = "2h"\nservice = "x\n' 'deploy = "x"\n'; do
+  printf "$broken" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "unreadable site.toml: exit 1"  [ "$(rc)" = 1 ]
+  check "unreadable site.toml: drop-in kept, not treated as no knob" grep -qx "TimeoutStartSec=23h" "$dropin"
+done
 : > "$HR/srv/app/deploy/site.toml"
 reset_log; run
 check "knob removed: drop-in removed"   [ ! -e "$HR/etc/systemd/system/site-backup@app.service.d" ]

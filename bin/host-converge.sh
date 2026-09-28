@@ -194,12 +194,17 @@ app_probe_external() {   # <app>
 # for a producer the unit's default cannot fit (issue #42: a 77 GB pg_dump).
 # Read exactly, not sed-extracted like the helpers above: a line-oriented
 # extraction would quietly accept the first line of a multi-line value.
-# Validated at the point of use (valid_backup_timeout).
+# Validated at the point of use (valid_backup_timeout). No site.toml is no
+# knob (empty, status 0); an UNREADABLE one is status 1, which must never be
+# read as "no knob" -- that would delete a working backup's timeout.
 app_backup_timeout() {   # <app>
   local a=$1 dir
   dir=$(app_dir "$a")
-  python3 -c 'import sys, tomllib
-sys.stdout.write(str(tomllib.load(open(sys.argv[1], "rb")).get("deploy", {}).get("backup_timeout", "")))' \
+  python3 -c 'import os, sys, tomllib
+if not os.path.exists(sys.argv[1]): sys.exit(0)
+deploy = tomllib.load(open(sys.argv[1], "rb")).get("deploy", {})
+if not isinstance(deploy, dict): sys.exit(1)
+sys.stdout.write(str(deploy.get("backup_timeout", "")))' \
     "$SRV/$dir/deploy/site.toml" 2>/dev/null
 }
 # <N>min or <N>h, at least a minute and at most 23h: the backup is daily, so a
@@ -621,8 +626,9 @@ for a in "${APPS[@]}"; do
   # the last good drop-in in place -- a typo must not shrink a working
   # backup's timeout back to the default and fail it tonight.
   bt_dir="$ETC/systemd/system/site-backup@$a.service.d"
-  bt=$(app_backup_timeout "$a")
-  if [ -z "$bt" ]; then
+  if ! bt=$(app_backup_timeout "$a"); then
+    note_failure "$a: $a_dir/deploy/site.toml is unreadable — site-backup@$a's timeout drop-in left as it was"
+  elif [ -z "$bt" ]; then
     if [ -e "$bt_dir/timeout.conf" ]; then
       rm -f "$bt_dir/timeout.conf"; rmdir "$bt_dir" 2>/dev/null || true
       say "$a: removed site-backup@$a timeout drop-in (no backup_timeout in site.toml)"
