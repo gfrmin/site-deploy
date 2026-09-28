@@ -296,7 +296,7 @@ www.example.org {
   crawl from tens of thousands of IPs defeats per-IP rate limits and the cache alike. Size N as what
   the app can serve at once (workers × threads, or its connection pool) times a small queue factor.
   It is a **soft** cap: Caddy checks the count before it counts the request, so a truly simultaneous
-  burst can overshoot by a few (measured on 2.11.4: cap 2, six at once, 3–4 served and the rest
+  burst can overshoot by a few (measured on 2.11.4, not re-measured on the fleet's 2.11.3: cap 2, six at once, 3–4 served and the rest
   shed). It bounds the queue; it is not a semaphore.
 - **`dial_timeout 5s`, `response_header_timeout 65s`** (above gunicorn's 60 s worker timeout, so the
   app's own timeout fires first). They bound how long a request's buffers live in Caddy.
@@ -311,7 +311,22 @@ Two traps, encoded rather than rediscovered:
    app's log owned by the caddy unit's `User=` and repairs one it finds owned by anyone else; the `[converge]` engine
    already validates as the caddy unit's `User=`. Validating by hand: `sudo -u caddy caddy validate
    --config /etc/caddy/Caddyfile`.
-2. **The cap counts what Caddy holds.** A client that hangs up frees its slot while the app finishes
+2. **A snippet change reaches every importing site at once**, and no app's converge sees it (each
+   compares only its own Caddyfile). So `self-update` applies it, on every tick rather than only
+   the tick that updates. It compares the `host/caddy/*.caddy` files on disk with the version it
+   last applied (a stamp in `.git`), whether the snippet arrived through the updater, the
+   override, install, a pull or a hand edit, and even on a tick whose fetch fails. On a mismatch it validates `/etc/caddy/Caddyfile` as the
+   caddy unit's `User=` and reloads Caddy. Any failure is logged and retried every tick until it
+   clears, so it never goes quiet. On the first tick after this lands, every box validates and
+   reloads Caddy once.
+   - **An update makes validation fail**: `self-update` rolls back and validates again. If the old
+     snippet passes, the update broke it, so the box stays on the old commit and logs `REFUSING`.
+     The commit is not merged again until `ci-green` moves, the Caddyfile changes, or an
+     hour passes (a fix in a file the Caddyfile imports is not visible to the refusal);
+     `rm .git/site-deploy-caddy-refused` retries now.
+   - **The old snippet fails too**: the Caddyfile is broken on its own. The update goes ahead,
+     Caddy is not reloaded, and the unit says so every tick.
+3. **The cap counts what Caddy holds.** A client that hangs up frees its slot while the app finishes
    the work (uvicorn does not cancel on disconnect), so a flood that hangs up early can still queue
    inside the app. That belongs to an edge challenge, or to uvicorn's own `limit_concurrency`.
 
