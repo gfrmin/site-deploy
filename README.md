@@ -312,12 +312,19 @@ Two traps, encoded rather than rediscovered:
    already validates as the caddy unit's `User=`. Validating by hand: `sudo -u caddy caddy validate
    --config /etc/caddy/Caddyfile`.
 2. **A snippet change reaches every importing site at once**, and no app's converge sees it (each
-   compares only its own Caddyfile). So `self-update` handles it: when an update touches
-   `host/caddy/*.caddy` it validates `/etc/caddy/Caddyfile` as the caddy unit's `User=` and reloads
-   Caddy. If validation fails, it rolls back and validates again. If the old snippet passes, the
-   update broke it: the box stays on the old commit and logs `REFUSING` every tick until master
-   moves. If the old one fails too, the Caddyfile is broken on its own, so the update goes ahead,
-   Caddy is not reloaded, and the unit fails once with the reason.
+   compares only its own Caddyfile). So `self-update` applies it, on every tick rather than only
+   the tick that updates. It compares the checked-out `host/caddy/*.caddy` with the version it
+   last applied (a stamp in `.git`), whether the snippet arrived through the updater, the
+   override, install or a pull by hand. On a mismatch it validates `/etc/caddy/Caddyfile` as the
+   caddy unit's `User=` and reloads Caddy. Any failure is logged and retried every tick until it
+   clears, so it never goes quiet. On the first tick after this lands, every box validates and
+   reloads Caddy once.
+   - **An update makes validation fail**: `self-update` rolls back and validates again. If the old
+     snippet passes, the update broke it, so the box stays on the old commit and logs `REFUSING`.
+     The commit is not merged again until `ci-green` moves or the Caddyfile changes;
+     `rm .git/site-deploy-caddy-refused` retries now.
+   - **The old snippet fails too**: the Caddyfile is broken on its own. The update goes ahead,
+     Caddy is not reloaded, and the unit says so every tick.
 3. **The cap counts what Caddy holds.** A client that hangs up frees its slot while the app finishes
    the work (uvicorn does not cancel on disconnect), so a flood that hangs up early can still queue
    inside the app. That belongs to an edge challenge, or to uvicorn's own `limit_concurrency`.
