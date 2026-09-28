@@ -285,22 +285,25 @@ if [ -n "$WORKSPACE" ]; then
   done
 fi
 
-# Install $1 at $2 only if it differs. Returns 0 when it wrote something.
-# A missing SOURCE is a counted failure, not a silent "updated": the first
 # --- 0. the pinned origin root fetches app content from (bin/site-tree.sh) ------
-# site-tree.sh pins it on first use (from the checkout's remote.origin.url, said
-# loudly) and never re-reads it after. Asked here so the PINNED line lands in the
-# deploy log on the tick this ships, and so a site that NEEDS the tree (converge,
-# a backup producer, a cloudflare.json) and cannot have one is told every tick.
+# Never written here: this script is reachable through the service user's own
+# grant, and a pin taken from the checkout at a moment the checkout's owner can
+# choose would let them choose the code root runs. It is pinned once by root's
+# self-update, or by an admin (install.sh). What this does is say, every tick,
+# when a site that NEEDS the tree (converge, a backup producer, a
+# cloudflare.json) cannot have one.
 needs_tree=""
 case $(python3 "$SELF/bin/site-config.py" "$SRV/deploy/site.toml" 2>/dev/null | sed -n "s/^export DEPLOY_CONVERGE=//p" | tail -1 | tr -d "'\"") in
   True|true|1) needs_tree=1 ;;
 esac
 [ -n "$(find "$SRV" -path "$SRV/.git" -prune -o \( -path '*/deploy/cloudflare.json' -o -path '*/deploy/backup-producer.sh' \) -print -quit 2>/dev/null)" ] && needs_tree=1
-if ! origin_msg=$("$SELF/bin/site-tree.sh" origin "$APP" 2>&1); then
-  [ -n "$needs_tree" ] && say "$origin_msg — root cannot verify this app's code, so its converge, backup and cf-converge WILL REFUSE"
-elif [ -n "$origin_msg" ]; then
-  say "$origin_msg"
+origin_file="$ETC/site-deploy/origin/$APP"
+if [ -n "$needs_tree" ]; then
+  if [ ! -r "$origin_file" ]; then
+    say "no pinned origin in $origin_file — root cannot verify this app's code, so its converge, backup and cf-converge WILL REFUSE; write url=<clone URL> there (or re-run install.sh)"
+  elif ! grep -q '^url=https://' "$origin_file" && ! grep -q '^key=' "$origin_file"; then
+    say "$origin_file pins an ssh URL with no key= — unless the repo is readable anonymously, root's fetch has no credentials and converge, backup and cf-converge WILL REFUSE; add key=<ssh identity readable by root>"
+  fi
 fi
 
 # --- 1. the toolkit's own units --------------------------------------------------

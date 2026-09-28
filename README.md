@@ -132,10 +132,15 @@ hook, the `[converge]` engine's files, `deploy/backup-producer.sh`, `deploy/clou
 from root's own export of the deployed commit:
 
 - the origin URL is pinned in root-owned `/etc/site-deploy/origin/<site>` (`url=<clone URL>`, plus
-  `key=<ssh identity>` for a private repo over ssh). `site-tree.sh` writes it **once**, from the
-  checkout's `remote.origin.url`, and says so loudly (`PINNED the origin…`, in the deploy log on a
-  converging site): check that line. After that it is never re-read from the checkout; changing it
-  is an admin act;
+  `key=<ssh identity readable by root>` for a private repo over ssh). It is taken from the checkout's
+  `remote.origin.url` only at moments the service user cannot choose: `install.sh` (an admin, just
+  after cloning), and once per site by root's own self-update when this toolkit version lands
+  (logged as `PINNED the origin…` in `journalctl -u site-deploy-update`: check that line). That
+  first-use window then closes for good, so a checkout URL changed later is never pinned; from then
+  on only an admin writes the file. Nothing the service user can invoke ever writes it. A URL
+  carrying credentials (`https://token@…`) is refused, never copied into the world-readable pin;
+  `host-converge` nags every tick when a site that needs the tree has no pin, or an ssh pin with no
+  `key=`;
 - root fetches master into its own mirror under `/var/lib/site-deploy-root/`, with a hermetic git
   (no system or user config, its own `known_hosts`, https and ssh only);
 - a commit is accepted only if it is **on master** (merge access is the bargain, nothing less) and
@@ -257,8 +262,8 @@ owns, every tick:
 - the service user's scoped `NOPASSWD` grants (`reload` and `restart` of units the app owns, the
   build unit, `cf-converge@`, `host-converge.sh <site>`, and `site-tree.sh converge <site>`),
   validated with `visudo -cf` before they replace the live file
-- the pinned origin for root's verified tree, pinned once (see the trust boundary above), with a
-  nag every tick if a site that needs the tree cannot have one
+- a nag every tick if a site that needs root's verified tree has no pinned origin (or an ssh one
+  with no `key=`); host-converge never writes the pin itself (see the trust boundary above)
 - a journald cap (`SystemMaxUse=1G`, a month of retention), unattended security upgrades, and a
   `needrestart` rule so an upgrade never restarts a running `<app>-*` batch unit mid-run (the
   app's own long-lived unit stays eligible on purpose)

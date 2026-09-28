@@ -235,20 +235,35 @@ check "same tip"                       [ "$(readlink "$TREES/tip")" = "$tip_befo
 check "said it could not fetch"        grep -q "could not fetch master" "$T/out.txt"
 mv "$T/origin.away" "$ORIGIN"
 
-echo "17. origin: pinned once from the checkout, then never re-read from it"
+echo "17. origin: pinned ONCE from the checkout (root's own first-use window), never by the service user's grant"
 mv "$HR/etc/site-deploy/origin/site" "$T/origin-file.bak"
+rm -f "$HR/var/lib/site-deploy-root/origin-window/site"      # a box on which the window is still open
 git -C "$SRV" remote set-url origin "file://$ORIGIN"
+run converge site "$(sha)"
+check "converge never pins (the service user can reach it)" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'
+check "and says an admin must"         grep -q "an admin writes url=" "$T/out.txt"
 run origin site
-check "exit 0"                         [ "$(rc)" = 0 ]
+check "root's first-use pin: exit 0"   [ "$(rc)" = 0 ]
 check "pinned from the checkout"       grep -qx "url=file://$ORIGIN" "$HR/etc/site-deploy/origin/site"
 check "said PINNED"                    grep -q "PINNED the origin" "$T/out.txt"
 git -C "$SRV" remote set-url origin "file://$T/evil.git"
 run origin site
 check "later checkout URL ignored"     grep -qx "url=file://$ORIGIN" "$HR/etc/site-deploy/origin/site"
 check "and silent"                     [ ! -s "$T/out.txt" ]
-rm "$HR/etc/site-deploy/origin/site"; git -C "$SRV" remote set-url origin "ext::sh -c id"
+rm "$HR/etc/site-deploy/origin/site"
 run origin site
-check "a command transport is never pinned" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'
+check "the window stays closed: no re-pin from a changed checkout" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'
+check "said so"                        grep -q "window is closed" "$T/out.txt"
+git -C "$SRV" remote set-url origin "file://$ORIGIN"
+run origin site --admin
+check "an admin (install.sh) can pin"  grep -qx "url=file://$ORIGIN" "$HR/etc/site-deploy/origin/site"
+rm "$HR/etc/site-deploy/origin/site"
+for bad in "https://x-access-token:ghp_S3CRET@github.com/o/w.git" "https://tok@github.com/o/w.git" "ssh://git:pw@github.com/o/w.git" "ext::sh -c id"; do
+  git -C "$SRV" remote set-url origin "$bad"
+  run origin site --admin
+  check "never pinned: $bad"           bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'
+  check "and the secret never echoed"  bash -c '! grep -q S3CRET "'"$T"'/out.txt"'
+done
 mv "$T/origin-file.bak" "$HR/etc/site-deploy/origin/site"; git -C "$SRV" remote set-url origin "$ORIGIN"
 
 echo "18. a hook that reads /srv/<site> BY NAME still sees only the verified tree (private mount namespace)"

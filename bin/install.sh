@@ -24,14 +24,20 @@ id "$APP" >/dev/null 2>&1 || { echo "error: no service user '$APP'"; exit 1; }
 sudo chown -R root:root "$HERE"
 sudo chmod -R u=rwX,go=rX "$HERE"
 
-# 2. Converge the host: units, grants, journald, swap, packages, timers. This
+# 2. Pin the origin root fetches this app's code from (bin/site-tree.sh): an
+#    admin running this has just cloned /srv/$APP, so the checkout's URL is
+#    the right one to trust. Once pinned it is never re-read from the checkout.
+sudo "$HERE/bin/site-tree.sh" origin "$APP" --admin \
+  || echo "WARNING: no origin pinned for $APP; write url=<clone URL> to /etc/site-deploy/origin/$APP" >&2
+
+# 3. Converge the host: units, grants, journald, swap, packages, timers. This
 #    is also what every deploy tick runs, so "installed" and "converged" are
 #    one state. Its warnings about monitoring that is not wired up are the
 #    point, not noise.
 echo "converging host for $APP"
 sudo "$HERE/bin/host-converge.sh" "$APP"
 
-# 3. Does the box carry the config each app declares? Names only, never
+# 4. Does the box carry the config each app declares? Names only, never
 #    values. A rebuilt box that is missing half its env file serves 200s all
 #    day. Workspace mode (Phase D item 14): loop over every app this site
 #    hosts, checking EACH app's OWN /etc/<app>/* and required-env.txt against

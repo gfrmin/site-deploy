@@ -88,6 +88,26 @@ run_update
 check "exit 0"                    [ "$(rc)" = 0 ]
 check "now at v4"                 [ "$(cat "$SELF/VERSION")" = v4 ]
 
+echo "N. every tick asks site-tree.sh to pin each site checkout's origin (once; it keeps the window), and logs only news"
+HR="$T/hostroot"; mkdir -p "$HR/srv/site/.git" "$HR/srv/other" "$SELF/bin"
+ln -s "$HR/srv/site" "$HR/srv/linked-app"
+cat > "$SELF/bin/site-tree.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "ORIGIN $*" >> "$T_LOG"
+[ "$2" = site ] && [ ! -e "$T_LOG.pinned" ] && { : > "$T_LOG.pinned"; echo "site-tree[site]: PINNED the origin ..." >&2; }
+exit 0
+STUB
+chmod +x "$SELF/bin/site-tree.sh"
+export T_LOG="$T/origin.log"
+run_update HOST_ROOT="$HR" T_LOG="$T_LOG"
+check "asked for the site checkout"   grep -qx "ORIGIN origin site" "$T_LOG"
+check "not for a dir with no .git"    bash -c '! grep -q "ORIGIN origin other" "'"$T_LOG"'"'
+check "not for an app symlink"        bash -c '! grep -q "linked-app" "'"$T_LOG"'"'
+check "logged the PINNED line"        grep -q "PINNED" "$T/out.txt"
+run_update HOST_ROOT="$HR" T_LOG="$T_LOG"
+check "second tick: silent"           bash -c '! grep -q "PINNED" "'"$T"'/out.txt"'
+rm -f "$SELF/bin/site-tree.sh"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))

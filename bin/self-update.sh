@@ -36,6 +36,21 @@ log() { echo "site-deploy-update: $*"; }
 
 cd "$SELF" || { log "no toolkit checkout at $SELF"; exit 1; }
 
+# Pin each site's origin for root's verified tree (bin/site-tree.sh), ONCE: the
+# first tick of the toolkit version that has it, a moment the service user
+# cannot choose. After that site-tree.sh keeps the window closed and only an
+# admin writes a pin. Every tick, because it costs nothing once pinned; only a
+# PINNED line or a first refusal is logged, never "window closed" again.
+SRV_ROOT="${HOST_ROOT:-}/srv"
+if [ -x "$SELF/bin/site-tree.sh" ]; then
+  for d in "$SRV_ROOT"/*/; do
+    d=${d%/}; s=${d##*/}
+    { [ -L "$d" ] || [ "$s" = site-deploy ] || [ ! -d "$d/.git" ]; } && continue
+    out=$("$SELF/bin/site-tree.sh" origin "$s" 2>&1) && { [ -n "$out" ] && log "$out"; continue; }
+    case $out in *"window is closed"*) ;; *) log "$out" ;; esac
+  done
+fi
+
 # A transient fetch failure just retries next tick (exit 0, not failed) —
 # the same rule as auto-deploy.sh, for the same reason: a flapping network
 # must not turn into a red unit every two minutes.

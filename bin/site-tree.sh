@@ -14,8 +14,9 @@
 #                                              cf-converge): the converged `current`
 #                                              tree on a converging site, else a
 #                                              `tip` tree refreshed to master's head
-#   site-tree.sh origin <site>                 pin the origin URL if it is not yet
-#                                              (first use, from the checkout)
+#   site-tree.sh origin <site> [--admin]       pin the origin URL from the checkout:
+#                                              once, when this lands (self-update),
+#                                              or by an admin (install.sh)
 #
 # The service user's sudo grant (host-converge.sh) is `converge <site> *` and
 # nothing else; `pin`, `use`, `origin` and `path` are for root's own units.
@@ -51,7 +52,7 @@ STATE="$ROOT/var/lib/site-deploy-root"
 ORIGIN_DIR="$ROOT/etc/site-deploy/origin"
 PROTOCOLS="${SITE_TREE_PROTOCOLS:-https:ssh}"
 
-usage() { echo "usage: site-tree.sh pin <site> <sha> | path <site> [<app>] | converge <site> <sha> [<app>] | use <site> [<app>] | origin <site>" >&2; exit 2; }
+usage() { echo "usage: site-tree.sh pin <site> <sha> | path <site> [<app>] | converge <site> <sha> [<app>] | use <site> [<app>] | origin <site> [--admin]" >&2; exit 2; }
 name_ok() { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
 
 cmd=${1:-}; site=${2:-}
@@ -79,8 +80,12 @@ git_root() {
 # option to git), never a transport:: form (ext:: runs a command), no
 # whitespace. file:// only when the protocol list allows it (tests).
 url_ok() {   # <url>
-  local u=$1
+  local u=$1 auth
   [[ $u =~ [[:space:]] || $u == *::* || -z $u ]] && return 1
+  # No credentials in the URL: the pin is a world-readable file and is logged.
+  # https takes none at all (a user part there is a token); ssh a user only.
+  auth=${u#*://}; auth=${auth%%/*}
+  case $u in https://*) [[ $auth == *@* ]] && return 1 ;; ssh://*) [[ ${auth%@*} == *:* && $auth == *@* ]] && return 1 ;; esac
   case $u in
     https://*|ssh://*) return 0 ;;
     file://*) [[ :$PROTOCOLS: == *:file:* ]] ;;
@@ -88,29 +93,44 @@ url_ok() {   # <url>
   esac
 }
 
-# The pinned origin. Written ONCE, from the checkout's remote.origin.url, the
-# first time anything needs it (trust on first use, at the moment an admin
-# would otherwise hand-write it, and said loudly so it can be checked); never
-# re-read from the checkout after that. `git config --file` honours no include
-# and runs nothing.
+# The pinned origin, which root alone writes. Never taken from the checkout
+# here: this runs under the service user's `converge` grant, and a first-use
+# pin reachable from there would let whoever controls the checkout choose the
+# URL (and so the code root runs). See `origin` below for how it gets written.
 read_origin() {
-  local f="$ORIGIN_DIR/$site" url tmp
-  if [ ! -r "$f" ]; then
-    url=$(env -i PATH=/usr/local/bin:/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-            git config --file "$ROOT/srv/$site/.git/config" --get remote.origin.url 2>/dev/null || true)
-    url_ok "$url" || refuse "no pinned origin at $f, and the checkout's remote.origin.url $(printf '%q' "$url") is not an https or ssh URL; write url=<clone URL> (and key=<ssh identity> for a private repo) there"
-    tmp=$(mktemp) && printf 'url=%s\n' "$url" > "$tmp" \
-      && install -d -m0755 "$ORIGIN_DIR" && install -m0644 "$tmp" "$f" \
-      || { rm -f "$tmp"; refuse "could not write $f"; }
-    rm -f "$tmp"
-    say "PINNED the origin root fetches $site from: $url (first use, taken from the checkout; check it in $f)" >&2
-  fi
+  local f="$ORIGIN_DIR/$site"
+  [ -r "$f" ] || refuse "no pinned origin at $f; an admin writes url=<clone URL> there (install.sh does it), plus key=<ssh identity> for a private repo over ssh"
   URL=$(sed -n 's/^url=//p' "$f" | tail -1)
   KEY=$(sed -n 's/^key=//p' "$f" | tail -1)
-  url_ok "$URL" || refuse "pinned url $(printf '%q' "$URL") in $f is not an https, ssh or user@host:path URL; refusing"
+  url_ok "$URL" || refuse "pinned url in $f is not a credential-free https, ssh or user@host:path URL; refusing"
   if [ -n "$KEY" ] && ! [[ $KEY =~ ^/[A-Za-z0-9._/-]+$ ]]; then
     refuse "pinned key=$(printf '%q' "$KEY") is not an absolute path; refusing"
   fi
+}
+
+# `origin <site> [--admin]`: write the pin from the checkout's remote.origin.url
+# (read with `git config --file`, which honours no include and runs nothing).
+# Never granted to the service user. Without --admin it is a ONE-TIME window:
+# the first attempt, made by root's own self-update when this toolkit version
+# lands (a moment the service user cannot choose), closes it whether it pinned
+# or not, so a checkout URL changed later can never be pinned by waiting.
+# --admin is install.sh, run by a person who just cloned the checkout.
+pin_origin() {   # [--admin]
+  local f="$ORIGIN_DIR/$site" done="$STATE/origin-window/$site" url tmp
+  [ -r "$f" ] && return 0
+  if [ "${1:-}" != --admin ] && [ -e "$done" ]; then
+    refuse "no pinned origin at $f, and the first-use window is closed; an admin writes url=<clone URL> there"
+  fi
+  mkdir -p "$STATE/origin-window" && : > "$done"
+  url=$(env -i PATH=/usr/local/bin:/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+          git config --file "$ROOT/srv/$site/.git/config" --get remote.origin.url 2>/dev/null || true)
+  url_ok "$url" || refuse "cannot pin an origin for $site: the checkout's remote.origin.url is not a credential-free https or ssh URL; an admin writes url=<clone URL> to $f"
+  tmp=$(mktemp) && printf 'url=%s\n' "$url" > "$tmp" \
+    && install -d -m0755 "$ORIGIN_DIR" && install -m0644 "$tmp" "$f" \
+    || { rm -f "$tmp"; refuse "could not write $f"; }
+  rm -f "$tmp"
+  say "PINNED the origin root fetches $site from: $url (taken from the checkout; check it in $f)" >&2
+  case $url in https://*) ;; *) say "WARNING $url is ssh: unless the repo is readable anonymously, add key=<ssh identity readable by root> to $f" >&2 ;; esac
 }
 
 on_master() {   # <sha>
@@ -232,8 +252,8 @@ case $cmd in
     [ -L "$TREES/current" ] && [ -d "$TREES/current/" ] || refuse "no verified tree yet (nothing pinned)"
     if [ -n "$app" ]; then app_dir_in "$TREES/current" "$app"; else printf '%s\n' "$TREES/current"; fi ;;
   origin)
-    [ $# -eq 2 ] || usage
-    read_origin ;;
+    [ $# -eq 2 ] || { [ $# -eq 3 ] && [ "$3" = --admin ]; } || usage
+    pin_origin "${3:-}" ;;
   use)
     [ $# -eq 2 ] || [ $# -eq 3 ] || usage
     app=${3:-}

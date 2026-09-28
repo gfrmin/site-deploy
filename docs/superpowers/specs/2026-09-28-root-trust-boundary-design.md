@@ -25,13 +25,16 @@ the attacker can commit to, and `remote.origin.url`/`refs/remotes` are theirs to
 content.
 
 - **Pinned origin.** `/etc/site-deploy/origin/<site>` (root, 0644) holds
-  `url=<clone URL>` and optionally `key=<ssh identity path>`. If absent,
-  `site-tree.sh` writes it **once** (whichever root caller needs it first;
-  `host-converge` asks every tick so the line lands in the deploy log) from the checkout's
-  `remote.origin.url` (read with `git config --file`, which runs nothing),
-  saying so loudly: trust on first use at the moment this ships, the same
-  moment an admin would otherwise have to hand-write it. After that it is
-  never re-read from the checkout; changing it is an admin act.
+  `url=<clone URL>` and optionally `key=<ssh identity path>`. It is taken from
+  the checkout's `remote.origin.url` (read with `git config --file`, which runs
+  nothing) only at moments the service user cannot choose: `install.sh
+  --admin`, and ONE first-use window per site, opened by root's self-update
+  timer on the first tick of this toolkit version and closed by that attempt
+  whether it pinned or not. `site-tree.sh origin` is never granted to the
+  service user, and nothing it can invoke (`converge`, `host-converge`,
+  `cf-converge@`) ever pins: a pin reachable from there would let whoever owns
+  the checkout choose the URL, and so the code root runs. A URL with
+  credentials in it is refused (the pin is world-readable and logged).
 - **Root mirror.** `/var/lib/site-deploy-root/mirror/<site>.git`, bare, root-owned
   0700. Fetched by root from the pinned URL only, with a hermetic transport:
   `GIT_CONFIG_NOSYSTEM=1`, `HOME` pointed at a root-owned dir,
@@ -118,7 +121,8 @@ content.
 - Known fleet: webbsite is a public https repo, so root fetches with no
   credentials.
 - Residual risk, stated: if an attacker already controls the service user at
-  the moment this ships, TOFU pins their URL. The pinned file is one line an
+  the moment this ships (the self-update tick that opens the window), the
+  first-use pin takes their URL. The pinned file is one line an
   admin can check. Likewise the very first pin (no `current` yet) accepts any
   master commit, so one old hook could run once at that moment; every pin
   after it is forward-only.

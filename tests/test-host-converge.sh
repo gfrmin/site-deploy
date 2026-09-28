@@ -449,24 +449,20 @@ check "no direct engine grant"          bash -c '! grep -q "bin/converge.sh" "$H
 check "no pin grant (root's own units pin)" bash -c '! grep -q "site-tree.sh pin" "$HR/etc/sudoers.d/app-deploy"'
 check "converge through root's tree"    grep -qF "/srv/site-deploy/bin/site-tree.sh converge app *" "$HR/etc/sudoers.d/app-deploy"
 
-echo "24. the origin root fetches from is pinned ONCE from the checkout, then never re-read"
+echo "24. host-converge never pins the origin (the service user can run it); it says when a site that needs one has none"
 mkdir -p "$HR/srv/app/.git"
 printf '[remote "origin"]\n\turl = https://git.example/app.git\n' > "$HR/srv/app/.git/config"
-reset_log; run
-check "pinned"                          grep -qx "url=https://git.example/app.git" "$HR/etc/site-deploy/origin/app"
-check "said so, loudly"                 grep -q "PINNED the origin" "$T/out.txt"
-printf '[remote "origin"]\n\turl = https://evil.example/x.git\n' > "$HR/srv/app/.git/config"
-reset_log; run
-check "a later checkout URL changes nothing" grep -qx "url=https://git.example/app.git" "$HR/etc/site-deploy/origin/app"
-check "and is silent"                   bash -c '! grep -q "PINNED\|origin" "$T/out.txt"'
-rm -f "$HR/etc/site-deploy/origin/app"
-printf '[remote "origin"]\n\turl = ext::sh -c id\n' > "$HR/srv/app/.git/config"
-reset_log; run
-check "a command transport is never pinned" [ ! -e "$HR/etc/site-deploy/origin/app" ]
 printf '[deploy]\nconverge = true\n' > "$HR/srv/app/deploy/site.toml"
 reset_log; run
-check "and a site that needs the tree is told it WILL REFUSE" grep -q "WILL REFUSE" "$T/out.txt"
-rm -rf "$HR/srv/app/.git"; : > "$HR/srv/app/deploy/site.toml"
+check "never wrote a pin"               [ ! -e "$HR/etc/site-deploy/origin/app" ]
+check "said WILL REFUSE"                grep -q "no pinned origin.*WILL REFUSE" "$T/out.txt"
+mkdir -p "$HR/etc/site-deploy/origin"; printf 'url=git@github.com:o/app.git\n' > "$HR/etc/site-deploy/origin/app"
+reset_log; run
+check "ssh pin without key= is nagged"  grep -q "ssh URL with no key=" "$T/out.txt"
+printf 'url=https://git.example/app.git\n' > "$HR/etc/site-deploy/origin/app"
+reset_log; run
+check "an https pin: no origin nag"     bash -c '! grep -q "WILL REFUSE" "$T/out.txt"'
+rm -rf "$HR/srv/app/.git" "$HR/etc/site-deploy/origin"; : > "$HR/srv/app/deploy/site.toml"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
