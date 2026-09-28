@@ -50,6 +50,13 @@ run_case "a paused check is a violation" 1 1 "{\"checks\":[$up,$paused]}" "PAUSE
 run_case "a firing check is armed, not a violation" 0 1 "{\"checks\":[$up,$down]}" "currently firing"
 run_case "a stale simple-period check is a violation" 1 1 "{\"checks\":[$stale]}" "past its"
 run_case "a never-pinged check is reported as such, not as stale" 1 1 "{\"checks\":[$never]}" "never been pinged"
+# A first run in progress (started, never pinged) is not a violation: on a
+# fresh install that is this script's own check, which it has just /start-ed.
+first='{"name":"armed","status":"new","started":true,"timeout":86400,"grace":3600,"last_ping":null}'
+first_down='{"name":"hung","status":"down","started":true,"timeout":86400,"grace":3600,"last_ping":null}'
+run_case "a started never-pinged check is a first run, not a violation" 0 1 "{\"checks\":[$up,$first]}" "on a first run: armed"
+run_case "a first run that hung past grace is reported as firing" 0 1 "{\"checks\":[$up,$first_down]}" "currently firing: hung"
+run_case "never pinged and NOT started is still a violation" 1 1 "{\"checks\":[$up,$first,$never]}" "f: has never been pinged"
 run_case "a cron-scheduled check is not judged for staleness" 0 1 "{\"checks\":[$cron]}" "all armed"
 run_case "the happy path passes" 0 2 "{\"checks\":[$up,$cron]}" "all armed"
 
@@ -113,6 +120,11 @@ check "API unreachable: exit 1, /fail"      bash -c '[ "$(cat "$T/rc.txt")" = 1 
 
 : > "$STUB_LOG"; run_sh HEALTHCHECKS_API_URL=https://hc.example/api/v3 HEALTHCHECKS_API_KEY=k
 check "no sweep tag: exit 0, says so"       bash -c '[ "$(cat "$T/rc.txt")" = 0 ] && grep -qi "SWEEP_TAG" "$T/out.txt"'
+
+# The first run of a fresh install: /start goes out BEFORE the sweep is read,
+# so the API can report this run's own check as started.
+: > "$STUB_LOG"; run_sh HEALTHCHECKS_API_URL=https://hc.example/api/v3 HEALTHCHECKS_API_KEY=k HEALTHCHECKS_SWEEP_TAG=fleet HEALTHCHECKS_ARMED_URL=https://hc.example/armed STUB_API_BODY="$ok_body"
+check "sent /start before reading the API"  bash -c 'grep -n . "$STUB_LOG" | grep -m1 -E "armed/start|tag=fleet" | grep -q armed/start'
 
 echo "── probe_external, end to end ──"
 HC_ENV=(HEALTHCHECKS_API_URL=https://hc.example/api/v3 HEALTHCHECKS_API_KEY=k HEALTHCHECKS_SWEEP_TAG=fleet HEALTHCHECKS_ARMED_URL=https://hc.example/armed)
