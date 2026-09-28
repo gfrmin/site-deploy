@@ -319,6 +319,10 @@ reset_log; run_ws
 check "exit 0"                       [ "$(rc)" = 0 ]
 check "installed libbaronly1"        called "apt-get install"
 check "named it"                     grep -q libbaronly1 "$T/out.txt"
+printf '[deploy]\nreload = "reload"\nbuild_service = "site-build@bar.service"\nbackup_timeout = "2h"\n' > "$HR/srv/site/apps/bar/deploy/site.toml"
+reset_log; run_ws
+check "bar's backup_timeout: its own drop-in" grep -qx "TimeoutStartSec=2h" "$HR/etc/systemd/system/site-backup@bar.service.d/timeout.conf"
+check "foo gets none"                [ ! -e "$HR/etc/systemd/system/site-backup@foo.service.d/timeout.conf" ]
 
 echo "19. bar leaves the fleet: its symlink and armed timers are pruned"
 printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
@@ -327,6 +331,7 @@ reset_log; run_ws
 check "exit 0"                       [ "$(rc)" = 0 ]
 check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
 check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
+check "bar's backup timeout drop-in removed" [ ! -e "$HR/etc/systemd/system/site-backup@bar.service.d" ]
 check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
 
 echo "19a. a site claiming ANOTHER app's name (or a system service's) gets no grant, drop-in or dir for it"
@@ -463,6 +468,36 @@ printf 'url=https://git.example/app.git\n' > "$HR/etc/site-deploy/origin/app"
 reset_log; run
 check "an https pin: no origin nag"     bash -c '! grep -q "WILL REFUSE" "$T/out.txt"'
 rm -rf "$HR/srv/app/.git" "$HR/etc/site-deploy/origin"; : > "$HR/srv/app/deploy/site.toml"
+
+echo "25. backup_timeout (issue #42): a per-app TimeoutStartSec drop-in for site-backup@, strictly validated"
+dropin="$HR/etc/systemd/system/site-backup@app.service.d/timeout.conf"
+reset_log; run
+check "no knob: no drop-in"             [ ! -e "$dropin" ]
+printf '[deploy]\nbackup_timeout = "2h"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "drop-in carries the timeout"     grep -qx "TimeoutStartSec=2h" "$dropin"
+check "daemon-reloaded"                 called "daemon-reload"
+reset_log; run
+check "idempotent"                      not_called "daemon-reload"
+printf '[deploy]\nbackup_timeout = "90min"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "minutes are accepted"            grep -qx "TimeoutStartSec=90min" "$dropin"
+for bad in 24h 1381min 0h 0min 90 1d 2h30min "2h\nExecStartPre=/bin/evil" "infinity" " 2h"; do
+  printf '[deploy]\nbackup_timeout = "%s"\n' "$bad" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "refused $(printf %q "$bad"): exit 1"   [ "$(rc)" = 1 ]
+  check "refused $(printf %q "$bad"): said so"  grep -q "REFUSED backup_timeout" "$T/out.txt"
+  check "refused $(printf %q "$bad"): last good value kept" grep -qx "TimeoutStartSec=90min" "$dropin"
+done
+check "never an injected directive"     bash -c '! grep -q ExecStartPre "$1"' _ "$dropin"
+printf '[deploy]\nbackup_timeout = "23h"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "23h (the cap) is accepted"       grep -qx "TimeoutStartSec=23h" "$dropin"
+: > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "knob removed: drop-in removed"   [ ! -e "$HR/etc/systemd/system/site-backup@app.service.d" ]
+check "and daemon-reloaded"             called "daemon-reload"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

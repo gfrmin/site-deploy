@@ -21,8 +21,10 @@ ExecStart=/srv/site-deploy/bin/backup.sh %i
 # bin/hc-unit-result.sh). This catches the script being killed before its
 # own EXIT trap — TimeoutStartSec, OOM.
 ExecStopPost=-/srv/site-deploy/bin/hc-unit-result.sh backup
-# A large runtime database, encrypted and uploaded, then downloaded again for
-# the round-trip check: generous, and still well inside the daily cadence.
+# A runtime database, encrypted and uploaded, then downloaded again for the
+# round-trip check. The default for an ordinary app; one whose producer
+# cannot fit sets `backup_timeout` in its site.toml, which host-converge
+# renders into site-backup@<app>.service.d/timeout.conf (issue #42).
 TimeoutStartSec=20min
 Nice=19
 # First out under memory pressure: nothing here is latency-critical and the
