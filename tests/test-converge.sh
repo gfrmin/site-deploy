@@ -75,7 +75,7 @@ reset_log() { : > "$STUB_LOG"; }
 called() { grep -qF -e "$1" "$STUB_LOG"; }
 not_called() { ! grep -qF -e "$1" "$STUB_LOG"; }
 site_toml() { printf '%s\n' "$@" > "$HR/srv/app/deploy/site.toml"; }
-run() { env HOST_ROOT="$HR" "$@" bash "$ROOT/bin/converge.sh" app > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
+run() { env HOST_ROOT="$HR" AS_SITE_USER= "$@" bash "$ROOT/bin/converge.sh" app > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
 rc() { cat "$T/rc.txt"; }
 
 echo "1. no deploy/site.toml: no-op, exit 0"
@@ -273,7 +273,7 @@ printf '[hosts."thehost"]\napps = ["foo2", "bar2"]\n' > "$HR/srv/site2/deploy/fl
 printf '[deploy]\nreload = "reload"\n' > "$HR/srv/site2/apps/foo2/deploy/site.toml"
 printf '[deploy]\nreload = "reload"\nservice = "site2@custom-bar2.service"\n' > "$HR/srv/site2/apps/bar2/deploy/site.toml"
 printf 'template v1\n' > "$HR/srv/site2/deploy/site2-app.service"
-run2() { env HOST_ROOT="$HR" BOX_HOSTNAME=thehost bash "$ROOT/bin/converge.sh" site2 > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
+run2() { env HOST_ROOT="$HR" AS_SITE_USER= BOX_HOSTNAME=thehost bash "$ROOT/bin/converge.sh" site2 > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
 
 echo "20. a template unit's restart queues one marker per hosted app that instantiates it"
 cat > "$HR/srv/site2/deploy/site.toml" <<'TOML'
@@ -313,6 +313,21 @@ check "bar2 NOT queued (its service does not instantiate site2@)" \
       [ ! -e "$HR/var/lib/site-deploy/site2/pending/bar2" ]
 rm -f "$HR/var/lib/site-deploy/site2/pending/foo2"
 printf '[deploy]\nreload = "reload"\nservice = "site2@custom-bar2.service"\n' > "$HR/srv/site2/apps/bar2/deploy/site.toml"
+
+echo "22b. --tree: the queue reads the app list from ROOT's tree, never the checkout, and allow-lists names"
+TREE2="$T/tree-site2"; rm -rf "$TREE2"; cp -a "$HR/srv/site2" "$TREE2"
+echo "template v3" >> "$TREE2/deploy/site2-app.service"
+printf '[hosts."thehost"]\napps = ["bar2", "../../../../pwned-by-checkout"]\n' > "$HR/srv/site2/deploy/fleet.toml"   # the checkout lies
+printf '[hosts."thehost"]\napps = ["foo2", "../../../../pwned-by-tree"]\n' > "$TREE2/deploy/fleet.toml"
+reset_log
+env HOST_ROOT="$HR" AS_SITE_USER= BOX_HOSTNAME=thehost SITE_TREE="$TREE2" bash "$ROOT/bin/converge.sh" site2 --tree "$TREE2" > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"
+check "foo2 queued from the tree"          [ "$(cat "$HR/var/lib/site-deploy/site2/pending/foo2")" = restart ]
+check "bar2 (only the checkout lists it) not" [ ! -e "$HR/var/lib/site-deploy/site2/pending/bar2" ]
+check "the tree's bad name refused"        grep -q "refusing hosted app name" "$T/out.txt"
+check "nothing written outside the queue"  bash -c '! find "$HR" "$T" -name "pwned-by-*" | grep -q .'
+check "exit 1 (counted)"                   [ "$(rc)" = 1 ]
+rm -f "$HR/var/lib/site-deploy/site2/pending/foo2"; rm -rf "$TREE2"
+printf '[hosts."thehost"]\napps = ["foo2", "bar2"]\n' > "$HR/srv/site2/deploy/fleet.toml"
 
 echo "23. apply = \"reload\" on a template is refused by converge-config.py, never attempted"
 cat > "$HR/srv/site2/deploy/site.toml" <<'TOML'

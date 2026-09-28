@@ -51,6 +51,7 @@ jobs:
           ./tests/test-fleet-config.sh
           ./tests/test-workspace.sh
           ./tests/test-site-config.sh
+          ./tests/test-site-tree.sh
 
   # Advance `ci-green` to this commit once the suite is green on master. The
   # boxes track that ref (bin/self-update.sh), so a red run here means the
