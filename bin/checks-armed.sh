@@ -37,6 +37,21 @@
 # own check paused, pings /fail (discarded, as expected) and exits 1, so
 # `systemctl --failed` carries it.
 #
+# A first run IN PROGRESS is not "never pinged". On a fresh install this
+# script's own check is brand new BECAUSE this is its first run, and failing
+# on that sent one spurious down alert per install (its /fail then counts as a
+# ping, so run two passed). So each run sends /start before it reads the API:
+# healthchecks records a start without touching last_ping (hc/api/models.py,
+# "Don't update last_ping"), and reports it as `started: true`. A check that
+# has never pinged but is started is a job on its first run, this one or any
+# other, and is listed as information, but only while that start is its ONE
+# ping ever (n_pings == 1). A job that sends only /start, run after run (a
+# wrong success URL, or killed before it can report), keeps last_start fresh
+# and would otherwise never go down. No URL-to-check matching is needed,
+# which a read-only key could not do anyway (it gets no ping_url). If that
+# first run never finishes, healthchecks turns the start into `down` after
+# the grace period, which is the alarm firing.
+#
 # Composition, because these three are easy to conflate:
 #   * a canary        — can the instance still ALERT?     (instance-wide)
 #   * this script     — is each alarm ARMED?              (per-check)
@@ -81,6 +96,9 @@ if [ -z "$sweep_tag" ]; then
   echo "$tag: HEALTHCHECKS_SWEEP_TAG unset (which checks are this fleet's?); ALARMS ARE UNVERIFIED" >&2
   exit 0
 fi
+
+# Before the read, so this run's own check shows as started: see the header.
+hc_ping "$hurl" /start "$tag: sweeping tag=$sweep_tag"
 
 # -f so a 401/403/404 becomes a curl error rather than a body we might parse
 # as an empty check list — assertion 1's trap, closed one layer earlier.
@@ -149,6 +167,7 @@ if required:
 
 now = datetime.now(timezone.utc)
 firing = []
+first_run = []
 for c in sorted(checks, key=lambda x: x.get("name", "")):
     name = c.get("name", "?")
     if c.get("status") == "paused":
@@ -163,6 +182,9 @@ for c in sorted(checks, key=lambda x: x.get("name", "")):
         # apostrophes anywhere in this block: it is shell single-quoted.)
         continue
     if not last:
+        if c.get("started") and c.get("n_pings") == 1:
+            first_run.append(name)   # a first run in progress; see the header
+            continue
         problems.append(f"{name}: has never been pinged")
         continue
     age = (now - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds()
@@ -175,6 +197,9 @@ for c in sorted(checks, key=lambda x: x.get("name", "")):
 
 joined = ", ".join(firing)
 note = f" ({len(firing)} currently firing: {joined})" if firing else ""
+if first_run:
+    starting = ", ".join(first_run)
+    note += f" ({len(first_run)} on a first run: {starting})"
 if problems:
     print("; ".join(problems) + note)
     sys.exit(1)
