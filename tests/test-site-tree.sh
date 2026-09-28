@@ -258,7 +258,7 @@ git -C "$SRV" remote set-url origin "file://$ORIGIN"
 run origin site --admin
 check "an admin (install.sh) can pin"  grep -qx "url=file://$ORIGIN" "$HR/etc/site-deploy/origin/site"
 rm "$HR/etc/site-deploy/origin/site"
-for bad in "https://x-access-token:ghp_S3CRET@github.com/o/w.git" "https://tok@github.com/o/w.git" "ssh://git:pw@github.com/o/w.git" "ext::sh -c id"; do
+for bad in "https://github.com/o/w.git?access_token=S3CRET" "https://x-access-token:ghp_S3CRET@github.com/o/w.git" "https://tok@github.com/o/w.git" "ssh://git:pw@github.com/o/w.git" "ext::sh -c id"; do
   git -C "$SRV" remote set-url origin "$bad"
   run origin site --admin
   check "never pinned: $bad"           bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'

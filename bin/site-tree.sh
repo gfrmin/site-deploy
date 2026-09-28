@@ -81,7 +81,7 @@ git_root() {
 # whitespace. file:// only when the protocol list allows it (tests).
 url_ok() {   # <url>
   local u=$1 auth
-  [[ $u =~ [[:space:]] || $u == *::* || -z $u ]] && return 1
+  [[ $u =~ [[:space:]] || $u == *::* || $u == *[?#]* || -z $u ]] && return 1   # ?/# can carry a token
   # No credentials in the URL: the pin is a world-readable file and is logged.
   # https takes none at all (a user part there is a token); ssh a user only.
   auth=${u#*://}; auth=${auth%%/*}

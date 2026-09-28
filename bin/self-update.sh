@@ -41,11 +41,14 @@ cd "$SELF" || { log "no toolkit checkout at $SELF"; exit 1; }
 # cannot choose. After that site-tree.sh keeps the window closed and only an
 # admin writes a pin. Every tick, because it costs nothing once pinned; only a
 # PINNED line or a first refusal is logged, never "window closed" again.
+# A site is a /srv/<name> with an admin-created /etc/<name>: NOT "has a .git",
+# which its owner controls (hiding .git would hold the window open until they
+# chose to reveal it). The attempt is made, and the window closed, either way.
 SRV_ROOT="${HOST_ROOT:-}/srv"
 if [ -x "$SELF/bin/site-tree.sh" ]; then
   for d in "$SRV_ROOT"/*/; do
     d=${d%/}; s=${d##*/}
-    { [ -L "$d" ] || [ "$s" = site-deploy ] || [ ! -d "$d/.git" ]; } && continue
+    { [ -L "$d" ] || [ "$s" = site-deploy ] || ! [[ $s =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || [ ! -d "${HOST_ROOT:-}/etc/$s" ]; } && continue
     out=$("$SELF/bin/site-tree.sh" origin "$s" 2>&1) && { [ -n "$out" ] && log "$out"; continue; }
     case $out in *"window is closed"*) ;; *) log "$out" ;; esac
   done
