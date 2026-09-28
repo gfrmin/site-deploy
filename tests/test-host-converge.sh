@@ -320,11 +320,77 @@ check "named it"                     grep -q libbaronly1 "$T/out.txt"
 
 echo "19. bar leaves the fleet: its symlink and armed timers are pruned"
 printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
+
 reset_log; run_ws
 check "exit 0"                       [ "$(rc)" = 0 ]
 check "bar's symlink removed"        [ ! -e "$HR/srv/bar" ]
 check "said so"                      grep -q "bar: removed /srv/bar" "$T/out.txt"
 check "foo's symlink untouched"      [ -L "$HR/srv/foo" ]
+
+echo "19a. a site claiming ANOTHER app's name (or a system service's) gets no grant, drop-in or dir for it"
+mkdir -p "$HR/srv/victim"                                   # another site's checkout on the same box
+ln -s "$HR/srv/othersite/apps/victim2" "$HR/srv/victim2"     # another site's WORKSPACE app
+printf '[hosts."the-host"]\napps = ["foo", "victim", "victim2", "sshd"]\n' > "$HR/srv/site/deploy/fleet.toml"
+mkdir -p "$HR/srv/site/apps/victim/deploy" "$HR/srv/site/apps/sshd/deploy"
+printf '[deploy]\nbuild_service = "site-build@victim.service"\n' > "$HR/srv/site/apps/victim/deploy/site.toml"
+printf '[deploy]\nservice = "sshd.service"\n' > "$HR/srv/site/apps/sshd/deploy/site.toml"
+reset_log; run_ws
+check "exit 1"                           [ "$(rc)" = 1 ]
+check "named the collision"              grep -q "victim: .*name collision" "$T/out.txt"
+check "no grant over victim's units"     bash -c '! grep -q "victim" "$HR/etc/sudoers.d/site-deploy"'
+check "no drop-in re-pointing victim's probe" [ ! -e "$HR/etc/systemd/system/site-probe@victim.service.d/site-deploy.conf" ]
+check "nor victim2's (symlinked elsewhere)" [ ! -e "$HR/etc/systemd/system/site-probe@victim2.service.d/site-deploy.conf" ]
+check "an app named sshd gets no sshd.service grant" bash -c '! grep -qE "(reload|restart) sshd(\.service)?(,|$)" "$HR/etc/sudoers.d/site-deploy"'
+check "said REFUSED for it"              grep -q "sshd: REFUSED to grant reload/restart of sshd.service" "$T/out.txt"
+check "foo still granted"                grep -q "reload site@foo.service" "$HR/etc/sudoers.d/site-deploy"
+cp "$HR/srv/site/apps/foo/deploy/site.toml" "$T/foo-site.toml.bak"
+printf '[deploy]\nreload = "reload"\nbuild_service = "site-backup@victim.service"\n' > "$HR/srv/site/apps/foo/deploy/site.toml"
+reset_log; run_ws
+check "a toolkit template instance is never granted, even when the site's name prefixes it" \
+  bash -c '! grep -q "site-backup@victim" "$HR/etc/sudoers.d/site-deploy"'
+cp "$T/foo-site.toml.bak" "$HR/srv/site/apps/foo/deploy/site.toml"
+mkdir -p "$HR/srv/blog"                                      # another single-app site on the box
+printf '[hosts."the-host"]\napps = ["foo", "blog-build", "site-extra"]\n' > "$HR/srv/site/deploy/fleet.toml"
+mkdir -p "$HR/srv/site/apps/blog-build/deploy" "$HR/srv/site/apps/site-extra/deploy"
+reset_log; run_ws
+check "an app name extending another site's is refused" grep -q "REFUSED hosted app name blog-build: it extends /srv/blog" "$T/out.txt"
+check "and never squats /srv"            [ ! -e "$HR/srv/blog-build" ]
+check "extending this site's own name is fine" [ -L "$HR/srv/site-extra" ]
+rm -rf "$HR/srv/blog" "$HR/srv/site-extra" "$HR/srv/site/apps/blog-build" "$HR/srv/site/apps/site-extra" "$HR/var/lib/site-extra"
+# Siblings: shop and shop-api both ours -- stable on every tick, not just the first.
+printf '[hosts."the-host"]\napps = ["foo", "shop", "shop-api"]\n' > "$HR/srv/site/deploy/fleet.toml"
+mkdir -p "$HR/srv/site/apps/shop/deploy" "$HR/srv/site/apps/shop-api/deploy"
+reset_log; run_ws; reset_log; run_ws
+check "siblings shop/shop-api: tick 2 exit 0" [ "$(rc)" = 0 ]
+check "shop-api still linked on tick 2"      [ -L "$HR/srv/shop-api" ]
+# Reverse: another site's NEW /srv/shop cannot take our existing shop-api away.
+rm "$HR/srv/shop"; mkdir -p "$HR/srv/shop"
+printf '[hosts."the-host"]\napps = ["foo", "shop-api"]\n' > "$HR/srv/site/deploy/fleet.toml"
+reset_log; run_ws
+check "an existing app survives a new /srv prefix" [ -L "$HR/srv/shop-api" ]
+check "and is not refused"                   bash -c '! grep -q "REFUSED hosted app name shop-api" "$T/out.txt"'
+rm -rf "$HR/srv/shop" "$HR/srv/shop-api" "$HR/srv/site/apps/shop" "$HR/srv/site/apps/shop-api" "$HR/var/lib/shop" "$HR/var/lib/shop-api"
+printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
+rm -rf "$HR/srv/victim" "$HR/srv/victim2" "$HR/srv/sshd" "$HR/srv/site/apps/victim" "$HR/srv/site/apps/sshd" "$HR/var/lib/sshd"
+printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
+reset_log; run_ws
+
+echo "19b. an apps_dir that climbs out of the site is refused"
+cp "$HR/srv/site/deploy/site.toml" "$T/ws-site.toml.bak"
+printf '[workspace]\napps_dir = "../../etc"\n' > "$HR/srv/site/deploy/site.toml"
+reset_log; run_ws
+check "exit 1"                       [ "$(rc)" = 1 ]
+check "said REFUSED apps_dir"        grep -q "REFUSED \[workspace\] apps_dir" "$T/out.txt"
+cp "$T/ws-site.toml.bak" "$HR/srv/site/deploy/site.toml"
+
+echo "19c. a hosted app name that is not a plain name is refused, never used as a path"
+printf '[hosts."the-host"]\napps = ["foo", "../../etc/evil"]\n' > "$HR/srv/site/deploy/fleet.toml"
+reset_log; run_ws
+check "exit 1"                       [ "$(rc)" = 1 ]
+check "said REFUSED"                 grep -q "REFUSED hosted app name" "$T/out.txt"
+check "no path escape"               bash -c '[ ! -e "$HR/etc/evil" ] && ! ls -d "$HR"/srv/*evil* >/dev/null 2>&1'
+check "foo still converged"          [ -L "$HR/srv/foo" ]
+printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
 
 echo "20. probe_external (issue #24): the on-box probe is disarmed, not nagged UNPROBED"
 printf '[deploy]\nreload = "reload"\nprobe_external = "foo.example-probe"\n' > "$HR/srv/site/apps/foo/deploy/site.toml"
@@ -340,6 +406,40 @@ printf 'HEALTHCHECKS_API_KEY=k\nHEALTHCHECKS_SWEEP_TAG=fleet\n' > "$HR/etc/foo/o
 reset_log; run_ws
 check "with the sweep armed: no foo probe nag at all" bash -c '! grep -qE "foo: .*(UNPROBED|UNVERIFIED|ignored)" "$T/out.txt"'
 check "foo's sweep armed"            [ -e "$STUB_UNITS/site-checks-armed@foo.timer.enabled" ]
+
+echo "21. declarations are untrusted: an injected unit name never reaches sudoers (issue #31)"
+cp "$HR/srv/app/deploy/site.toml" "$T/site.toml.bak" 2>/dev/null || : > "$T/site.toml.bak"
+printf '[deploy]\nservice = "app.service, /bin/bash"\nbuild_service = "x.service,/usr/bin/env"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "exit 1 (counted failure)"        [ "$(rc)" = 1 ]
+check "said REFUSED"                    grep -q "REFUSED to grant reload/restart" "$T/out.txt"
+check "build unit refused too"          grep -q "REFUSED to grant start of build unit" "$T/out.txt"
+check "no shell in sudoers"             bash -c '! grep -qE "/bin/bash|/usr/bin/env" "$HR/etc/sudoers.d/app-deploy"'
+check "refusal text not in sudoers"     bash -c '! grep -q REFUSED "$HR/etc/sudoers.d/app-deploy"'
+check "the safe grants still written"   grep -q "host-converge.sh app" "$HR/etc/sudoers.d/app-deploy"
+mkdir -p "$HR/srv/app-staging"                              # another site whose name extends this one's
+for bad in reboot.target sshd sshd.service poweroff site-backup@victim.service site-backup@app.service cf-drift@app a:b other.service app-staging.service app-staging-build.service; do
+  printf '[deploy]\nbuild_service = "%s"\n' "$bad" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "well-formed but not ours: $bad refused" bash -c '[ "$(cat "$T/rc.txt")" = 1 ] && ! grep -qF -- "'"$bad"'" "$HR/etc/sudoers.d/app-deploy"'
+done
+for good in app app.service app-build.service app@x.service site-build@app.service; do
+  printf '[deploy]\nbuild_service = "%s"\n' "$good" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "ours: $good granted" grep -qF -- "start --no-block $good" "$HR/etc/sudoers.d/app-deploy"
+done
+rmdir "$HR/srv/app-staging"
+cp "$T/site.toml.bak" "$HR/srv/app/deploy/site.toml"
+
+echo "22. an option smuggled in as a package name never reaches apt-get"
+printf 'libok1\n-oDPkg::Pre-Invoke::=touch /pwned\n--allow-unauthenticated\n' > "$HR/srv/app/deploy/packages.txt"
+reset_log; run
+check "exit 1"                          [ "$(rc)" = 1 ]
+check "said REFUSED"                    grep -q "packages: REFUSED" "$T/out.txt"
+check "apt never saw the option"        not_called "Pre-Invoke"
+check "nor the flag"                    not_called "allow-unauthenticated"
+check "the valid package still installed" called "libok1"
+rm -f "$HR/srv/app/deploy/packages.txt"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

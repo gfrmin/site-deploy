@@ -76,6 +76,47 @@ envval() { [ -r "$2" ] && sed -n "s/^$1=//p" "$2" | tail -1 | tr -d '"'"'"'[:spa
 units_changed=0
 changed_timers=()
 
+# --- declarations are UNTRUSTED input -------------------------------------------
+# Everything read out of /srv/<site> (site.toml, fleet.toml, packages.txt) is
+# writable by the service user: /srv/<app> is its home. This script runs as
+# root and the service user can invoke it through its own sudo grant, so a
+# declared value must never reach sudoers, a command line or a path unless it
+# matches a strict allow-list. An app compromise must stay an app compromise
+# (issue #31). Anything that fails is a counted failure and is never used.
+# A unit this site may be granted. Shape alone is not enough (a well-formed
+# `reboot.target` or `sshd` must never become a grant), and neither is a name
+# prefix (site `blog` must not claim site `blog-staging`'s unit). So:
+#   * a .service, or a bare name (which systemctl reads as one); no ':' (a
+#     sudoers separator), space, comma, slash, backslash or glob;
+#   * never an instance of one of the toolkit's own templates, which act on
+#     another app by name, except site-build@<this app>;
+#   * otherwise the unit is named for its OWNER, the longest site or app name
+#     under /srv that it equals or extends with '-' or '@', and that owner
+#     must be this SITE. A workspace app's own bare name is not enough: its
+#     name comes from the checkout, and `sshd` is a perfectly valid app name.
+stem_owner() {   # <stem> -> the longest /srv name N with stem = N, N-*, N@*
+  local stem=$1 best="" p n
+  for p in "$ROOT"/srv/*; do
+    n=${p##*/}
+    case $stem in "$n"|"$n"-*|"$n"@*) [ ${#n} -gt ${#best} ] && best=$n ;; esac
+  done
+  printf '%s' "$best"
+}
+owned_unit() {   # <app> <unit>
+  local a=$1 u=$2 stem f t
+  [[ $u =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] || return 1
+  case $u in *.service) stem=${u%.service} ;; *.*) return 1 ;; *) stem=$u ;; esac
+  case $stem in site-build@*) [ "${stem#site-build@}" = "$a" ]; return ;; esac
+  for f in "$SELF"/systemd/*@.service; do
+    t=${f##*/}; t=${t%@.service}
+    [ "$t" = app ] && continue    # the copy-me reference unit, named for no one
+    case $stem in "$t"@*) return 1 ;; esac
+  done
+  [ "$(stem_owner "$stem")" = "$APP" ]
+}
+valid_pkg()  { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]+(:[a-z0-9]+)?$ ]]; }
+valid_app()  { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
+
 # --- workspace mode (Phase D item 14): several apps out of one checkout -----
 # $APP is the SITE (the checkout); $APPS is what it hosts -- itself, under
 # dir ".", for a single-app site (today's shape, unchanged), or every name
@@ -83,8 +124,42 @@ changed_timers=()
 WORKSPACE=""
 ws_active "$SRV" && WORKSPACE=1
 APPS_DIR=$(ws_apps_dir "$SRV")
+# apps_dir becomes symlink targets under /srv: relative, plain segments, no '..'.
+if [ -n "$WORKSPACE" ] && { ! [[ $APPS_DIR =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$ ]] || [[ /$APPS_DIR/ == */../* ]]; }; then
+  say "REFUSED [workspace] apps_dir $(printf '%q' "$APPS_DIR"): must be a relative path of plain segments, no '..'; refusing"
+  exit 1
+fi
 if [ -n "$WORKSPACE" ]; then
-  mapfile -t APPS < <(ws_apps "$SRV" "$APP")
+  mapfile -t ws_names < <(ws_apps "$SRV" "$APP")
+  APPS=()
+  for a in "${ws_names[@]}"; do
+    if ! valid_app "$a"; then
+      note_failure "REFUSED hosted app name $(printf '%q' "$a"): must match ^[a-z][a-z0-9_-]{0,31}\$"
+      continue
+    fi
+    # A name that extends ANOTHER site's or app's name (blog-build, next to
+    # site blog) would, once /srv/<name> exists, take ownership of that
+    # site's own units (see owned_unit) and stop its deploys. Extending this
+    # site's own name is fine: those units are ours either way.
+    # Only a NEW name is checked: one whose /srv link is already ours keeps
+    # it, so a later /srv/<prefix> (another site's new app) can never take an
+    # existing app away. And a name that is itself one of OUR links (shop,
+    # next to our shop-api) is no one else's to protect.
+    squat=""
+    if [ "$(readlink "$ROOT/srv/$a" 2>/dev/null)" != "$SRV/$APPS_DIR/$a" ]; then
+      for p in "$ROOT"/srv/*; do
+        n=${p##*/}
+        [ "$n" = "$a" ] || [ "$n" = "$APP" ] && continue
+        [ "$(readlink "$p" 2>/dev/null)" = "$SRV/$APPS_DIR/$n" ] && continue
+        case $a in "$n"-*|"$n"@*) squat=$n; break ;; esac
+      done
+    fi
+    if [ -n "$squat" ]; then
+      note_failure "REFUSED hosted app name $a: it extends /srv/$squat, another site's or app's name, whose units it would take over"
+      continue
+    fi
+    APPS+=("$a")
+  done
 else
   APPS=("$APP")
 fi
@@ -154,11 +229,17 @@ if [ -n "$WORKSPACE" ]; then
     dir=$(app_dir "$a")
     link="$ROOT/srv/$a"
     target="$SRV/$dir"
+    # On a collision, nothing else below runs for this name either: no
+    # /var/lib dir, and above all no User= drop-in, which would re-point
+    # ANOTHER app's probe at this site's user.
     if [ -L "$link" ]; then
-      [ "$(readlink "$link")" = "$target" ] \
-        || note_failure "$a: /srv/$a is a symlink to $(readlink "$link"), not $target -- refusing to touch it (name collision)"
+      if [ "$(readlink "$link")" != "$target" ]; then
+        note_failure "$a: /srv/$a is a symlink to $(readlink "$link"), not $target -- refusing to touch it (name collision)"
+        continue
+      fi
     elif [ -e "$link" ]; then
       note_failure "$a: /srv/$a exists and is not a symlink -- refusing to touch it (name collision)"
+      continue
     else
       install -d -m0755 "$ROOT/srv" 2>/dev/null || true
       ln -s "$target" "$link" && say "$a: created /srv/$a -> $target"
@@ -173,6 +254,13 @@ if [ -n "$WORKSPACE" ]; then
       rm -f "$tmp_dropin"
     done
   done
+  # A colliding name is not this site's app: drop it, so nothing below
+  # grants, arms or converges anything in its name.
+  kept_apps=()
+  for a in "${APPS[@]}"; do
+    [ "$(readlink "$ROOT/srv/$a" 2>/dev/null)" = "$SRV/$(app_dir "$a")" ] && kept_apps+=("$a")
+  done
+  APPS=("${kept_apps[@]}")
   # Prune identity + alarm timers for an app this site no longer hosts. Only
   # symlinks pointing INTO this site's own apps_dir/ are ever considered --
   # never a name this site does not own.
@@ -230,16 +318,36 @@ tmp_sudo=$(mktemp)
     # matches arguments literally, so granting the bare "$APP" while the poller runs
     # `systemctl reload $APP.service` refuses every deploy ("sudo: a password is required").
     svc=$(app_service "$APP")
-    echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
-    [ -n "$build_svc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
+    if owned_unit "$APP" "$svc"; then
+      echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
+    else
+      note_failure "REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a unit this app owns" >&2
+    fi
+    if [ -n "$build_svc" ]; then
+      if owned_unit "$APP" "$build_svc"; then
+        echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $build_svc"
+      else
+        note_failure "REFUSED to grant start of build unit $(printf '%q' "$build_svc"): not a unit this app owns" >&2
+      fi
+    fi
     echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$APP.service"
   else
     # One grant per hosted app, keyed on ITS OWN service/build_service (a
     # workspace app's default unit is $APP@<app>.service, not <app> bare).
     for a in "${APPS[@]}"; do
       svc=$(app_service "$a"); bsvc=$(app_build_service "$a")
-      echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
-      [ -n "$bsvc" ] && echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $bsvc"
+      if owned_unit "$a" "$svc"; then
+        echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl reload $svc, /usr/bin/systemctl restart $svc"
+      else
+        note_failure "$a: REFUSED to grant reload/restart of $(printf '%q' "$svc"): not a unit this app owns" >&2
+      fi
+      if [ -n "$bsvc" ]; then
+        if owned_unit "$a" "$bsvc"; then
+          echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $bsvc"
+        else
+          note_failure "$a: REFUSED to grant start of build unit $(printf '%q' "$bsvc"): not a unit this app owns" >&2
+        fi
+      fi
       echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$a.service"
       echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/converge.sh $a"
     done
@@ -290,6 +398,7 @@ fi
 missing=()
 while read -r pkg; do
   [ -n "$pkg" ] || continue
+  valid_pkg "$pkg" || { note_failure "packages: REFUSED $(printf '%q' "$pkg"): not a Debian package name"; continue; }
   dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || missing+=("$pkg")
 done < <(grep -hvE '^\s*#|^\s*$' "${PKG_FILES[@]}" | sort -u)
 if [ ${#missing[@]} -gt 0 ]; then
