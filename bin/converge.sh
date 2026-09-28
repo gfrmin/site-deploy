@@ -53,7 +53,10 @@ elif [ $# -gt 1 ]; then
   echo "usage: converge.sh <app> [--tree <dir>]" >&2; exit 2
 fi
 TOML="$SRV/deploy/site.toml"
-STATE_DIR="${CONVERGE_STATE_DIR:-$ROOT/var/lib/$APP}"
+# Root's own record of what it installed, in root's own store: prune
+# rm -f's every path listed here, so it must never live where the service
+# user can write (/var/lib/<app> can be the app's own StateDirectory=).
+STATE_DIR="${CONVERGE_STATE_DIR:-$ROOT/var/lib/site-deploy-root/converge/$APP}"
 MANIFEST="$STATE_DIR/converge-installed-files"
 
 # shellcheck disable=SC1091
@@ -300,7 +303,7 @@ fi
 # asked converge to manage is never at risk just because it happens to sit
 # near one that is.
 if [ -n "$prune" ]; then
-  install -d -m0755 "$STATE_DIR"
+  install -d -m0700 "$STATE_DIR"
   if [ -f "$MANIFEST" ]; then
     while IFS= read -r old; do
       [ -n "$old" ] || continue

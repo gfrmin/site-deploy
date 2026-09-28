@@ -151,6 +151,22 @@ echo "HOOK RAN from $PWD tree=${SITE_TREE:-} srv=${SRV:-}" >> "$T/hook.log"
   git add -A; git commit -qm "hook back"; git push -q origin master )
 S4=$(sha); run pin site "$S4"
 
+echo "9d. a daemon a hook leaves running never keeps the lock: the next pin is not blocked"
+( cd "$WORK" || exit 1
+  printf '#!/usr/bin/env bash\nsleep 20 &\necho $! > "$T/daemon.pid"\n' > deploy/converge.sh
+  git add -A; git commit -qm "hook forks a daemon"; git push -q origin master )
+run converge site "$(sha)"
+advance v4e
+start=$(date +%s)
+env HOST_ROOT="$HR" SITE_TREE_PROTOCOLS=file SITE_TREE_LOCK_WAIT=10 bash "$ROOT/bin/site-tree.sh" pin site "$(sha)" > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"
+check "next pin succeeded"             [ "$(rc)" = 0 ]
+check "without waiting on the daemon"  [ $(( $(date +%s) - start )) -lt 8 ]
+kill "$(cat "$T/daemon.pid")" 2>/dev/null || true
+( cd "$WORK" || exit 1
+  printf '#!/usr/bin/env bash\necho "HOOK RAN from $PWD tree=${SITE_TREE:-} srv=${SRV:-}" >> "$T/hook.log"\n' > deploy/converge.sh
+  git add -A; git commit -qm "hook back again"; git push -q origin master )
+S4=$(sha); run pin site "$S4"
+
 echo "10. converge runs the TREE's hook, never the checkout's"
 printf '#!/usr/bin/env bash\ntouch "$T/checkout-hook-ran"\n' > "$SRV/deploy/converge.sh"   # tampered on the box
 : > "$T/hook.log"

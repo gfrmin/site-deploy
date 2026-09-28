@@ -110,7 +110,17 @@ content.
   credentials.
 - Residual risk, stated: if an attacker already controls the service user at
   the moment this ships, TOFU pins their URL. The pinned file is one line an
-  admin can check.
+  admin can check. Likewise the very first pin (no `current` yet) accepts any
+  master commit, so one old hook could run once at that moment; every pin
+  after it is forward-only.
+- `bin/converge.sh`'s record of what it installed (which `prune` deletes
+  from) moves to `/var/lib/site-deploy-root/converge/<app>/`: under
+  `/var/lib/<app>`, possibly the app's own `StateDirectory=`, an edited
+  manifest was root `rm -f` of any path. A box's first converge after this
+  starts a fresh record, so files installed before it are not pruned (the
+  safe direction).
+- Locks are bounded (`flock -w`, default 600 s) and never inherited by a hook
+  or the engine, so a daemon a hook leaves behind cannot stall later deploys.
 
 ## Tests
 

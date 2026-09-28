@@ -94,8 +94,14 @@ on_master() {   # <sha>
 # One lock per site. pin holds it exclusively (fetch, export, repoint,
 # prune); converge holds it SHARED while its hook runs, so a concurrent pin
 # can neither place a half-built tree nor prune the one in use.
+# Bounded, never a hang: a lock held past the timeout is a stuck converge,
+# which must fail this deploy loudly rather than stall every later one. And
+# fd 9 is closed for everything this script runs, so a daemon a hook starts
+# can never keep the lock.
+LOCK_WAIT="${SITE_TREE_LOCK_WAIT:-600}"
 lock() {   # <-s|-x>
-  mkdir -p "$TREES" && exec 9>"$TREES/.lock" && flock "$1" 9 || refuse "could not lock $TREES"
+  mkdir -p "$TREES" && exec 9>"$TREES/.lock" && flock -w "$LOCK_WAIT" "$1" 9 \
+    || refuse "could not lock $TREES within ${LOCK_WAIT}s (a converge still running?)"
 }
 
 pin() {   # <sha> -> prints the tree dir
@@ -123,7 +129,7 @@ pin() {   # <sha> -> prints the tree dir
   dir="$TREES/$sha"
   if [ ! -d "$dir" ]; then
     tmp=$(mktemp -d "$TREES/.tmp.XXXXXX") || refuse "could not create a temp tree"
-    if ! git_root --git-dir="$MIRROR" archive "$sha" | tar -x -C "$tmp"; then
+    if ! git_root --git-dir="$MIRROR" archive "$sha" 9>&- | tar -x -C "$tmp"; then
       rm -rf "$tmp"; refuse "could not export ${sha:0:9}"
     fi
     chmod 0755 "$tmp"
@@ -168,11 +174,11 @@ case $cmd in
     fi
     hook="$appdir/deploy/converge.sh"
     if [ -x "$hook" ]; then
-      ( cd "$appdir" && SITE_TREE="$tree" SRV="/srv/$site" "$hook" ) || refuse "deploy/converge.sh failed"
+      ( cd "$appdir" && SITE_TREE="$tree" SRV="/srv/$site" "$hook" 9>&- ) || refuse "deploy/converge.sh failed"
     elif [ -e "$hook" ]; then
       refuse "deploy/converge.sh is in the tree but not executable (a forgotten chmod +x, not 'no hook')"
     else
-      SITE_TREE="$tree" "$SELF/bin/converge.sh" "${app:-$site}" --tree "$appdir" || exit 1
+      SITE_TREE="$tree" "$SELF/bin/converge.sh" "${app:-$site}" --tree "$appdir" 9>&- || exit 1
     fi ;;
   *) usage ;;
 esac
