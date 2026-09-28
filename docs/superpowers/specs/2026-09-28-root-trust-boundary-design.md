@@ -31,11 +31,11 @@ content.
   saying so loudly: trust on first use at the moment this ships, the same
   moment an admin would otherwise have to hand-write it. After that it is
   never re-read from the checkout; changing it is an admin act.
-- **Root mirror.** `/var/lib/site-deploy/mirror/<site>.git`, bare, root-owned
+- **Root mirror.** `/var/lib/site-deploy-root/mirror/<site>.git`, bare, root-owned
   0700. Fetched by root from the pinned URL only, with a hermetic transport:
   `GIT_CONFIG_NOSYSTEM=1`, `HOME` pointed at a root-owned dir,
   `GIT_SSH_COMMAND='ssh -F /dev/null -o IdentitiesOnly=yes -o
-  UserKnownHostsFile=/var/lib/site-deploy/known_hosts -o
+  UserKnownHostsFile=/var/lib/site-deploy-root/known_hosts -o
   StrictHostKeyChecking=accept-new [-i key]'`, and `GIT_ALLOW_PROTOCOL=https:ssh`
   (git's `ext::` transport runs a command; a pinned URL is also shape-checked
   to `https://…`, `ssh://…` or `user@host:path`, never starting with `-`). The service user can at worst
@@ -47,9 +47,19 @@ content.
   (A gate ref such as `ci-green` only ever points at master commits.) The
   mirror is fetched only when the SHA is not already known and verified, so a
   steady-state tick costs no network.
-- **Export.** `git archive <sha>` into `/var/lib/site-deploy/tree/<site>/<sha>/`
+- **Forward only.** A pin must be the current tree's commit or a descendant
+  of it: deploys only fast-forward, and an older master commit would re-run an
+  old hook and roll `current` back. After a history rewrite an admin removes
+  `current`.
+- **Store.** Everything lives under `/var/lib/site-deploy-root/`, never under
+  `/var/lib/site-deploy/`, whose `<site>` directories belong to each site's
+  poller (a site named `mirror` would otherwise own root's mirror).
+- **Locking.** One `flock` per site: `pin` holds it exclusively (fetch,
+  export, repoint, prune), and `converge` holds it shared while its hook runs,
+  so a concurrent pin never prunes a tree in use.
+- **Export.** `git archive <sha>` into `/var/lib/site-deploy-root/tree/<site>/<sha>/`
   (root-owned, 0755, built in a temp dir and renamed into place), and
-  `/var/lib/site-deploy/tree/<site>/current` → that dir. Older trees are
+  `/var/lib/site-deploy-root/tree/<site>/current` → that dir. Older trees are
   pruned (keep current + previous).
 - **Interface.** `site-tree.sh pin <site> <sha>` (verify, export, repoint
   `current`; prints the tree path) and `site-tree.sh path <site>` (prints
@@ -68,6 +78,11 @@ content.
   else `bin/converge.sh` against the tree. Environment passes
   `SITE_TREE=<tree>` and `SRV=/srv/<site>` so a hook can tell its source tree
   from the live checkout; cwd is the tree.
+- **`bin/converge.sh`'s template-restart queue** reads the app list and
+  each app's service from the tree (`SITE_TREE`), allow-lists app names, and
+  writes the poller's marker **as the site user** (`runuser`), because that
+  queue lives in a directory the service user owns: a symlink planted there
+  must never be followed by root.
 - **`bin/converge.sh`** gains `--tree <dir>`: `site.toml` and every `src` are
   read from the tree. Invoked without it, it refuses (no root path reads the
   checkout).

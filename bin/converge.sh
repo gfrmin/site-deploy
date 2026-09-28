@@ -135,11 +135,18 @@ is_template_unit() {   # <unit>
 queue_template_restart() {   # <template-unit>
   local tmpl=$1 site site_srv apps_dir a dir svc pending_dir queued=""
   site=$(ws_site_of "$ROOT" "$APP")
-  site_srv="$ROOT/srv/$site"
+  # The app list and each app's service come from root's verified tree when
+  # there is one (SITE_TREE, set by bin/site-tree.sh), never from the
+  # service user's checkout; names are allow-listed before they become paths.
+  site_srv="${SITE_TREE:-$ROOT/srv/$site}"
   apps_dir=$(ws_apps_dir "$site_srv")
   pending_dir="${CONVERGE_QUEUE_DIR:-$ROOT/var/lib/site-deploy/$site}/pending"
   while IFS= read -r a; do
     [ -n "$a" ] || continue
+    if ! [[ $a =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
+      note_failure "refusing hosted app name $(printf '%q' "$a"): not a plain name"
+      continue
+    fi
     dir="$apps_dir/$a"
     svc=$(python3 "$SELF/bin/site-config.py" --app-keys "$site_srv/$dir/deploy/site.toml" 2>/dev/null \
             | sed -n "s/^export DEPLOY_SERVICE=//p" | tail -1 | tr -d "'\"")
@@ -148,8 +155,12 @@ queue_template_restart() {   # <template-unit>
       "${tmpl%@}@"*) : ;;   # this app's service is an instance of $tmpl
       *) continue ;;
     esac
-    if mkdir -p "$pending_dir" 2>/dev/null; then
-      echo restart > "$pending_dir/$a"
+    # The queue is the POLLER's, in a directory its service user owns: write
+    # it AS that user, so a symlink planted there can only lead somewhere the
+    # service user could already write. Root following it would be a write
+    # anywhere.
+    if ${AS_SITE_USER-runuser -u "$site" --} mkdir -p "$pending_dir" 2>/dev/null \
+       && printf 'restart\n' | ${AS_SITE_USER-runuser -u "$site" --} tee "$pending_dir/$a" >/dev/null; then
       say "$a: restart queued ($tmpl changed; the poller applies it after the CSS build, same as a code-side uv.lock change)"
       queued=1
     else

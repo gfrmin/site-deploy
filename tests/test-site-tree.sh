@@ -41,7 +41,7 @@ sha() { git -C "$WORK" rev-parse "${1:-HEAD}"; }
 advance() { ( cd "$WORK" || exit 1; echo "$1" >> app.py; git commit -qam "$1"; git push -q origin master ); }
 run() { env HOST_ROOT="$HR" SITE_TREE_PROTOCOLS=file bash "$ROOT/bin/site-tree.sh" "$@" > "$T/out.txt" 2>&1; echo $? > "$T/rc.txt"; }
 rc() { cat "$T/rc.txt"; }
-TREES="$HR/var/lib/site-deploy/tree/site"
+TREES="$HR/var/lib/site-deploy-root/tree/site"
 
 echo "1. pin a commit on master: verified, exported, current"
 S1=$(sha)
@@ -104,9 +104,17 @@ S2=$(sha); run pin site "$S2"
 check "exit 0"                         [ "$(rc)" = 0 ]
 check "current moved"                  [ "$(readlink "$TREES/current")" = "$S2" ]
 mv "$ORIGIN" "$T/origin.away"
-run pin site "$S1"
+run pin site "$S2"
 check "cached: still pins with origin gone" [ "$(rc)" = 0 ]
 mv "$T/origin.away" "$ORIGIN"
+
+echo "8b. forward only: an OLDER master commit is refused, current does not move back"
+run pin site "$S1"
+check "exit 1"                         [ "$(rc)" = 1 ]
+check "said never moves backwards"     grep -q "never moves backwards" "$T/out.txt"
+check "current still S2"               [ "$(readlink "$TREES/current")" = "$S2" ]
+run converge site "$S1"
+check "converge of an older commit refused too" [ "$(rc)" = 1 ]
 
 echo "9. only current + previous trees are kept"
 advance v3; S3=$(sha); run pin site "$S3"
@@ -114,6 +122,34 @@ advance v4; S4=$(sha); run pin site "$S4"
 check "current is v4"                  [ "$(readlink "$TREES/current")" = "$S4" ]
 check "previous kept"                  [ -d "$TREES/$S3" ]
 check "older pruned"                   [ ! -e "$TREES/$S2" ]
+
+echo "9b. two concurrent pins of one new commit leave one clean tree, never one nested in the other"
+advance v4b; S4B=$(sha)
+for _ in 1 2 3; do env HOST_ROOT="$HR" SITE_TREE_PROTOCOLS=file bash "$ROOT/bin/site-tree.sh" pin site "$S4B" >/dev/null 2>&1 & done; wait
+check "exported once"                  grep -qx v1 <(head -1 "$TREES/$S4B/app.py")
+check "nothing nested inside it"       bash -c '! find "'"$TREES/$S4B"'" -mindepth 1 -maxdepth 1 -name ".tmp.*" | grep -q .'
+check "no temp dirs left"              bash -c '! ls -d "'"$TREES"'"/.tmp.* >/dev/null 2>&1'
+S4=$S4B
+
+echo "9c. a pin waits for a running converge hook: the tree in use is never pruned under it"
+( cd "$WORK" || exit 1
+  printf '#!/usr/bin/env bash
+sleep 2
+[ -f "$PWD/app.py" ] && echo "TREE INTACT" >> "$T/hook.log"
+' > deploy/converge.sh
+  git add -A; git commit -qm "slow hook"; git push -q origin master )
+SLOW=$(sha); : > "$T/hook.log"
+env HOST_ROOT="$HR" SITE_TREE_PROTOCOLS=file bash "$ROOT/bin/site-tree.sh" converge site "$SLOW" >/dev/null 2>&1 &
+cpid=$!; sleep 0.5
+advance v4c; run pin site "$(sha)"; advance v4d; run pin site "$(sha)"   # would prune $SLOW
+wait "$cpid"
+check "the hook still saw its tree"    grep -q "TREE INTACT" "$T/hook.log"
+( cd "$WORK" || exit 1
+  printf '#!/usr/bin/env bash
+echo "HOOK RAN from $PWD tree=${SITE_TREE:-} srv=${SRV:-}" >> "$T/hook.log"
+' > deploy/converge.sh
+  git add -A; git commit -qm "hook back"; git push -q origin master )
+S4=$(sha); run pin site "$S4"
 
 echo "10. converge runs the TREE's hook, never the checkout's"
 printf '#!/usr/bin/env bash\ntouch "$T/checkout-hook-ran"\n' > "$SRV/deploy/converge.sh"   # tampered on the box

@@ -18,7 +18,7 @@
 #
 #   * the origin URL is PINNED in root-owned /etc/site-deploy/origin/<site>
 #     (url=..., optional key=... for ssh), never read from the checkout;
-#   * root fetches it into its own bare mirror (/var/lib/site-deploy/mirror/)
+#   * root fetches it into its own bare mirror (/var/lib/site-deploy-root/mirror/)
 #     through a hermetic transport: no system/global git config, root's own
 #     known_hosts, only https and ssh (git's ext:: transport runs a command);
 #   * a sha is accepted only if it is ON MASTER in that mirror: anything on
@@ -34,7 +34,10 @@ set -uo pipefail
 
 ROOT="${HOST_ROOT:-}"
 SELF="$ROOT/srv/site-deploy"
-STATE="$ROOT/var/lib/site-deploy"
+# Root's own store. NOT under /var/lib/site-deploy/: each site's poller owns
+# /var/lib/site-deploy/<site> (StateDirectory=), so a site named `mirror` or
+# `tree` would own root's directories there.
+STATE="$ROOT/var/lib/site-deploy-root"
 ORIGIN_DIR="$ROOT/etc/site-deploy/origin"
 PROTOCOLS="${SITE_TREE_PROTOCOLS:-https:ssh}"
 KEEP=2   # trees kept: current + the one before it
@@ -45,7 +48,7 @@ name_ok() { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
 cmd=${1:-}; site=${2:-}
 name_ok "$site" || usage
 say() { echo "site-tree[$site]: $*"; }
-refuse() { say "$*"; exit 1; }
+refuse() { say "$*" >&2; exit 1; }   # stderr: stdout is pin's tree path
 
 MIRROR="$STATE/mirror/$site.git"
 TREES="$STATE/tree/$site"
@@ -88,17 +91,34 @@ on_master() {   # <sha>
     && git_root --git-dir="$MIRROR" merge-base --is-ancestor "$1" refs/heads/master 2>/dev/null
 }
 
+# One lock per site. pin holds it exclusively (fetch, export, repoint,
+# prune); converge holds it SHARED while its hook runs, so a concurrent pin
+# can neither place a half-built tree nor prune the one in use.
+lock() {   # <-s|-x>
+  mkdir -p "$TREES" && exec 9>"$TREES/.lock" && flock "$1" 9 || refuse "could not lock $TREES"
+}
+
 pin() {   # <sha> -> prints the tree dir
-  local sha=$1 dir tmp
+  local sha=$1 dir tmp cur
   [[ $sha =~ ^[0-9a-f]{40}$ ]] || usage
   read_origin
   (umask 077; mkdir -p "$STATE/home" "$STATE/mirror" "$TREES")
   chmod 0755 "$STATE" "$STATE/tree" "$TREES" 2>/dev/null || true
+  lock -x
   [ -d "$MIRROR" ] || git_root init -q --bare "$MIRROR" || refuse "could not create $MIRROR"
   if ! on_master "$sha"; then
     git_root --git-dir="$MIRROR" fetch -q --no-tags "$URL" "+refs/heads/master:refs/heads/master" \
       || refuse "could not fetch master from the pinned origin $URL (credentials? see key= in $ORIGIN_DIR/$site)"
     on_master "$sha" || refuse "${sha:0:9} is not on master at $URL; root converges only merged commits"
+  fi
+  # Forward only. Deploys only ever fast-forward, so a sha OLDER than the
+  # current tree is not a deploy: it would re-run an old hook (with whatever
+  # bug it had) and roll `current` back for cf-converge and the backup. A
+  # rewritten master is an operator's call: remove $TREES/current.
+  cur=$(readlink "$TREES/current" 2>/dev/null || true)
+  if [[ $cur =~ ^[0-9a-f]{40}$ ]] && [ "$cur" != "$sha" ] \
+     && ! git_root --git-dir="$MIRROR" merge-base --is-ancestor "$cur" "$sha" 2>/dev/null; then
+    refuse "${sha:0:9} is not a descendant of the current tree ${cur:0:9}; root never moves backwards (after a history rewrite, remove $TREES/current)"
   fi
   dir="$TREES/$sha"
   if [ ! -d "$dir" ]; then
@@ -107,7 +127,7 @@ pin() {   # <sha> -> prints the tree dir
       rm -rf "$tmp"; refuse "could not export ${sha:0:9}"
     fi
     chmod 0755 "$tmp"
-    mv "$tmp" "$dir" || { rm -rf "$tmp"; refuse "could not place $dir"; }
+    mv -T "$tmp" "$dir" || { rm -rf "$tmp"; refuse "could not place $dir"; }
   fi
   # Atomic repoint: readers see the old tree or the new one, never neither.
   ln -sfn "$sha" "$TREES/.current.new" && mv -T "$TREES/.current.new" "$TREES/current" \
@@ -133,7 +153,8 @@ case $cmd in
     [ $# -eq 3 ] || [ $# -eq 4 ] || usage
     app=${4:-}
     [ -z "$app" ] || name_ok "$app" || usage
-    tree=$(pin "$3") || { echo "$tree"; exit 1; }
+    tree=$(pin "$3") || exit 1
+    lock -s
     # shellcheck disable=SC1091
     . "$SELF/lib/workspace.sh"
     if [ -n "$app" ]; then
@@ -151,7 +172,7 @@ case $cmd in
     elif [ -e "$hook" ]; then
       refuse "deploy/converge.sh is in the tree but not executable (a forgotten chmod +x, not 'no hook')"
     else
-      "$SELF/bin/converge.sh" "${app:-$site}" --tree "$appdir" || exit 1
+      SITE_TREE="$tree" "$SELF/bin/converge.sh" "${app:-$site}" --tree "$appdir" || exit 1
     fi ;;
   *) usage ;;
 esac
