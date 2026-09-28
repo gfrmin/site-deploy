@@ -183,6 +183,10 @@ S5=$(sha); : > "$T/hook.log"
 run converge site "$S5" foo
 check "exit 0"                         [ "$(rc)" = 0 ]
 check "foo's hook ran from the tree"   grep -q "FOO HOOK RAN from $TREES/$S5/apps/foo" "$T/hook.log"
+run path site foo
+check "path site foo is foo's dir in current" grep -qx "$TREES/current/apps/foo" "$T/out.txt"
+run path site nosuch
+check "path of an app the tree lacks refuses" [ "$(rc)" = 1 ]
 run converge site "$S5" ../foo
 check "an app name that is a path is refused" [ "$(rc)" = 2 ]
 run converge site "$S5" nosuch
@@ -201,6 +205,88 @@ echo "13. a hook present but not executable in the tree is a failure, not a skip
 run converge site "$(sha)"
 check "exit 1"                         [ "$(rc)" = 1 ]
 check "said not executable"            grep -qi "not executable" "$T/out.txt"
+
+echo "14. use: a NON-converging site's root consumers get master's head as \`tip\`, and \`current\` never moves"
+( cd "$WORK" || exit 1; printf '[deploy]\nreload = "reload"\n' > deploy/site.toml; chmod +x deploy/converge.sh; git add -A; git commit -qm "no converge"; git push -q origin master )
+S7=$(sha); run pin site "$S7"; cur_before=$(readlink "$TREES/current")
+advance v14; HEAD14=$(sha)
+run use site
+check "exit 0"                         [ "$(rc)" = 0 ]
+check "answers the tip link"           grep -qx "$TREES/tip" "$T/out.txt"
+check "tip is master's head"           [ "$(readlink "$TREES/tip")" = "$HEAD14" ]
+check "current untouched"              [ "$(readlink "$TREES/current")" = "$cur_before" ]
+run pin site "$HEAD14"
+check "a later deploy still pins forward" [ "$(rc)" = 0 ]
+
+echo "15. use: a CONVERGING site's root consumers get what the poller converged, not master's head"
+( cd "$WORK" || exit 1; printf '[deploy]\nconverge = true\n' > deploy/site.toml; git add -A; git commit -qm "converge on"; git push -q origin master )
+S8=$(sha); run pin site "$S8"; advance v15
+run use site
+check "answers current"                grep -qx "$TREES/current" "$T/out.txt"
+check "which is the converged commit"  [ "$(readlink "$TREES/current")" = "$S8" ]
+
+echo "16. use: master unreachable keeps the tip already exported, and says so"
+( cd "$WORK" || exit 1; printf '[deploy]\nreload = "reload"\n' > deploy/site.toml; git add -A; git commit -qm "off again"; git push -q origin master )
+run pin site "$(sha)"; run use site; tip_before=$(readlink "$TREES/tip")
+mv "$ORIGIN" "$T/origin.away"
+run use site
+check "exit 0"                         [ "$(rc)" = 0 ]
+check "same tip"                       [ "$(readlink "$TREES/tip")" = "$tip_before" ]
+check "said it could not fetch"        grep -q "could not fetch master" "$T/out.txt"
+mv "$T/origin.away" "$ORIGIN"
+
+echo "17. origin: pinned ONCE from the checkout (root's own first-use window), never by the service user's grant"
+mv "$HR/etc/site-deploy/origin/site" "$T/origin-file.bak"
+rm -f "$HR/var/lib/site-deploy-root/origin-window/site"      # a box on which the window is still open
+git -C "$SRV" remote set-url origin "file://$ORIGIN"
+run converge site "$(sha)"
+check "converge never pins (the service user can reach it)" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'
+check "and says an admin must"         grep -q "an admin writes url=" "$T/out.txt"
+run origin site
+check "root's first-use pin: exit 0"   [ "$(rc)" = 0 ]
+check "pinned from the checkout"       grep -qx "url=file://$ORIGIN" "$HR/etc/site-deploy/origin/site"
+check "said PINNED"                    grep -q "PINNED the origin" "$T/out.txt"
+git -C "$SRV" remote set-url origin "file://$T/evil.git"
+run origin site
+check "later checkout URL ignored"     grep -qx "url=file://$ORIGIN" "$HR/etc/site-deploy/origin/site"
+check "and silent"                     [ ! -s "$T/out.txt" ]
+rm "$HR/etc/site-deploy/origin/site"
+run origin site
+check "the window stays closed: no re-pin from a changed checkout" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'
+check "said so"                        grep -q "window is closed" "$T/out.txt"
+git -C "$SRV" remote set-url origin "file://$ORIGIN"
+run origin site --admin
+check "an admin (install.sh) can pin"  grep -qx "url=file://$ORIGIN" "$HR/etc/site-deploy/origin/site"
+rm "$HR/etc/site-deploy/origin/site"
+for bad in "https://github.com/o/w.git?access_token=S3CRET" "https://x-access-token:ghp_S3CRET@github.com/o/w.git" "https://tok@github.com/o/w.git" "ssh://git:pw@github.com/o/w.git" "ext::sh -c id"; do
+  git -C "$SRV" remote set-url origin "$bad"
+  run origin site --admin
+  check "never pinned: $bad"           bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && [ ! -e "'"$HR"'/etc/site-deploy/origin/site" ]'
+  check "and the secret never echoed"  bash -c '! grep -q S3CRET "'"$T"'/out.txt"'
+done
+mv "$T/origin-file.bak" "$HR/etc/site-deploy/origin/site"; git -C "$SRV" remote set-url origin "$ORIGIN"
+
+echo "18. a hook that reads /srv/<site> BY NAME still sees only the verified tree (private mount namespace)"
+# Production runs as root with `unshare --mount`; here a user namespace stands
+# in for root. Skipped (said so) where the kernel refuses unprivileged ones.
+if unshare -r --mount --propagation private -- true 2>/dev/null; then
+  ( cd "$WORK" || exit 1
+    printf '[deploy]\nconverge = true\n' > deploy/site.toml
+    printf '#!/usr/bin/env bash\ncat /srv/site/app.py > "$T/hook-saw" 2>/dev/null || cat "%s/srv/site/app.py" > "$T/hook-saw"\ntouch "%s/srv/site/hook-wrote" 2>/dev/null || echo RO >> "$T/hook-saw"\n' "$HR" "$HR" > deploy/converge.sh
+    chmod +x deploy/converge.sh; git add -A; git commit -qm "hook reads by name"; git push -q origin master )
+  NS=$(sha); rm -f "$T/hook-saw"
+  echo "TAMPERED ON THE BOX" > "$SRV/app.py"
+  export SITE_TREE_UNSHARE="unshare -r --mount --propagation private"
+  run converge site "$NS"
+  unset SITE_TREE_UNSHARE
+  check "exit 0"                         [ "$(rc)" = 0 ]
+  check "the hook read the tree's app.py" bash -c '! grep -q TAMPERED "'"$T"'/hook-saw" && grep -q "^v1" "'"$T"'/hook-saw"'
+  check "and could not write into it"    grep -q RO "$T/hook-saw"
+  check "outside the hook, the checkout is untouched" grep -q TAMPERED "$SRV/app.py"
+  git -C "$SRV" checkout -q -- app.py
+else
+  echo "  skip (unprivileged user namespaces unavailable here; production uses root's unshare --mount)"
+fi
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

@@ -145,11 +145,31 @@ called() { grep -qF -e "$1" "$STUB_LOG"; }
 not_called() { ! grep -qF -e "$1" "$STUB_LOG"; }
 set_unit_state() { echo "$2" > "$STUB_UNITS/$1.state"; }
 
+# bin/site-tree.sh is root's verified export of the deployed commit; it has
+# its own suite (tests/test-site-tree.sh). Here the checkout IS the deployed
+# commit, so the stub stands the checkout in for the tree and runs the same
+# three-way rule (hook, not-executable, engine), which keeps this file about
+# the poller's WIRING. `pin` just records the call.
+cat > "$T/bin/site-tree" <<'STUB'
+#!/usr/bin/env bash
+echo "SITE-TREE RAN $*" >> "$STUB_LOG"
+[ "$1" = pin ] && exit "${FAKE_PIN_RC:-0}"
+dir=$STUB_SRV; [ -n "${4:-}" ] && dir="$STUB_SRV/apps/$4"
+if [ -x "$dir/deploy/converge.sh" ]; then
+  ( cd "$dir" && ./deploy/converge.sh ) || { echo "site-tree[$2]: deploy/converge.sh failed" >&2; exit 1; }
+elif [ -e "$dir/deploy/converge.sh" ]; then
+  echo "site-tree[$2]: deploy/converge.sh is in the tree but not executable" >&2; exit 1
+else
+  "$STUB_ENGINE" "${4:-$2}" || exit 1
+fi
+STUB
+chmod +x "$T/bin/site-tree"
+export STUB_SRV="$SRV" STUB_ENGINE="$T/bin/converge-engine"
 run_deploy() {
   env APP=site APP_DIR="$SRV" SITE_DEPLOY_DIR="$ROOT" UV="$T/bin/uv" CURL="$T/bin/curl" \
       RELOAD_CMD="$T/bin/systemctl" SYSCTL_QUERY="$T/bin/systemctl" DEPLOY_HEALTH_TRIES=2 \
       CONVERGE_CMD=env HOST_CONVERGE_CMD="$T/bin/host-converge" \
-      CONVERGE_ENGINE_CMD="$T/bin/converge-engine" DEPLOY_REF_FILE="$T/deploy-ref" \
+      CONVERGE_ENGINE_CMD="$T/bin/converge-engine" SITE_TREE_CMD="$T/bin/site-tree" DEPLOY_REF_FILE="$T/deploy-ref" \
       WS_APPS_FILE="$T/etc/site-apps-override" BOX_HOSTNAME="$BOX_HOSTNAME" \
       "$@" bash "$ROOT/bin/auto-deploy.sh" > "$T/out.txt" 2>&1
   echo $? > "$T/rc.txt"

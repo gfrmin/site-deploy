@@ -292,7 +292,9 @@ echo "15. per-app sudoers: each app's OWN unit name, default site@<app>.service"
 check "foo reload/restart grant"     grep -q "systemctl reload site@foo.service, /usr/bin/systemctl restart site@foo.service" "$HR/etc/sudoers.d/site-deploy"
 check "bar's build_service grant"    grep -q "start --no-block site-build@bar.service" "$HR/etc/sudoers.d/site-deploy"
 check "foo has no build grant"       bash -c '! grep -q "site-build@foo" "$HR/etc/sudoers.d/site-deploy"'
-check "per-app converge grant"       grep -q "bin/converge.sh foo" "$HR/etc/sudoers.d/site-deploy"
+check "converge goes through root's tree" grep -qF "bin/site-tree.sh converge site *" "$HR/etc/sudoers.d/site-deploy"
+check "no grant runs the engine directly" bash -c '! grep -q "bin/converge.sh" "$HR/etc/sudoers.d/site-deploy"'
+check "no grant names the checkout"   bash -c '! grep -q "/srv/site/" "$HR/etc/sudoers.d/site-deploy"'
 
 echo "16. a directory (not a symlink) already at /srv/foo is a name collision: refused, not clobbered"
 rm -rf "$HR/srv/foo"; mkdir -p "$HR/srv/foo"; echo sentinel > "$HR/srv/foo/sentinel"
@@ -440,6 +442,27 @@ check "apt never saw the option"        not_called "Pre-Invoke"
 check "nor the flag"                    not_called "allow-unauthenticated"
 check "the valid package still installed" called "libok1"
 rm -f "$HR/srv/app/deploy/packages.txt"
+
+echo "23. no grant names anything the service user can write (issue #31)"
+check "no /srv/app/ path granted"       bash -c '! grep -q "/srv/app/" "$HR/etc/sudoers.d/app-deploy"'
+check "no direct engine grant"          bash -c '! grep -q "bin/converge.sh" "$HR/etc/sudoers.d/app-deploy"'
+check "no pin grant (root's own units pin)" bash -c '! grep -q "site-tree.sh pin" "$HR/etc/sudoers.d/app-deploy"'
+check "converge through root's tree"    grep -qF "/srv/site-deploy/bin/site-tree.sh converge app *" "$HR/etc/sudoers.d/app-deploy"
+
+echo "24. host-converge never pins the origin (the service user can run it); it says when a site that needs one has none"
+mkdir -p "$HR/srv/app/.git"
+printf '[remote "origin"]\n\turl = https://git.example/app.git\n' > "$HR/srv/app/.git/config"
+printf '[deploy]\nconverge = true\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "never wrote a pin"               [ ! -e "$HR/etc/site-deploy/origin/app" ]
+check "said WILL REFUSE"                grep -q "no pinned origin.*WILL REFUSE" "$T/out.txt"
+mkdir -p "$HR/etc/site-deploy/origin"; printf 'url=git@github.com:o/app.git\n' > "$HR/etc/site-deploy/origin/app"
+reset_log; run
+check "ssh pin without key= is nagged"  grep -q "ssh URL with no key=" "$T/out.txt"
+printf 'url=https://git.example/app.git\n' > "$HR/etc/site-deploy/origin/app"
+reset_log; run
+check "an https pin: no origin nag"     bash -c '! grep -q "WILL REFUSE" "$T/out.txt"'
+rm -rf "$HR/srv/app/.git" "$HR/etc/site-deploy/origin"; : > "$HR/srv/app/deploy/site.toml"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

@@ -25,12 +25,16 @@ the attacker can commit to, and `remote.origin.url`/`refs/remotes` are theirs to
 content.
 
 - **Pinned origin.** `/etc/site-deploy/origin/<site>` (root, 0644) holds
-  `url=<clone URL>` and optionally `key=<ssh identity path>`. If absent,
-  `host-converge` writes it **once** from the checkout's
-  `remote.origin.url` (read with `git config --file`, which runs nothing),
-  saying so loudly: trust on first use at the moment this ships, the same
-  moment an admin would otherwise have to hand-write it. After that it is
-  never re-read from the checkout; changing it is an admin act.
+  `url=<clone URL>` and optionally `key=<ssh identity path>`. It is taken from
+  the checkout's `remote.origin.url` (read with `git config --file`, which runs
+  nothing) only at moments the service user cannot choose: `install.sh
+  --admin`, and ONE first-use window per site, opened by root's self-update
+  timer on the first tick of this toolkit version and closed by that attempt
+  whether it pinned or not. `site-tree.sh origin` is never granted to the
+  service user, and nothing it can invoke (`converge`, `host-converge`,
+  `cf-converge@`) ever pins: a pin reachable from there would let whoever owns
+  the checkout choose the URL, and so the code root runs. A URL with
+  credentials in it is refused (the pin is world-readable and logged).
 - **Root mirror.** `/var/lib/site-deploy-root/mirror/<site>.git`, bare, root-owned
   0700. Fetched by root from the pinned URL only, with a hermetic transport:
   `GIT_CONFIG_NOSYSTEM=1`, `HOME` pointed at a root-owned dir,
@@ -61,23 +65,31 @@ content.
   (root-owned, 0755, built in a temp dir and renamed into place), and
   `/var/lib/site-deploy-root/tree/<site>/current` → that dir. Older trees are
   pruned (keep current + previous).
-- **Interface.** `site-tree.sh pin <site> <sha>` (verify, export, repoint
-  `current`; prints the tree path) and `site-tree.sh path <site>` (prints
-  `current`, exits 1 if none). Only `pin` is granted to the service user.
+- **Interface.** `pin <site> <sha>` (verify, export, repoint `current`),
+  `converge <site> <sha> [<app>]` (pin, then run the tree's converge),
+  `use <site> [<app>]` (for root's other consumers: `current` on a converging
+  site, else a separate `tip` link refreshed to master's head, which never
+  moves `current`), `origin <site>` (pin the origin on first use) and
+  `path`. Only `converge <site> *` is granted to the service user.
 
 ## Consumers switch to the tree
 
-- **Poller.** After a successful fast-forward (and on a resume), calls
-  `sudo -n site-tree.sh pin <site> <REMOTE>`. On `converge = true` a pin
-  failure is fatal to the tick (old code keeps serving, `/fail`), because the
-  converge that follows needs it; otherwise it is logged and the tick goes on.
+- **Poller.** Calls only `sudo -n site-tree.sh converge <site> <REMOTE> [<app>]`,
+  and only on `converge = true`. A failure is fatal to the tick (old code
+  keeps serving, `/fail`). A site that does not converge never touches the
+  tree from the poller: its root consumers refresh `tip` themselves, because
+  `host-converge` (and so the sudoers grant) runs only on converging sites.
 - **Converge hook.** The grant `/srv/<site>/deploy/converge.sh` is **removed**.
   The poller calls `sudo -n site-tree.sh converge <site> <sha>` (and per
   workspace app `… converge <site> <sha> <app>`), which pins, then runs
   `<tree>/[<apps_dir>/<app>/]deploy/converge.sh` if present and executable,
-  else `bin/converge.sh` against the tree. Environment passes
-  `SITE_TREE=<tree>` and `SRV=/srv/<site>` so a hook can tell its source tree
-  from the live checkout; cwd is the tree.
+  else `bin/converge.sh` against the tree. The hook runs in a private mount
+  namespace (`unshare --mount`) where the tree is bound **read-only over
+  `/srv/<site>`**: a hook that reads `/srv/<site>/deploy/...` by name (webbsite's
+  `REPO=/srv/webbsite`) sees only verified content, and one that needs a file
+  not in git fails rather than reading the checkout. `SITE_TREE` and `SRV` are
+  in its environment. If the bind cannot be made, root refuses to run the
+  hook.
 - **`bin/converge.sh`'s template-restart queue** reads the app list and
   each app's service from the tree (`SITE_TREE`), allow-lists app names, and
   writes the poller's marker **as the site user** (`runuser`), because that
@@ -86,16 +98,16 @@ content.
 - **`bin/converge.sh`** gains `--tree <dir>`: `site.toml` and every `src` are
   read from the tree. Invoked without it, it refuses (no root path reads the
   checkout).
-- **`backup.sh`** runs `<current>/deploy/backup-producer.sh`; no current tree
-  means "cannot back up" (a counted failure, `/fail`), never a fallback to the
-  checkout.
+- **`backup.sh`** runs `$(site-tree.sh use …)/deploy/backup-producer.sh`; no
+  tree obtainable while the checkout has a producer is "cannot back up" (a
+  counted failure, `/fail`), never a fallback to the checkout.
 - **`cf-converge-run.sh`** reads `cloudflare.json` and `site.toml` from
-  `current`; no current tree → refuse, as with a missing domain today.
+  `site-tree.sh use …`; none obtainable → refuse.
 - **`host-converge`** keeps reading declarations from the checkout (validated
   by part 1; its effects are bounded to allow-listed grants, packages from the
   configured apt repos, and timers), writes the pinned origin once, and its
   sudoers grants become: systemctl verbs for owned units, `host-converge.sh
-  <site>`, `site-tree.sh pin <site> *`, `site-tree.sh converge <site> *`.
+  <site>`, `site-tree.sh converge <site> *`.
   `bin/converge.sh` and `/srv/<site>/deploy/converge.sh` are no longer granted.
 
 ## Rollout and failure modes
@@ -109,7 +121,8 @@ content.
 - Known fleet: webbsite is a public https repo, so root fetches with no
   credentials.
 - Residual risk, stated: if an attacker already controls the service user at
-  the moment this ships, TOFU pins their URL. The pinned file is one line an
+  the moment this ships (the self-update tick that opens the window), the
+  first-use pin takes their URL. The pinned file is one line an
   admin can check. Likewise the very first pin (no `current` yet) accepts any
   master commit, so one old hook could run once at that moment; every pin
   after it is forward-only.

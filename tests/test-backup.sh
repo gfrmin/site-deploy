@@ -74,13 +74,22 @@ STUB
 chmod +x "$T/bin"/*
 export PATH="$T/bin:$PATH"
 
-cat > "$HR/srv/app/deploy/backup-producer.sh" <<'PRODUCER'
+# The producer root runs comes from root's verified tree (bin/site-tree.sh,
+# its own suite); a sandbox tree stands in for it here. The checkout keeps a
+# copy too, as a real one would, which is what makes "a producer in the
+# checkout but no tree" a distinguishable, loud case.
+TREE="$HR/var/lib/site-deploy-root/tree/app/0123456789abcdef0123456789abcdef01234567"
+mkdir -p "$TREE/deploy"; ln -sfn "${TREE##*/}" "${TREE%/*}/current"
+printf '[deploy]\nconverge = true\n' > "$TREE/deploy/site.toml"   # a converging site: `use` answers `current`
+cat > "$TREE/deploy/backup-producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
 [ -n "${STUB_PRODUCER_FAIL:-}" ] && exit 1
 [ -n "${STUB_PRODUCER_EMPTY:-}" ] && exit 0
 printf 'the-backup-content'
 PRODUCER
-chmod +x "$HR/srv/app/deploy/backup-producer.sh"
+chmod +x "$TREE/deploy/backup-producer.sh"
+cp "$TREE/deploy/backup-producer.sh" "$HR/srv/app/deploy/backup-producer.sh"
+MARKER="$HR/var/lib/site-deploy-root/backup/app/backup-last-success"
 
 reset_log() { : > "$STUB_LOG"; }
 called() { grep -qF -e "$1" "$STUB_LOG"; }
@@ -95,12 +104,28 @@ rc() { cat "$T/rc.txt"; }
 remote_files() { find "$STUB_REMOTE" -type f | sort; }
 
 echo "1. no deploy/backup-producer.sh: no-op, exit 0"
-mv "$HR/srv/app/deploy/backup-producer.sh" "$T/producer.bak"
+mv "$HR/srv/app/deploy/backup-producer.sh" "$T/producer.bak"; mv "$TREE/deploy/backup-producer.sh" "$T/tree-producer.bak"
 reset_log; run
 check "exit 0"                 [ "$(rc)" = 0 ]
 check "said nothing to back up" grep -qi "nothing to back up" "$T/out.txt"
 check "no age/rclone calls"    [ ! -s "$STUB_LOG" ]
-mv "$T/producer.bak" "$HR/srv/app/deploy/backup-producer.sh"
+mv "$T/producer.bak" "$HR/srv/app/deploy/backup-producer.sh"; mv "$T/tree-producer.bak" "$TREE/deploy/backup-producer.sh"
+
+echo "1b. root runs the TREE's producer, never the checkout's (issue #31)"
+printf '#!/usr/bin/env bash\ntouch "%s/checkout-producer-ran"; printf tampered\n' "$T" > "$HR/srv/app/deploy/backup-producer.sh"
+reset_log; run
+check "exit 0"                 [ "$(rc)" = 0 ]
+check "the checkout's never ran" [ ! -e "$T/checkout-producer-ran" ]
+check "the tree's content shipped" bash -c 'f=$(find "'"$STUB_REMOTE"'" -name "app-*.age" | head -1); [ "$(cat "$f")" = the-backup-content ]'
+cp "$TREE/deploy/backup-producer.sh" "$HR/srv/app/deploy/backup-producer.sh"; rm -rf "${STUB_REMOTE:?}"/* "$MARKER"
+
+echo "1c. a producer in the checkout but no verified tree: a loud failure, never a fallback"
+mv "${TREE%/*}/current" "$T/current.bak"
+reset_log; run
+check "exit 1"                 [ "$(rc)" = 1 ]
+check "said no verified tree"  grep -q "no verified tree" "$T/out.txt"
+check "nothing shipped"        [ -z "$(find "$STUB_REMOTE" -type f)" ]
+mv "$T/current.bak" "${TREE%/*}/current"
 
 echo "2. backup-producer.sh exists but BACKUP_AGE_RECIPIENT unset: refuses loudly"
 reset_log; run BACKUP_AGE_RECIPIENT=
@@ -118,7 +143,7 @@ reset_log; run
 check "exit 0"                          [ "$(rc)" = 0 ]
 check "encrypted with the recipient"    called "age1recipient"
 check "uploaded to host/app-stamp.age"  bash -c 'find "$STUB_REMOTE" -name "app-*.age" | grep -q .'
-check "marker written"                  [ -f "$HR/var/lib/app/backup-last-success" ]
+check "marker written"                  [ -f "$MARKER" ]
 check "said OK"                         grep -q "OK" "$T/out.txt"
 
 echo "5. the uploaded object round-trips to the exact producer content"
@@ -127,11 +152,11 @@ f=$(find "$STUB_REMOTE" -name "app-*.age" | head -1)
 check "content matches"        [ "$(cat "$f")" = "the-backup-content" ]
 
 echo "6. the producer fails: refuses, no upload, no marker"
-rm -rf "${STUB_REMOTE:?}"/*; rm -f "$HR/var/lib/app/backup-last-success"
+rm -rf "${STUB_REMOTE:?}"/*; rm -f "$MARKER"
 reset_log; run STUB_PRODUCER_FAIL=1
 check "exit 1"                 [ "$(rc)" = 1 ]
 check "no upload"              [ -z "$(remote_files)" ]
-check "no marker"              [ ! -f "$HR/var/lib/app/backup-last-success" ]
+check "no marker"              [ ! -f "$MARKER" ]
 
 echo "7. the producer emits nothing: refused, not shipped as an empty backup"
 reset_log; run STUB_PRODUCER_EMPTY=1
@@ -147,13 +172,13 @@ check "no upload"              [ -z "$(remote_files)" ]
 echo "9. the upload itself fails: refuses, no marker"
 reset_log; run STUB_RCAT_FAIL=1
 check "exit 1"                 [ "$(rc)" = 1 ]
-check "no marker"              [ ! -f "$HR/var/lib/app/backup-last-success" ]
+check "no marker"              [ ! -f "$MARKER" ]
 
 echo "10. a round-trip mismatch (corrupted upload) is caught, not silently accepted"
 reset_log; run STUB_CORRUPT_UPLOAD=1
 check "exit 1"                          [ "$(rc)" = 1 ]
 check "said mismatch"                   grep -qi "mismatch" "$T/out.txt"
-check "marker NOT written on mismatch"  [ ! -f "$HR/var/lib/app/backup-last-success" ]
+check "marker NOT written on mismatch"  [ ! -f "$MARKER" ]
 
 echo "11. BACKUP_KEEP_LAST prunes the oldest objects for THIS app only"
 rm -rf "${STUB_REMOTE:?}"/*
