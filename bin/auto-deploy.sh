@@ -567,7 +567,10 @@ for app in "${APPS[@]}"; do
     in_scope=1
   fi
   [ -n "$in_scope" ] || continue
-  [ -f "$BASE_DIR/$app" ] || printf '%s\n' "$LOCAL" > "$BASE_DIR/$app"
+  # Keyed on the MARKER, not the base file: with no deploy pending, this tick
+  # starts a new one from LOCAL, whatever an orphaned base (a hand-deleted
+  # marker, an app that left and came back) says.
+  [ -f "$PENDING_DIR/$app" ] || printf '%s\n' "$LOCAL" > "$BASE_DIR/$app"
   if [ -n "$LOCK_CHANGED" ]; then
     echo restart > "$PENDING_DIR/$app"
   elif [ ! -f "$PENDING_DIR/$app" ] || [ "$(cat "$PENDING_DIR/$app" 2>/dev/null)" != restart ]; then

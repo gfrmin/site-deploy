@@ -743,6 +743,13 @@ reset_log; run_deploy CONVERGE_CMD=env
 check "exit 0"                     [ "$(rc)" = 0 ]
 check "no second dispatch"         not_called "cf-converge@app.service"
 
+echo "24d. an orphaned base (marker deleted by hand) never makes a later deploy over-dispatch"
+git -C "$SRV" rev-parse HEAD~3 > "$SRV/.site-deploy-state/pending-base/app"   # predates the cloudflare.json change
+push_commit c24d; ( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "no spurious cf-converge"    not_called "cf-converge@app.service"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))
