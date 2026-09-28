@@ -190,6 +190,33 @@ app_probe_external() {   # <app>
   python3 "$SELF/bin/site-config.py" --app-keys "$SRV/$dir/deploy/site.toml" 2>/dev/null \
     | sed -n "s/^export PROBE_EXTERNAL=//p" | tail -1 | tr -d "'\""
 }
+# <app>'s `backup_timeout` (site.toml): site-backup@<app>'s TimeoutStartSec,
+# for a producer the unit's default cannot fit (issue #42: a 77 GB pg_dump).
+# Read exactly, not sed-extracted like the helpers above: a line-oriented
+# extraction would quietly accept the first line of a multi-line value.
+# Validated at the point of use (valid_backup_timeout). No site.toml is no
+# knob (empty, status 0); an UNREADABLE one is status 1, which must never be
+# read as "no knob" -- that would delete a working backup's timeout.
+app_backup_timeout() {   # <app>
+  local a=$1 dir
+  dir=$(app_dir "$a")
+  python3 -c 'import os, sys, tomllib
+if not os.path.exists(sys.argv[1]): sys.exit(0)
+deploy = tomllib.load(open(sys.argv[1], "rb")).get("deploy", {})
+if not isinstance(deploy, dict): sys.exit(1)
+sys.stdout.write(str(deploy.get("backup_timeout", "")))' \
+    "$SRV/$dir/deploy/site.toml" 2>/dev/null
+}
+# <N>min or <N>h, at least a minute and at most 23h: the backup is daily, so a
+# run allowed to outlast its own cadence is a hang, not a slow backup. Nothing
+# else -- the value is written into a unit file root's systemd reads.
+valid_backup_timeout() {
+  local n
+  if [[ $1 =~ ^([1-9][0-9]{0,3})min$ ]]; then n=${BASH_REMATCH[1]}
+  elif [[ $1 =~ ^([1-9][0-9]?)h$ ]]; then n=$(( BASH_REMATCH[1] * 60 ))
+  else return 1; fi
+  [ "$n" -le 1380 ]
+}
 # Two kinds of timer, two policies for one an operator STOPPED without
 # disabling. An ALARM timer (probe, sweep) is re-armed: there is no sanctioned
 # stopped state for an alarm — a stopped timer is a silently dead alarm, and
@@ -275,7 +302,8 @@ if [ -n "$WORKSPACE" ]; then
         rm -f "$link"
         say "$name: removed /srv/$name (no longer hosted here)"
         rm -rf "$ETC/systemd/system/site-probe@$name.service.d" \
-               "$ETC/systemd/system/site-checks-armed@$name.service.d"
+               "$ETC/systemd/system/site-checks-armed@$name.service.d" \
+               "$ETC/systemd/system/site-backup@$name.service.d"
         disarm "site-probe@$name.timer" "$name no longer hosted here"
         disarm "site-checks-armed@$name.timer" "$name no longer hosted here"
         disarm "cf-drift@$name.timer" "$name no longer hosted here"
@@ -591,6 +619,28 @@ for a in "${APPS[@]}"; do
     fi
   else
     disarm "site-backup@$a.timer" "no deploy/backup-producer.sh"
+  fi
+  # The timeout drop-in follows the knob alone, not the producer or the
+  # credentials: it is inert while the timer is disarmed, and rendering it
+  # first means the first armed run already has it. A refused value leaves
+  # the last good drop-in in place -- a typo must not shrink a working
+  # backup's timeout back to the default and fail it tonight.
+  bt_dir="$ETC/systemd/system/site-backup@$a.service.d"
+  if ! bt=$(app_backup_timeout "$a"); then
+    note_failure "$a: $a_dir/deploy/site.toml is unreadable — site-backup@$a's timeout drop-in left as it was"
+  elif [ -z "$bt" ]; then
+    if [ -e "$bt_dir/timeout.conf" ]; then
+      rm -f "$bt_dir/timeout.conf"; rmdir "$bt_dir" 2>/dev/null || true
+      say "$a: removed site-backup@$a timeout drop-in (no backup_timeout in site.toml)"
+      units_changed=1
+    fi
+  elif valid_backup_timeout "$bt"; then
+    tmp_dropin=$(mktemp)
+    printf '[Service]\nTimeoutStartSec=%s\n' "$bt" > "$tmp_dropin"
+    sync_file "$tmp_dropin" "$bt_dir/timeout.conf" && units_changed=1
+    rm -f "$tmp_dropin"
+  else
+    note_failure "$a: REFUSED backup_timeout $(printf '%q' "$bt"): must be <N>min or <N>h, from 1min to 23h"
   fi
 done
 

@@ -178,6 +178,7 @@ tailwindcss_version = "4.3.3"      # apps with static/src.css: pin the compiler 
 # build_inputs  = ["data/build_db.py"]    # paths whose change dispatches build_service (default shown)
 # converge      = true                    # apply deploy/ to the box each tick (see below)
 # probe_external = "<healthchecks check name or slug>"  # probed off-box; no on-box probe (see Monitoring)
+# backup_timeout = "2h"                  # site-backup@<app>'s TimeoutStartSec, <N>min or <N>h, max 23h (see Off-box backup)
 ```
 
 `service` and `build_inputs` exist for workspace mode (Phase D item 14: several apps served from
@@ -546,6 +547,16 @@ required vars are set; a declared producer with no credentials nags instead of s
 up. `age` and `rclone` are not in the fleet's base `host/packages.txt` (most apps need neither) — an
 app that opts in adds them to its own `deploy/packages.txt`, the same mechanism an app already uses
 for a native library dependency.
+
+**A large producer sets `backup_timeout`** in its own `deploy/site.toml` (issue #42). The unit's
+default `TimeoutStartSec=20min` covers a small database; a 77 GB `pg_dump` at idle priority takes
+that long on its own, before the encrypt, upload and full round-trip download. `host-converge.sh`
+renders the value into `site-backup@<app>.service.d/timeout.conf`, and removes the drop-in when the
+key goes. It accepts `<N>min` or `<N>h`, from 1min to 23h (a daily backup allowed to outlast its own
+cadence is a hang, not a slow backup). Any other value is refused as a counted failure, and the last
+good drop-in stays put, so a typo cannot shrink a working backup's timeout back to the default. If
+`HEALTHCHECKS_BACKUP_URL` is set, give that check a grace time longer than the timeout: the run
+pings `/start`, so a check whose grace is shorter reports it down while it is still running.
 
 ### Reference units: `systemd/app@.service`, `systemd/site-build@.service`
 
