@@ -54,22 +54,6 @@ if [ -x "$SELF/bin/site-tree.sh" ]; then
   done
 fi
 
-# A transient fetch failure just retries next tick (exit 0, not failed) —
-# the same rule as auto-deploy.sh, for the same reason: a flapping network
-# must not turn into a red unit every two minutes.
-#
-# --prune is load-bearing. A ref deleted on the remote lives on as a stale
-# refs/remotes/origin/<ref> locally until something prunes it, so without this
-# a deleted ci-green would pass the existence check below forever and the gate
-# would quietly keep "deploying" the last commit it ever pointed at.
-git fetch --quiet --prune origin || { log "fetch failed (transient?); will retry next tick"; exit 0; }
-
-if ! REMOTE=$(git rev-parse --verify --quiet "refs/remotes/origin/$REF"); then
-  log "REFUSING TO UPDATE: origin/$REF does not exist, so there is no tested toolkit" \
-      "commit to take. Keeping $(git rev-parse --short @). Fix CI, or set" \
-      "SITE_DEPLOY_REF=master on site-deploy-update.service to bypass the gate."
-  exit 1
-fi
 # The Caddy snippet (host/caddy/*.caddy) is imported by site Caddyfiles
 # straight out of this checkout, so changing it IS a change to every importing
 # site's proxy config, one nothing else applies or checks: an app's converge
@@ -93,7 +77,11 @@ caddy_wanted() {
   [ -f "$caddyfile" ] || return 1
   [ -n "${CADDY_VALIDATE:-}" ] || command -v caddy >/dev/null 2>&1
 }
-snippet_id() { git ls-tree -r HEAD -- host/caddy/ | grep '\.caddy$' | sha256sum | cut -c1-16; }
+# The files on disk, which are what Caddy loads, not HEAD: a hand edit counts.
+snippet_id() {
+  local f
+  for f in host/caddy/*.caddy; do [ -f "$f" ] && { echo "$f"; cat "$f"; }; done | sha256sum | cut -c1-16
+}
 caddy_validate() {   # the live Caddyfile against whatever is checked out now
   if [ -n "${CADDY_VALIDATE:-}" ]; then $CADDY_VALIDATE "$caddyfile"; return; fi
   local user
@@ -123,9 +111,34 @@ caddy_converge() {   # 0: applied or nothing to do; 1: does not validate; 2: rel
   echo "$id" > "$caddy_stamp"
 }
 # The refusal (below) is keyed to the commit AND the Caddyfile, so a change to
-# either retries; `rm` of the file retries by hand.
+# either retries at once. A Caddyfile can import other files, which that key
+# cannot see, so a refusal also lapses after an hour and is retried: a fix in
+# an imported file lands within the hour, and the broken snippet is on disk
+# for a moment at most hourly. `rm` of the file retries by hand.
 refusal_key() { echo "$REMOTE $(sha256sum < "$caddyfile" 2>/dev/null | cut -c1-16)"; }
+refusal_live() {
+  [ "$(cat "$refused" 2>/dev/null)" = "$(refusal_key)" ] \
+    && [ -n "$(find "$refused" -mmin -"${CADDY_REFUSAL_MIN:-60}" 2>/dev/null)" ]
+}
 
+# A transient fetch failure just retries next tick (exit 0, not failed) —
+# the same rule as auto-deploy.sh, for the same reason: a flapping network
+# must not turn into a red unit every two minutes.
+#
+# --prune is load-bearing. A ref deleted on the remote lives on as a stale
+# refs/remotes/origin/<ref> locally until something prunes it, so without this
+# a deleted ci-green would pass the existence check below forever and the gate
+# would quietly keep "deploying" the last commit it ever pointed at.
+# Caddy converges on these early exits too: a stale stamp must not hide
+# behind a flapping network or a missing ref.
+git fetch --quiet --prune origin || { log "fetch failed (transient?); will retry next tick"; caddy_converge || exit 1; exit 0; }
+
+if ! REMOTE=$(git rev-parse --verify --quiet "refs/remotes/origin/$REF"); then
+  log "REFUSING TO UPDATE: origin/$REF does not exist, so there is no tested toolkit" \
+      "commit to take. Keeping $(git rev-parse --short @). Fix CI, or set" \
+      "SITE_DEPLOY_REF=master on site-deploy-update.service to bypass the gate."
+  caddy_converge; exit 1
+fi
 LOCAL=$(git rev-parse @)
 if [ "$LOCAL" = "$REMOTE" ]; then caddy_converge; exit $?; fi   # current -> silent unless Caddy needs applying
 
@@ -136,7 +149,7 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   log "REFUSING TO UPDATE: tracked files are modified in $SELF (someone edited the" \
       "toolkit in place); commit or discard them. origin/$REF is at ${REMOTE:0:9}."
   git status --porcelain --untracked-files=no | sed 's/^/site-deploy-update:   /'
-  exit 1
+  caddy_converge; exit 1
 fi
 if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
   if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
@@ -149,10 +162,10 @@ fi
 # A commit already refused for breaking this Caddyfile is not re-merged just to
 # roll back again: that would put the broken snippet on disk for a moment every
 # tick, and a Caddy restart in that moment would load it.
-if caddy_wanted && [ "$(cat "$refused" 2>/dev/null)" = "$(refusal_key)" ]; then
+if caddy_wanted && refusal_live; then
   log "REFUSING TO UPDATE: ${REMOTE:0:9} breaks $caddyfile (refused earlier; the reason" \
-      "is above in this journal). Staying on ${LOCAL:0:9} until origin/$REF moves or the" \
-      "Caddyfile changes; rm $refused to retry now. Fix master."
+      "is above in this journal). Staying on ${LOCAL:0:9} until origin/$REF moves, the Caddyfile" \
+      "changes or the hourly retry; rm $refused to retry now. Fix master."
   caddy_converge; exit 1
 fi
 

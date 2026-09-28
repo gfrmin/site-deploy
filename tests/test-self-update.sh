@@ -183,10 +183,26 @@ run_caddy
 check "  ...retried next tick, not silence" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 0 ] && grep -qx RELOAD "'"$CV"'"'
 
 push_caddy good6; run_caddy SITE_DEPLOY_REF=master; run_caddy
-check "ahead of the gate: the snippet was still applied" bash -c 'grep -qx good6 "'"$SELF"'/host/caddy/rp.caddy" && [ "$(cat "'"$STAMP"'")" = "$(cd "'"$SELF"'" && git ls-tree -r HEAD -- host/caddy/ | grep "\.caddy$" | sha256sum | cut -c1-16)" ]'
+run_caddy
+check "ahead of the gate: the snippet was applied (next tick silent)" bash -c 'grep -qx good6 "'"$SELF"'/host/caddy/rp.caddy" && [ ! -s "'"$CV"'" ] && [ "$(cat "'"$T"'/rc.txt")" = 0 ]'
 rm -f "$STAMP"; run_caddy
 check "ahead of the gate: an unapplied snippet converges" grep -qx RELOAD "$CV"
 green_to_master; run_caddy
+
+echo "  -- review round 3: hand edits, early exits, imported files --"
+cp "$SELF/host/caddy/rp.caddy" "$T/rp.keep"; echo BROKEN >> "$SELF/host/caddy/rp.caddy"; run_caddy
+check "a hand-edited snippet is validated, and fails loudly" bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && grep -q "does not validate" "'"$T"'/out.txt"'
+cp "$T/rp.keep" "$SELF/host/caddy/rp.caddy"
+rm -f "$STAMP"; git -C "$SELF" remote set-url origin "$T/nowhere.git"; run_caddy
+check "fetch failure: Caddy still converges" grep -qx RELOAD "$CV"
+git -C "$SELF" remote set-url origin "$ORIGIN"
+rm -f "$STAMP"; run_caddy SITE_DEPLOY_REF=no-such-ref
+check "missing ref: Caddy still converges"  bash -c '[ "$(cat "'"$T"'/rc.txt")" = 1 ] && grep -qx RELOAD "'"$CV"'"'
+good=$(at); push_caddy BROKEN; green_to_master; run_caddy
+check "refused again (setup for the lapse)" [ "$(at)" = "$good" ]
+run_caddy CADDY_REFUSAL_MIN=0
+check "a refusal lapses (an imported file may have been fixed)" grep -q "VALIDATE $CF BROKEN" "$CV"
+push_caddy good6b; green_to_master; run_caddy
 
 push_caddy good7; green_to_master; run_caddy CADDYFILE="$T/no-such-Caddyfile"
 check "no Caddyfile: updates, exit 0"      bash -c '[ "$(cat "'"$T"'/rc.txt")" = 0 ] && grep -qx good7 "'"$SELF"'/host/caddy/rp.caddy"'
