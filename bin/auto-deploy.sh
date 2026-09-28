@@ -404,7 +404,7 @@ if [ "$REF" != master ] && MASTER=$(git rev-parse --verify --quiet refs/remotes/
   if [ "$frozen_sha" != "$REMOTE" ]; then
     { printf '%s %s\n' "$REMOTE" "$now" > "$REF_FROZEN_STAMP"; } 2>/dev/null || true
   elif [ $(( now - frozen_since )) -ge "$REF_FROZEN_SECONDS" ]; then
-    REF_FROZEN="origin/$REF has not moved for $(( now - frozen_since ))s while origin/master is $behind commit(s) ahead — CI is red or not running, so this box is level with an untested gap"
+    REF_FROZEN="origin/$REF has not moved for $(( now - frozen_since ))s while origin/master is $behind commit(s) ahead — CI is red or not running"
   fi
 else
   rm -f "$REF_FROZEN_STAMP" 2>/dev/null || true
@@ -427,8 +427,8 @@ if [ "$LOCAL" = "$REMOTE" ] && ! any_pending; then
   if [ -n "$REF_FROZEN" ]; then
     # Level with a ref that stopped moving is not "where it should be".
     rm -f "$BEHIND_STAMP" 2>/dev/null || true
-    log "DEPLOY GATE FROZEN: $REF_FROZEN"
-    hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: GATE FROZEN — $REF_FROZEN"
+    log "DEPLOY GATE FROZEN: $REF_FROZEN, so this box is level with an untested gap"
+    hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: GATE FROZEN — $REF_FROZEN, so this box is level with an untested gap"
   else
     report_level "at ${LOCAL:0:9} (origin/$REF)"
   fi
@@ -462,14 +462,49 @@ if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
   # minutes, which trains everyone to ignore `systemctl --failed`. Genuine
   # divergence — neither commit an ancestor of the other — stays fatal, because
   # nothing but a human can resolve it.
+  #
+  # Ahead of a GATE ref (deploy_ref) is also where a box lands on master's own
+  # commits the gate has not passed: the transition deploy (the pre-merge read
+  # of site.toml still said master), or an /etc deploy-ref = master override
+  # being removed. Two things must keep working there (issue #29):
+  #   * a pending marker is RESUMED -- finishing what is checked out, never
+  #     advancing -- but only when every checked-out commit is on origin/master.
+  #     The resume runs deploy/converge.sh as root, and the dirty-tree guard
+  #     compares to HEAD, so a commit made ON the box plus a marker would
+  #     otherwise be an app user's path to root. A marker on top of such a
+  #     commit is a stranded deploy: /fail, not level.
+  #   * a gate frozen for REF_FROZEN_SECONDS is /fail, as when level: the box
+  #     is serving commits the gate never passed, and the ref is not coming.
   if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
-    log "local is ahead of origin by $(git rev-list --count "$REMOTE".."$LOCAL") commit(s) — nothing to deploy"
-    report_level "ahead of origin at ${LOCAL:0:9}"
-    DRAIN_OK=1
-    exit 0
+    ahead=$(git rev-list --count "$REMOTE".."$LOCAL")
+    on_master=""
+    MASTER_TIP=$(git rev-parse --verify --quiet refs/remotes/origin/master) \
+      && git merge-base --is-ancestor "$LOCAL" "$MASTER_TIP" && on_master=1
+    if any_pending && [ -n "$on_master" ]; then
+      log "resuming an unfinished deploy of ${LOCAL:0:9} ($ahead commit(s) ahead of origin/$REF, all on origin/master) — finishing what is checked out, not advancing"
+      REMOTE=$LOCAL
+    elif any_pending; then
+      rm -f "$BEHIND_STAMP" 2>/dev/null || true
+      log "UNFINISHED DEPLOY NOT RESUMED: ${LOCAL:0:9} is $ahead commit(s) ahead of origin/$REF with commit(s) on no origin branch; root will not converge them. Drop or push the local commit(s)."
+      hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: unfinished deploy stranded — ${LOCAL:0:9} holds local-only commit(s) ahead of origin/$REF"
+      DRAIN_OK=1
+      exit 0
+    else
+      log "local is ahead of origin by $ahead commit(s) — nothing to deploy"
+      if [ -n "$REF_FROZEN" ]; then
+        rm -f "$BEHIND_STAMP" 2>/dev/null || true
+        log "DEPLOY GATE FROZEN: $REF_FROZEN, and this box is $ahead commit(s) AHEAD of origin/$REF, serving commit(s) the gate never passed"
+        hc_ping "$HC_DEPLOY" /fail "auto-deploy[$APP]: GATE FROZEN — $REF_FROZEN, and this box is $ahead commit(s) AHEAD of origin/$REF, serving untested commit(s)"
+      else
+        report_level "ahead of origin at ${LOCAL:0:9}"
+      fi
+      DRAIN_OK=1
+      exit 0
+    fi
+  else
+    log "local has diverged from origin (neither is an ancestor of the other) — manual fix needed"
+    exit 1
   fi
-  log "local has diverged from origin (neither is an ancestor of the other) — manual fix needed"
-  exit 1
 fi
 
 log "${LOCAL:0:9} -> ${REMOTE:0:9} (origin/$REF); deploying"
