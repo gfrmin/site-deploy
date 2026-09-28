@@ -30,13 +30,32 @@ SELF="$ROOT/srv/site-deploy"
 SRV="$ROOT/srv/$APP"
 ETC="$ROOT/etc"
 APP_ETC="$ETC/$APP"
-DESIRED="$SRV/deploy/cloudflare.json"
 CFC="${CFC:-$SELF/bin/cf-converge.py}"
 PYTHON="${PYTHON:-python3}"
 
 say() { echo "cf-converge-run[$APP]: $*"; }
 
-[ -f "$DESIRED" ] || { say "no $DESIRED; nothing to converge"; exit 0; }
+# cloudflare.json decides the zone's DNS and WAF, and this runs as root with a
+# zone-scoped token, so it comes from root's verified tree of the deployed
+# commit (bin/site-tree.sh), never from the checkout the service user can
+# write (issue #31): an app compromise must not become a DNS takeover.
+# shellcheck disable=SC1091
+. "$SELF/lib/workspace.sh"
+site=$(ws_site_of "$ROOT" "$APP")
+# stdout is the tree's path; anything site-tree.sh says goes to our stderr.
+tree_why=$(mktemp); trap 'rm -f "$tree_why"' EXIT
+if [ "$site" = "$APP" ]; then TREE=$("$SELF/bin/site-tree.sh" use "$site" 2>"$tree_why")
+else TREE=$("$SELF/bin/site-tree.sh" use "$site" "$APP" 2>"$tree_why"); fi || {
+  TREE=$(cat "$tree_why")
+  if [ -f "$SRV/deploy/cloudflare.json" ]; then
+    say "no verified tree of $APP's code to take cloudflare.json from ($TREE); refusing"
+    exit 1
+  fi
+  say "no deploy/cloudflare.json; nothing to converge"; exit 0
+}
+cat "$tree_why" >&2
+DESIRED="$TREE/deploy/cloudflare.json"
+[ -f "$DESIRED" ] || { say "no deploy/cloudflare.json in the deployed tree; nothing to converge"; exit 0; }
 
 envval() { [ -r "$2" ] && sed -n "s/^$1=//p" "$2" | tail -1 | tr -d '"'"'"'[:space:]'; }
 
@@ -45,8 +64,8 @@ envval() { [ -r "$2" ] && sed -n "s/^$1=//p" "$2" | tail -1 | tr -d '"'"'"'[:spa
 # only in /etc/<app>/cf-env, though an override there wins for an app with no
 # site.toml yet.
 CF_DOMAIN=$(envval CF_DOMAIN "$APP_ETC/cf-env")
-if [ -z "$CF_DOMAIN" ] && [ -f "$SRV/deploy/site.toml" ]; then
-  CF_DOMAIN=$(python3 "$SELF/bin/site-config.py" "$SRV/deploy/site.toml" 2>/dev/null \
+if [ -z "$CF_DOMAIN" ] && [ -f "$TREE/deploy/site.toml" ]; then
+  CF_DOMAIN=$(python3 "$SELF/bin/site-config.py" "$TREE/deploy/site.toml" 2>/dev/null \
                 | sed -n "s/^export CF_DOMAIN=//p" | tr -d "'\"")
 fi
 [ -n "$CF_DOMAIN" ] || {

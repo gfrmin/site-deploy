@@ -287,6 +287,22 @@ fi
 
 # Install $1 at $2 only if it differs. Returns 0 when it wrote something.
 # A missing SOURCE is a counted failure, not a silent "updated": the first
+# --- 0. the pinned origin root fetches app content from (bin/site-tree.sh) ------
+# site-tree.sh pins it on first use (from the checkout's remote.origin.url, said
+# loudly) and never re-reads it after. Asked here so the PINNED line lands in the
+# deploy log on the tick this ships, and so a site that NEEDS the tree (converge,
+# a backup producer, a cloudflare.json) and cannot have one is told every tick.
+needs_tree=""
+case $(python3 "$SELF/bin/site-config.py" "$SRV/deploy/site.toml" 2>/dev/null | sed -n "s/^export DEPLOY_CONVERGE=//p" | tail -1 | tr -d "'\"") in
+  True|true|1) needs_tree=1 ;;
+esac
+[ -n "$(find "$SRV" -path "$SRV/.git" -prune -o \( -path '*/deploy/cloudflare.json' -o -path '*/deploy/backup-producer.sh' \) -print -quit 2>/dev/null)" ] && needs_tree=1
+if ! origin_msg=$("$SELF/bin/site-tree.sh" origin "$APP" 2>&1); then
+  [ -n "$needs_tree" ] && say "$origin_msg — root cannot verify this app's code, so its converge, backup and cf-converge WILL REFUSE"
+elif [ -n "$origin_msg" ]; then
+  say "$origin_msg"
+fi
+
 # --- 1. the toolkit's own units --------------------------------------------------
 # install.sh copied them once; a change to any of them (a pinned ref in an
 # Environment=, a new ExecStopPost) reached a box only if a human recopied it.
@@ -349,12 +365,12 @@ tmp_sudo=$(mktemp)
         fi
       fi
       echo "$APP ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block cf-converge@$a.service"
-      echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/converge.sh $a"
     done
   fi
   echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/host-converge.sh $APP"
-  echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/converge.sh $APP"
-  echo "$APP ALL=(root) NOPASSWD: /srv/$APP/deploy/converge.sh"
+  # Root runs app content only from its own verified tree (bin/site-tree.sh,
+  # issue #31): never a grant naming the checkout, which this user can write.
+  echo "$APP ALL=(root) NOPASSWD: /srv/site-deploy/bin/site-tree.sh converge $APP *"
 } > "$tmp_sudo"
 if visudo -cf "$tmp_sudo" >/dev/null 2>&1; then
   sync_file "$tmp_sudo" "$ETC/sudoers.d/$APP-deploy" 0440 || true

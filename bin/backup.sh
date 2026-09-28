@@ -28,10 +28,13 @@ APP=${1:?usage: backup.sh <app>}
 ROOT="${HOST_ROOT:-}"
 SELF="$ROOT/srv/site-deploy"
 SRV="$ROOT/srv/$APP"
-PRODUCER="$SRV/deploy/backup-producer.sh"
-STATE_DIR="${BACKUP_STATE_DIR:-$ROOT/var/lib/$APP}"
+# Root's own store: a stamp written as root into /var/lib/<app> (possibly the
+# app's own StateDirectory=) would follow whatever symlink the app put there.
+STATE_DIR="${BACKUP_STATE_DIR:-$ROOT/var/lib/site-deploy-root/backup/$APP}"
 # shellcheck disable=SC1091
 . "$SELF/lib/hc.sh"
+# shellcheck disable=SC1091
+. "$SELF/lib/workspace.sh"
 
 HC_URL="${HEALTHCHECKS_BACKUP_URL:-}"
 log() { echo "backup[$APP]: $*"; }
@@ -41,7 +44,23 @@ fail() {
   exit 1
 }
 
-[ -x "$PRODUCER" ] || { log "no deploy/backup-producer.sh; nothing to back up"; exit 0; }
+# The producer runs as ROOT, so it comes from root's verified tree of the
+# deployed commit (bin/site-tree.sh), never from the checkout the service user
+# can write (issue #31). A producer in the checkout with no tree to take it
+# from is a backup that cannot run: loud, never a fallback.
+site=$(ws_site_of "$ROOT" "$APP")
+# stdout is the tree's path; anything site-tree.sh says goes to our stderr.
+tree_why=$(mktemp); trap 'rm -f "$tree_why"' EXIT
+if [ "$site" = "$APP" ]; then tree=$("$SELF/bin/site-tree.sh" use "$site" 2>"$tree_why")
+else tree=$("$SELF/bin/site-tree.sh" use "$site" "$APP" 2>"$tree_why"); fi || {
+  tree=$(cat "$tree_why")
+  [ -e "$SRV/deploy/backup-producer.sh" ] \
+    && fail "no verified tree of $APP's code to take backup-producer.sh from ($tree)"
+  log "no deploy/backup-producer.sh; nothing to back up"; exit 0
+}
+cat "$tree_why" >&2
+PRODUCER="$tree/deploy/backup-producer.sh"
+[ -x "$PRODUCER" ] || { log "no deploy/backup-producer.sh in the deployed tree; nothing to back up"; exit 0; }
 
 for var in BACKUP_AGE_RECIPIENT BACKUP_RCLONE_DEST; do
   [ -n "${!var:-}" ] || fail "deploy/backup-producer.sh exists but $var is not set in /etc/$APP/backup-env"
@@ -58,7 +77,7 @@ dest="$destdir/$APP-$stamp.age"
 keep="${BACKUP_KEEP_LAST:-14}"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK" "$tree_why"' EXIT
 plain="$WORK/plain"
 cipher="$WORK/backup.age"
 
@@ -84,7 +103,7 @@ fi
 # was the only thing standing between a claimed backup and no backup at all.
 rm -f "$cipher"
 
-install -d -m0755 "$STATE_DIR"
+install -d -m0700 "$STATE_DIR"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DIR/backup-last-success"
 
 # Prune to the newest $keep objects for THIS app. Names are timestamped, so

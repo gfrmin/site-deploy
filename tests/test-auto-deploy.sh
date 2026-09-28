@@ -129,12 +129,32 @@ echo "CONVERGE-ENGINE RAN $*" >> "$STUB_LOG"
 exit ${FAKE_CONVERGE_ENGINE_RC:-0}
 STUB
 chmod +x "$T/bin/converge-engine"
+# bin/site-tree.sh is root's verified export of the deployed commit; it has
+# its own suite (tests/test-site-tree.sh). Here the checkout IS the deployed
+# commit, so the stub stands the checkout in for the tree and runs the same
+# three-way rule (hook, not-executable, engine), which keeps this file about
+# the poller's WIRING. `pin` just records the call.
+cat > "$T/bin/site-tree" <<'STUB'
+#!/usr/bin/env bash
+echo "SITE-TREE RAN $*" >> "$STUB_LOG"
+[ "$1" = pin ] && exit "${FAKE_PIN_RC:-0}"
+dir=$STUB_SRV; [ -n "${4:-}" ] && dir="$STUB_SRV/apps/$4"
+if [ -x "$dir/deploy/converge.sh" ]; then
+  ( cd "$dir" && ./deploy/converge.sh ) || { echo "site-tree[$2]: deploy/converge.sh failed" >&2; exit 1; }
+elif [ -e "$dir/deploy/converge.sh" ]; then
+  echo "site-tree[$2]: deploy/converge.sh is in the tree but not executable" >&2; exit 1
+else
+  "$STUB_ENGINE" "${4:-$2}" || exit 1
+fi
+STUB
+chmod +x "$T/bin/site-tree"
+export STUB_SRV="$SRV" STUB_ENGINE="$T/bin/converge-engine"
 run_deploy() {
   env APP=app APP_DIR="$SRV" SITE_DEPLOY_DIR="$ROOT" UV="$T/bin/uv" CURL="$T/bin/curl" \
       RELOAD_CMD="$T/bin/systemctl" PORT=8000 DEPLOY_HEALTH_TRIES=2 \
       CF_ZONE_ID=zone1 CF_CACHE_PURGE_TOKEN=tok1 \
       CONVERGE_CMD=env HOST_CONVERGE_CMD="$T/bin/host-converge" \
-      CONVERGE_ENGINE_CMD="$T/bin/converge-engine" DEPLOY_REF_FILE="$T/deploy-ref" \
+      CONVERGE_ENGINE_CMD="$T/bin/converge-engine" SITE_TREE_CMD="$T/bin/site-tree" DEPLOY_REF_FILE="$T/deploy-ref" \
       "$@" bash "$ROOT/bin/auto-deploy.sh" > "$T/out.txt" 2>&1
   echo $? > "$T/rc.txt"
 }
@@ -278,7 +298,8 @@ push_commit c11c; reset_log; run_deploy CONVERGE_CMD=env FAKE_CONVERGE_ENGINE_RC
 check "exit non-zero"           [ "$(rc)" != 0 ]
 check "tried the engine"        called "CONVERGE-ENGINE RAN"
 check "did NOT reload"          not_called "systemctl restart app"
-check "said why"                grep -qi "converge.sh failed" "$T/out.txt"
+check "said why"                grep -qi "converge from root's verified tree of .* failed" "$T/out.txt"
+check "through root's tree"     called "SITE-TREE RAN converge app "
 ( cd "$WORK" || exit 1; printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\n' > deploy/site.toml
   git commit -qam "converge off again"; git push -q origin master )
 reset_log; run_deploy CONVERGE_CMD=env
@@ -323,7 +344,7 @@ echo "12d. declared but unusable refuses to deploy rather than deploying blind"
 reset_log; run_deploy CONVERGE_CMD=env
 check "exit non-zero"           [ "$(rc)" != 0 ]
 check "did NOT reload"          not_called "systemctl restart app"
-check "named the problem"       grep -qi "converge.sh is not executable" "$T/out.txt"
+check "named the problem"       grep -qi "converge.sh is in the tree but not executable" "$T/out.txt"
 
 echo "12e. root never runs a converge script out of a checkout that differs from the commit"
 # converge.sh runs as root via NOPASSWD from a directory the service user can
@@ -749,6 +770,16 @@ push_commit c24d; ( cd "$WORK" || exit 1; git push -q origin master:refs/heads/c
 reset_log; run_deploy CONVERGE_CMD=env
 check "exit 0"                     [ "$(rc)" = 0 ]
 check "no spurious cf-converge"    not_called "cf-converge@app.service"
+
+echo "25. a site that does not converge never calls root's tree at all (its root consumers refresh it themselves)"
+( cd "$WORK" || exit 1
+  printf '[deploy]\nreload = "restart"\nport = 8000\nhealth_path = "/health"\nhealth_match = "ok"\nhealth_tries = 2\ndeploy_ref = "ci-green"\n' > deploy/site.toml
+  git commit -qam "converge off"; git push -q origin master; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+push_commit c25; ( cd "$WORK" || exit 1; git push -q origin master:refs/heads/ci-green )
+reset_log; run_deploy CONVERGE_CMD=env
+check "exit 0"                     [ "$(rc)" = 0 ]
+check "no site-tree call"          not_called "SITE-TREE RAN"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

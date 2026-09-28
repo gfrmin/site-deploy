@@ -45,7 +45,13 @@ exit "${STUB_CFC_RC:-0}"
 STUB
 chmod +x "$T/fake-cfc.sh"
 
-printf '{}' > "$HR/srv/app/deploy/cloudflare.json"
+# cloudflare.json and site.toml come from root's verified tree
+# (bin/site-tree.sh, its own suite); a sandbox tree stands in for it here.
+TREE="$HR/var/lib/site-deploy-root/tree/app/0123456789abcdef0123456789abcdef01234567"
+mkdir -p "$TREE/deploy"; ln -sfn "${TREE##*/}" "${TREE%/*}/current"
+printf '[deploy]\nconverge = true\n' > "$TREE/deploy/site.toml"   # a converging site: `use` answers `current`
+printf '{}' > "$TREE/deploy/cloudflare.json"
+cp "$TREE/deploy/cloudflare.json" "$HR/srv/app/deploy/cloudflare.json"   # the checkout's copy
 
 reset_log() { : > "$STUB_LOG"; }
 called() { grep -qF -e "$1" "$STUB_LOG"; }
@@ -59,12 +65,28 @@ run() {
 rc() { cat "$T/rc.txt"; }
 
 echo "1. no cloudflare.json: no-op, exit 0, reconciler never called"
-mv "$HR/srv/app/deploy/cloudflare.json" "$T/cf.json.bak"
+mv "$TREE/deploy/cloudflare.json" "$T/cf.json.bak"; rm "$HR/srv/app/deploy/cloudflare.json"
 reset_log; run ""
 check "exit 0"                 [ "$(rc)" = 0 ]
 check "said nothing to converge" grep -qi "nothing to converge" "$T/out.txt"
 check "cfc never called"        not_called "cfc "
-mv "$T/cf.json.bak" "$HR/srv/app/deploy/cloudflare.json"
+mv "$T/cf.json.bak" "$TREE/deploy/cloudflare.json"; cp "$TREE/deploy/cloudflare.json" "$HR/srv/app/deploy/cloudflare.json"
+
+echo "1b. the reconciler is handed the TREE's cloudflare.json, never the checkout's (issue #31)"
+printf '{"ssl_mode":"off"}' > "$HR/srv/app/deploy/cloudflare.json"                  # tampered on the box
+printf 'CF_DOMAIN=site.example\n' > "$HR/etc/app/cf-env"
+reset_log; run ""
+check "desired is the tree's file"  called -- "--desired $TREE/deploy/cloudflare.json"
+check "never the checkout's"        not_called "srv/app/deploy/cloudflare.json"
+rm -f "$HR/etc/app/cf-env"; cp "$TREE/deploy/cloudflare.json" "$HR/srv/app/deploy/cloudflare.json"
+
+echo "1c. a cloudflare.json in the checkout but no verified tree: refuses, never falls back"
+mv "${TREE%/*}/current" "$T/current.bak"
+reset_log; run ""
+check "exit 1"                      [ "$(rc)" = 1 ]
+check "said no verified tree"       grep -q "no verified tree" "$T/out.txt"
+check "cfc never called"            not_called "cfc "
+mv "$T/current.bak" "${TREE%/*}/current"
 
 echo "2. cloudflare.json present but no domain anywhere: refuses"
 reset_log; run ""
@@ -73,8 +95,9 @@ check "said so"                grep -qi "refusing" "$T/out.txt"
 check "cfc never called"       not_called "cfc "
 
 echo "3. domain from deploy/site.toml's cf_domain knob"
-cat > "$HR/srv/app/deploy/site.toml" <<'EOF'
+cat > "$TREE/deploy/site.toml" <<'EOF'
 [deploy]
+converge = true
 cf_domain = "site.example"
 EOF
 reset_log; run ""
@@ -153,7 +176,7 @@ echo "16. --dry-run drift with no healthchecks URL: exit 0, drift is not a unit 
 reset_log; STUB_CFC_RC=3 run "--dry-run"
 check "exit 0"                 [ "$(rc)" = 0 ]
 
-rm -f "$HR/srv/app/deploy/site.toml"
+printf '[deploy]\nconverge = true\n' > "$TREE/deploy/site.toml"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

@@ -686,26 +686,14 @@ if [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] ||
   # the deploy like any other pre-reload failure.
   ${HOST_CONVERGE_CMD:-sudo -n "$SELF/bin/host-converge.sh"} "$APP" \
     || { log "host-converge failed; NOT reloading"; exit 1; }
-  if [ -x deploy/converge.sh ]; then
-    ${CONVERGE_CMD:-sudo -n} "$SRV/deploy/converge.sh" \
-      || { log "deploy/converge.sh failed; NOT reloading"; exit 1; }
-  elif [ -e deploy/converge.sh ]; then
-    # Present but not executable is a misconfiguration (a forgotten chmod
-    # +x), not "this app has none" — the box would keep serving stale units
-    # while site.toml claimed otherwise.
-    log "site.toml sets converge but deploy/converge.sh is not executable; NOT reloading"
-    exit 1
-  else
-    # No app-owned script at all: fall back to the toolkit's own
-    # [converge]-table engine (bin/converge.sh), the shape webbsite's and
-    # renavon's hand-written converge.sh scripts had already converged on
-    # independently — install, validate, reload-with-rollback, prune. An app
-    # with converge=true but NEITHER a script NOR a [converge] table is
-    # still a real misconfiguration; bin/converge.sh's own "nothing
-    # declared" exit 0 surfaces it in the log without treating it as a crash.
-    ${CONVERGE_ENGINE_CMD:-sudo -n "$SELF/bin/converge.sh"} "$APP" \
-      || { log "bin/converge.sh failed; NOT reloading"; exit 1; }
-  fi
+  # The app's own converge (its deploy/converge.sh, else the toolkit's
+  # [converge]-table engine) runs as root, so it runs from ROOT's verified
+  # export of the commit just merged (bin/site-tree.sh), never from this
+  # checkout, which the service user can write (issue #31). The dirty-tree
+  # check above stays: it no longer guards root, but a box edited in place is
+  # still a box whose deploy/ doesn't match what is being converged.
+  ${SITE_TREE_CMD:-sudo -n "$SELF/bin/site-tree.sh"} converge "$APP" "$REMOTE" \
+    || { log "converge from root's verified tree of ${REMOTE:0:9} failed (reason above); NOT reloading"; exit 1; }
 fi
 
 # --- deploy_app: one hosted app's apply (CSS, per-app converge, reload, ----
@@ -867,16 +855,8 @@ EOF_SOURCES
   # already covers its one app, and calling it again here would run
   # deploy/converge.sh (or bin/converge.sh $APP) a second time for nothing.
   if [ -n "$WORKSPACE" ] && { [ "${DEPLOY_CONVERGE:-}" = "True" ] || [ "${DEPLOY_CONVERGE:-}" = "true" ] || [ "${DEPLOY_CONVERGE:-}" = "1" ]; }; then
-    if [ -x deploy/converge.sh ]; then
-      ${CONVERGE_CMD:-sudo -n} "$SRV/$dir/deploy/converge.sh" \
-        || { log "$app: deploy/converge.sh failed; NOT reloading"; return 1; }
-    elif [ -e deploy/converge.sh ]; then
-      log "$app: converge is on but deploy/converge.sh is not executable; NOT reloading"
-      return 1
-    else
-      ${CONVERGE_ENGINE_CMD:-sudo -n "$SELF/bin/converge.sh"} "$app" \
-        || { log "$app: bin/converge.sh failed; NOT reloading"; return 1; }
-    fi
+    ${SITE_TREE_CMD:-sudo -n "$SELF/bin/site-tree.sh"} converge "$APP" "$REMOTE" "$app" \
+      || { log "$app: converge from root's verified tree of ${REMOTE:0:9} failed (reason above); NOT reloading"; return 1; }
   fi
 
   # 4c. The reload contract. `reload = "reload"` is `systemctl reload <service>`,

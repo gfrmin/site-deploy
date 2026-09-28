@@ -87,6 +87,7 @@ bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's cu
 bin/cf-converge.py   converge one zone's Cloudflare config (SSL/DNS/cache/WAF/rate-limit) to deploy/cloudflare.json
 bin/cf-converge-run.sh root wrapper: derives the domain + the box's public IP, calls cf-converge.py
 bin/backup.sh        encrypt deploy/backup-producer.sh's stdout, ship off-box, verify by round trip, prune (root)
+bin/site-tree.sh     root's verified export of the deployed commit: the only source of app content root runs (root)
 bin/converge.sh       generic [converge]-table engine: install/validate/reload-with-rollback/prune, template-unit restart queue (root)
 bin/converge-config.py deploy/site.toml [converge] table -> bin/converge.sh's bash arrays
 systemd/site-deploy@.service , site-deploy@.timer          per-app instance units
@@ -120,12 +121,34 @@ known-good toolkit. Escape hatch when CI itself is broken:
 sudo systemctl edit site-deploy-update.service     # [Service] Environment=SITE_DEPLOY_REF=master
 ```
 
-**Trust boundary, restated for the toolkit.** Root executes scripts out of `/srv/site-deploy`
-(the app's `deploy/converge.sh` today, more later), so the toolkit is **root-owned** and the
-service user cannot write it; `install.sh` does the one-time `chown` on boxes bootstrapped before
-this. For the same reason the poller refuses to run `deploy/converge.sh` unless the app's `deploy/`
-tree is byte-identical to the merged commit (no modified tracked files, nothing untracked): an RCE
-in the app must not become root two minutes later by editing a script in place.
+**Trust boundary, restated for the toolkit.** Root executes scripts out of `/srv/site-deploy`,
+so the toolkit is **root-owned** and the service user cannot write it; `install.sh` does the
+one-time `chown` on boxes bootstrapped before this. And root never executes or applies anything
+out of `/srv/<app>`, which is the service user's home (checkout, `.git` and all): an RCE in the app
+must not become root.
+
+**Root's verified tree** (`bin/site-tree.sh`). The app content root does run (the `deploy/converge.sh`
+hook, the `[converge]` engine's files, `deploy/backup-producer.sh`, `deploy/cloudflare.json`) comes
+from root's own export of the deployed commit:
+
+- the origin URL is pinned in root-owned `/etc/site-deploy/origin/<site>` (`url=<clone URL>`, plus
+  `key=<ssh identity>` for a private repo over ssh). `site-tree.sh` writes it **once**, from the
+  checkout's `remote.origin.url`, and says so loudly (`PINNED the origin…`, in the deploy log on a
+  converging site): check that line. After that it is never re-read from the checkout; changing it
+  is an admin act;
+- root fetches master into its own mirror under `/var/lib/site-deploy-root/`, with a hermetic git
+  (no system or user config, its own `known_hosts`, https and ssh only);
+- a commit is accepted only if it is **on master** (merge access is the bargain, nothing less) and
+  not older than the tree already pinned (forward only; after a history rewrite, remove
+  `/var/lib/site-deploy-root/tree/<site>/current`);
+- it is exported with `git archive`, so no `.git`, hook or config comes along.
+
+Which commit: on a converging site, the one the poller just merged (`current`, forward-only). Any
+other site's root consumers (backup, cf-converge) use master's head (`tip`), refreshed when they
+run. The service user's only grant here is `site-tree.sh converge <site> …`, never a path in the
+checkout. Consequence: an `/etc/<app>/deploy-ref` override naming a branch other than master still
+deploys, but its converge refuses (that commit is not on master). The poller's dirty-tree check on
+`deploy/` stays, as a guard against a box edited in place, no longer as the root boundary.
 
 ## Per-app config: `deploy/site.toml` in the app repo
 
@@ -231,8 +254,11 @@ owns, every tick:
 
 - the toolkit's own units in `/etc/systemd/system` (re-installed on change, daemon-reloaded; a
   changed timer is restarted only if an operator has not stopped it)
-- the service user's scoped `NOPASSWD` grants (`reload` and `restart`, the build unit, the two
-  converge scripts), validated with `visudo -cf` before they replace the live file
+- the service user's scoped `NOPASSWD` grants (`reload` and `restart` of units the app owns, the
+  build unit, `cf-converge@`, `host-converge.sh <site>`, and `site-tree.sh converge <site>`),
+  validated with `visudo -cf` before they replace the live file
+- the pinned origin for root's verified tree, pinned once (see the trust boundary above), with a
+  nag every tick if a site that needs the tree cannot have one
 - a journald cap (`SystemMaxUse=1G`, a month of retention), unattended security upgrades, and a
   `needrestart` rule so an upgrade never restarts a running `<app>-*` batch unit mid-run (the
   app's own long-lived unit stays eligible on purpose)
@@ -299,7 +325,11 @@ are a claim with nothing behind them. webbsite paid for that on 2026-09-11: Cadd
 in no repo at all, so nobody noticed it carried no `Restart=`, and one OOM kill became five days of
 Cloudflare 521s while the app underneath answered every health check.
 
-With `converge = true`, `deploy/converge.sh` from the app repo runs **as root**, after `uv sync` and
+With `converge = true`, `deploy/converge.sh` from the app repo runs **as root**, from root's verified
+tree of the merged commit, never the checkout. It runs in a private mount namespace in which
+`/srv/<site>` **is** that tree, bound read-only, so a hook that reads its files from `/srv/<site>` by
+name (webbsite's does) still sees only verified content; `SITE_TREE=<tree>` is in its environment
+too. So everything a hook reads must be in git. It runs after `uv sync` and
 **before** the reload. A failure stops the deploy with the old code still serving and the edge cache
 intact, exactly like a failed `uv sync`. If `deploy/converge.sh` exists but is not executable that is
 also fatal — a forgotten `chmod +x`, not "this app has none": deploying while believing the config
@@ -313,8 +343,9 @@ every two minutes.
 > **Trust boundary.** A repo-declared unit's `ExecStart` runs as root, so on a converging box
 > **merge access to the app repo is root access on that box.** That is the same bargain
 > `dataguru-converge` makes and it is fine where it is already true, but it must be a deliberate
-> per-app decision — which is why this is opt-in, and why it needs its own sudoers grant
-> (`NOPASSWD: /srv/<app>/deploy/converge.sh`) rather than riding on the `systemctl` one.
+> per-app decision — which is why this is opt-in. What it must never be is **app-compromise access**:
+> the grant is `site-tree.sh converge <site> …`, which runs the hook from root's verified tree of a
+> commit on master, never the file in the checkout.
 
 `site.toml` wins over the environment, and a disagreement is **reported**, not silently resolved —
 a box quietly behaving differently from the repo is the failure this exists to end. It is read
@@ -428,7 +459,9 @@ from whether it printed anything; the dry run's `ok --` lines go out as the succ
 `/etc/<app>/cf-env` — a declared file with no token nags instead (Cloudflare-as-code itself is
 opt-in, so its total absence is not a nag).
 
-`bin/cf-converge-run.sh` is the root wrapper the units call: it resolves the apex domain (site.toml's
+`bin/cf-converge-run.sh` is the root wrapper the units call. It reads `cloudflare.json` and
+`site.toml` only from root's verified tree of the deployed commit (an app compromise must not become
+a DNS takeover; a `cloudflare.json` with no tree to take it from is a refusal), resolves the apex domain (site.toml's
 `cf_domain`, or `CF_DOMAIN` in `cf-env`) and the box's own public IP (an override in
 `/etc/site-deploy/host.env`, then cloud metadata, then an outbound echo — empty is safe, it just
 leaves A-record content and any `__PUBLIC_IP__` rule untouched) and calls the pure, tested
@@ -454,7 +487,8 @@ rather than becoming a toolkit feature — this file purges everything, which is
 
 ### Off-box backup: `bin/backup.sh`
 
-Opt-in by the **presence** of `deploy/backup-producer.sh` in the app's own repo — an executable that
+Opt-in by the **presence** of `deploy/backup-producer.sh` in the app's own repo (run from root's
+verified tree of the deployed commit, never the checkout) — an executable that
 writes backup content to stdout and exits cleanly (a `pg_dump`, a `sqlite3 .backup`, a tar of a data
 directory: anything). The app declares WHAT to back up; this script owns HOW: `age`-encrypt, ship
 with `rclone`, verify by round trip, prune to a fixed count, report. No `backup-producer.sh` is not
@@ -464,7 +498,7 @@ an error — most apps have no runtime state that outlives a redeploy.
 "$PRODUCER" | age --encrypt --recipient $BACKUP_AGE_RECIPIENT
             | rclone rcat $BACKUP_RCLONE_DEST/<host>/<app>-<stamp>.age
             -> rclone cat (round-trip sha256, BEFORE the local copy is deleted)
-            -> /var/lib/<app>/backup-last-success
+            -> /var/lib/site-deploy-root/backup/<app>/backup-last-success
             -> prune to BACKUP_KEEP_LAST, oldest first, this app's objects only
 ```
 
