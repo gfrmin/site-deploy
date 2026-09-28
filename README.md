@@ -359,7 +359,7 @@ prune         = true        # a dst this app installed before but no longer decl
   just installed. Reloading it immediately after is not merely redundant — it can lose a race with
   the daemon still coming up and report a failure that would roll back a file that was never wrong.
   A reload sharing a unit with one `ensure_active` just started is skipped, once, that tick only.
-- **`prune`** is state-tracked (`/var/lib/<app>/converge-installed-files`), not a directory scan: a
+- **`prune`** is state-tracked (`/var/lib/site-deploy-root/converge/<app>/converge-installed-files`, root's own store: prune deletes what it lists), not a directory scan: a
   file the app never asked this engine to manage is never at risk just because it happens to sit near
   one that is.
 - `bin/converge-config.py` reads the `[converge]` table; a malformed one (an unknown `apply`/
