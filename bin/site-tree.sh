@@ -40,7 +40,6 @@ SELF="$ROOT/srv/site-deploy"
 STATE="$ROOT/var/lib/site-deploy-root"
 ORIGIN_DIR="$ROOT/etc/site-deploy/origin"
 PROTOCOLS="${SITE_TREE_PROTOCOLS:-https:ssh}"
-KEEP=2   # trees kept: current + the one before it
 
 usage() { echo "usage: site-tree.sh pin <site> <sha> | path <site> | converge <site> <sha> [<app>]" >&2; exit 2; }
 name_ok() { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
@@ -136,14 +135,22 @@ pin() {   # <sha> -> prints the tree dir
     mv -T "$tmp" "$dir" || { rm -rf "$tmp"; refuse "could not place $dir"; }
   fi
   # Atomic repoint: readers see the old tree or the new one, never neither.
+  # `previous` names the tree `current` pointed at before, so the prune below
+  # is bookkeeping, not a guess from mtimes (tar stamps every file with its
+  # commit's time, so two quick commits tie).
+  if [[ $cur =~ ^[0-9a-f]{40}$ ]] && [ "$cur" != "$sha" ]; then
+    ln -sfn "$cur" "$TREES/.previous.new" && mv -T "$TREES/.previous.new" "$TREES/previous"
+  fi
   ln -sfn "$sha" "$TREES/.current.new" && mv -T "$TREES/.current.new" "$TREES/current" \
     || refuse "could not repoint $TREES/current"
-  # Keep the newest $KEEP trees (current always among them).
-  local d
-  while IFS= read -r d; do
-    [ "$(basename "$d")" = "$sha" ] || rm -rf "$d"
-  done < <(find "$TREES" -mindepth 1 -maxdepth 1 -type d -regex '.*/[0-9a-f]\{40\}' -printf '%T@ %p\n' \
-             | sort -rn | tail -n +$((KEEP + 1)) | cut -d' ' -f2-)
+  # Keep exactly the trees `current` and `previous` name.
+  local d keep_prev
+  keep_prev=$(readlink "$TREES/previous" 2>/dev/null || true)
+  for d in "$TREES"/*/; do
+    d=${d%/}; d=${d##*/}
+    [[ $d =~ ^[0-9a-f]{40}$ ]] || continue
+    [ "$d" = "$sha" ] || [ "$d" = "$keep_prev" ] || rm -rf "${TREES:?}/$d"
+  done
   printf '%s\n' "$dir"
 }
 
