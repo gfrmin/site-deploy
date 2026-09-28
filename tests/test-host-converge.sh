@@ -349,6 +349,14 @@ reset_log; run_ws
 check "a toolkit template instance is never granted, even when the site's name prefixes it" \
   bash -c '! grep -q "site-backup@victim" "$HR/etc/sudoers.d/site-deploy"'
 cp "$T/foo-site.toml.bak" "$HR/srv/site/apps/foo/deploy/site.toml"
+mkdir -p "$HR/srv/blog"                                      # another single-app site on the box
+printf '[hosts."the-host"]\napps = ["foo", "blog-build", "site-extra"]\n' > "$HR/srv/site/deploy/fleet.toml"
+mkdir -p "$HR/srv/site/apps/blog-build/deploy" "$HR/srv/site/apps/site-extra/deploy"
+reset_log; run_ws
+check "an app name extending another site's is refused" grep -q "REFUSED hosted app name blog-build: it extends /srv/blog" "$T/out.txt"
+check "and never squats /srv"            [ ! -e "$HR/srv/blog-build" ]
+check "extending this site's own name is fine" [ -L "$HR/srv/site-extra" ]
+rm -rf "$HR/srv/blog" "$HR/srv/site-extra" "$HR/srv/site/apps/blog-build" "$HR/srv/site/apps/site-extra" "$HR/var/lib/site-extra"
 rm -rf "$HR/srv/victim" "$HR/srv/victim2" "$HR/srv/sshd" "$HR/srv/site/apps/victim" "$HR/srv/site/apps/sshd" "$HR/var/lib/sshd"
 printf '[hosts."the-host"]\napps = ["foo"]\n' > "$HR/srv/site/deploy/fleet.toml"
 reset_log; run_ws

@@ -133,8 +133,25 @@ if [ -n "$WORKSPACE" ]; then
   mapfile -t ws_names < <(ws_apps "$SRV" "$APP")
   APPS=()
   for a in "${ws_names[@]}"; do
-    if valid_app "$a"; then APPS+=("$a")
-    else note_failure "REFUSED hosted app name $(printf '%q' "$a"): must match ^[a-z][a-z0-9_-]{0,31}\$"; fi
+    if ! valid_app "$a"; then
+      note_failure "REFUSED hosted app name $(printf '%q' "$a"): must match ^[a-z][a-z0-9_-]{0,31}\$"
+      continue
+    fi
+    # A name that extends ANOTHER site's or app's name (blog-build, next to
+    # site blog) would, once /srv/<name> exists, take ownership of that
+    # site's own units (see owned_unit) and stop its deploys. Extending this
+    # site's own name is fine: those units are ours either way.
+    squat=""
+    for p in "$ROOT"/srv/*; do
+      n=${p##*/}
+      [ "$n" = "$a" ] || [ "$n" = "$APP" ] && continue
+      case $a in "$n"-*|"$n"@*) squat=$n; break ;; esac
+    done
+    if [ -n "$squat" ]; then
+      note_failure "REFUSED hosted app name $a: it extends /srv/$squat, another site's or app's name, whose units it would take over"
+      continue
+    fi
+    APPS+=("$a")
   done
 else
   APPS=("$APP")
