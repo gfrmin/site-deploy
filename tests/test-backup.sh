@@ -95,7 +95,8 @@ mkdir -p "$TREE/deploy"; ln -sfn "${TREE##*/}" "${TREE%/*}/current"
 printf '[deploy]\nconverge = true\n' > "$TREE/deploy/site.toml"   # a converging site: `use` answers `current`
 cat > "$TREE/deploy/backup-producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
-[ -n "${STUB_PRODUCER_FAIL:-}" ] && exit 1
+[ -n "${STUB_PRODUCER_FAIL:-}" ] && { echo "pg_dump: error: the-producer-reason" >&2; exit 1; }
+[ -n "${STUB_PRODUCER_WARN:-}" ] && echo "pg_dump: warning: the-producer-warning" >&2
 [ -n "${STUB_PRODUCER_EMPTY:-}" ] && exit 0
 printf 'the-backup-content'
 PRODUCER
@@ -231,6 +232,12 @@ check "the producer's content shipped"  bash -c 'f=$(find "$STUB_REMOTE" -name "
 reset_log; run STUB_PRODUCER_FAIL=1
 check "its failure is the run's"        [ "$(rc)" = 1 ]
 check "said the producer failed"        grep -q "backup-producer.sh failed" "$T/out.txt"
+check "with its own stderr, via a file" grep -q "backup-producer.sh failed: .*the-producer-reason" "$T/out.txt"
+reset_log; run STUB_PRODUCER_FAIL=1 HEALTHCHECKS_BACKUP_URL=https://hc.example/b1
+check "the reason reaches the /fail ping" grep -q "hc.example/b1/fail.*the-producer-reason\|the-producer-reason.*hc.example/b1/fail" "$STUB_LOG"
+reset_log; run STUB_PRODUCER_WARN=1
+check "a warning on success is logged"  grep -q "producer: pg_dump: warning: the-producer-warning" "$T/out.txt"
+check "and kept out of the backup"      bash -c 'f=$(find "$STUB_REMOTE" -name "app-*.age" | sort | tail -1); [ "$(cat "$f")" = the-backup-content ]'
 
 echo "15. no backup_user: the producer runs directly, as today"
 cp "$T/tree-site.toml.bak" "$TREE/deploy/site.toml"

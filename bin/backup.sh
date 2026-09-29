@@ -119,7 +119,14 @@ trap 'rm -rf "$WORK" "$tree_why"' EXIT
 plain="$WORK/plain"
 cipher="$WORK/backup.age"
 
-run_producer > "$plain" || fail "deploy/backup-producer.sh failed"
+# The producer's stderr goes to a FILE, then into the log and the /fail ping:
+# nested under systemd-run --pipe, its output to the unit's journal stream
+# was seen to stop after the first line (issue #44), which would leave a
+# failed pg_dump as a bare "failed" with its reason lost.
+perr="$WORK/producer.err"
+run_producer > "$plain" 2> "$perr" \
+  || fail "deploy/backup-producer.sh failed: $(tail -c 1000 "$perr" | tr '\n' ' ')"
+[ -s "$perr" ] && sed 's/^/producer: /' "$perr" >&2
 [ -s "$plain" ] || fail "deploy/backup-producer.sh produced no output"
 
 age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" --output "$cipher" "$plain" \
