@@ -27,7 +27,9 @@ ln -s "$ROOT" "$HR/srv/site-deploy"
 
 cat > "$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-echo "curl $*" >> "$STUB_LOG"
+# hc_ping posts its body on stdin (@-); fold it onto the call's own line.
+body=""; case " $* " in *" @- "*) body=" [body=$(tr '\n' ' ')]" ;; esac
+echo "curl$body $*" >> "$STUB_LOG"
 case "$*" in
   *169.254.169.254*) [ -n "${STUB_NO_METADATA:-}" ] && exit 1; printf '%s' "${STUB_METADATA_IP:-}" ;;
   *cdn-cgi/trace*)    [ -n "${STUB_NO_TRACE:-}" ] && exit 1; printf 'h=x\nip=%s\nts=1\n' "${STUB_TRACE_IP:-}" ;;

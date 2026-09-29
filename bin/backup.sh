@@ -81,15 +81,26 @@ sys.stdout.write(str(deploy.get("backup_user", "")))' "$tree/deploy/site.toml" 2
 if [ -n "$producer_user" ]; then
   { [[ $producer_user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && id -u "$producer_user" >/dev/null 2>&1; } \
     || fail "REFUSED backup_user $(printf '%q' "$producer_user"): not the plain name of a user on this box"
-  # Fed to bash on stdin: the tree is root's, so the user cannot exec the file.
+  # Handed over on stdin: the tree is root's, so the user cannot open the file.
   [[ $(head -1 "$PRODUCER") =~ ^#!(/usr)?/bin/(env\ )?bash([[:space:]]|$) ]] \
-    || fail "backup_user is set, so deploy/backup-producer.sh must be a bash script (#!/usr/bin/env bash): it is run with bash -s as $producer_user"
+    || fail "backup_user is set, so deploy/backup-producer.sh must be a bash script (#!/usr/bin/env bash): bash runs it as $producer_user"
 fi
+# The producer's transient unit outlives this run unless stopped: killing
+# systemd-run does not stop the unit it started, and the producer's stdout
+# is a file, not a pipe that would close under it. So a run killed by its
+# TimeoutStartSec stops the unit on the way out rather than leaving it
+# running as the target user into the next run.
+producer_unit=""
+stop_producer() { [ -z "$producer_unit" ] || systemctl stop "$producer_unit" 2>/dev/null || true; }
+trap 'exit 143' TERM INT
 run_producer() {
   if [ -z "$producer_user" ]; then "$PRODUCER"; return; fi
-  # The same hardening as site-backup@.service. If this run is killed (its
-  # TimeoutStartSec), the pipe closes and the producer dies on its next write.
-  systemd-run --quiet --wait --pipe --collect \
+  local rc
+  producer_unit="site-backup-producer-$APP-$$"
+  # The same hardening as site-backup@.service. The script arrives on stdin
+  # and is read ONCE; it then runs with stdin on /dev/null, so a command in
+  # it that reads stdin sees EOF instead of eating the rest of the script.
+  systemd-run --quiet --wait --pipe --collect --unit="$producer_unit" \
     --uid="$producer_user" --gid="$(id -g "$producer_user")" \
     -p Nice=19 -p OOMScoreAdjust=500 \
     -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes \
@@ -97,7 +108,11 @@ run_producer() {
     -p ProtectKernelModules=yes -p ProtectControlGroups=yes \
     -p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" -p RestrictNamespaces=yes \
     -p LockPersonality=yes -p SystemCallArchitectures=native -p ProtectClock=yes \
-    /bin/bash -s < "$PRODUCER"
+    /bin/bash -c 'script=$(cat) && exec /bin/bash -c "$script" backup-producer.sh </dev/null' \
+    < "$PRODUCER"
+  rc=$?
+  producer_unit=""   # finished (and --collect'ed): nothing left to stop
+  return $rc
 }
 
 for var in BACKUP_AGE_RECIPIENT BACKUP_RCLONE_DEST; do
@@ -115,7 +130,7 @@ dest="$destdir/$APP-$stamp.age"
 keep="${BACKUP_KEEP_LAST:-14}"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$tree_why"' EXIT
+trap 'stop_producer; rm -rf "$WORK" "$tree_why"' EXIT
 plain="$WORK/plain"
 cipher="$WORK/backup.age"
 

@@ -20,11 +20,14 @@
 #   POST body, not a query parameter: healthchecks takes the message as the
 #   request body. ${url%/} so a pasted trailing slash cannot produce "//fail".
 #   -f matters: a 404 from a wrong UUID must not look like a delivered ping.
+#   The body goes on STDIN, never argv: argv is readable by every local user
+#   (ps), and a /fail body can carry a failing command's own stderr (#45).
 hc_ping() {
   local url=${1:-} suffix=${2:-} msg=${3:-}
   [ -n "$url" ] || return 0
-  ${CURL:-curl} -fsS -o /dev/null --max-time 10 --retry 2 --retry-delay 1 --retry-max-time 20 \
-      --data-raw "$(printf '%s' "$msg" | tail -c 8000)" "${url%/}$suffix" \
+  printf '%s' "$msg" | tail -c 8000 \
+    | ${CURL:-curl} -fsS -o /dev/null --max-time 10 --retry 2 --retry-delay 1 --retry-max-time 20 \
+        --data-binary @- "${url%/}$suffix" \
     || echo "hc: could NOT ping ${url%/}$suffix (${msg:0:120})" >&2
   return 0
 }

@@ -19,6 +19,7 @@ mkdir -p "$T/bin"
 cat > "$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
+case " $* " in *" @- "*) echo "body=$(cat)" >> "$STUB_LOG" ;; esac
 case "$*" in
   *hc.example*) [ -n "${STUB_PING_FAIL:-}" ] && exit 22; exit 0 ;;
 esac
@@ -42,7 +43,8 @@ echo "1. hc_ping is a leaf: a failed ping returns 0 and says so on stderr"
 reset_log
 STUB_PING_FAIL=1 hc_ping "https://hc.example/u1" /fail "boom" 2> "$T/out.txt"; rc=$?
 check "returned 0"                 [ "$rc" = 0 ]
-check "posted the body"            called "--data-raw boom"
+check "posted the body"            called "body=boom"
+check "never on argv (ps shows argv to every local user)" bash -c '! grep -q "^curl .*boom" "$STUB_LOG"'
 check "hit /fail"                  called "https://hc.example/u1/fail"
 check "used -f (a 404 is not a delivered ping)" bash -c 'grep -q -- "-fsS" "$STUB_LOG"'
 check "warned"                     grep -qi "could not ping" "$T/out.txt"

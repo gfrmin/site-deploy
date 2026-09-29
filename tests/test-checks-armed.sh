@@ -87,7 +87,9 @@ T=$(mktemp -d); export T; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin"; export STUB_LOG="$T/calls.log"
 cat > "$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-echo "curl $*" >> "$STUB_LOG"
+# hc_ping posts its body on stdin (@-); fold it onto the call's own line.
+body=""; case " $* " in *" @- "*) body=" [body=$(tr '\n' ' ')]" ;; esac
+echo "curl$body $*" >> "$STUB_LOG"
 case "$*" in
   *"/checks/ "*|*"/checks/") [ -n "${STUB_ALL_FAIL:-}" ] && exit 22
                      printf '%s' "${STUB_ALL_BODY:-{\"checks\":[]\}}"; exit 0 ;;
