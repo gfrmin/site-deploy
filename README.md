@@ -545,7 +545,10 @@ HEALTHCHECKS_BACKUP_URL=...      # optional; a dead-man switch a silently-stoppe
 
 `host-converge.sh` arms `site-backup@<app>.timer` (daily) iff `backup-producer.sh` exists AND both
 required vars are set; a declared producer with no credentials nags instead of silently not backing
-up. `age` and `rclone` are not in the fleet's base `host/packages.txt` (most apps need neither) — an
+up. **Arming starts a backup immediately**: on a box that has been up a while, a newly armed timer
+(`Persistent=true`, `OnBootSec=20min`) was seen to run at once, not wait for the next 02:30. So restoring `backup-env` in the middle of the day means a full backup right
+then, on top of any run you just started by hand, with the I/O load that brings. Arm it off-peak,
+or expect that load. `age` and `rclone` are not in the fleet's base `host/packages.txt` (most apps need neither) — an
 app that opts in adds them to its own `deploy/packages.txt`, the same mechanism an app already uses
 for a native library dependency.
 
