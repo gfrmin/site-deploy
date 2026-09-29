@@ -558,7 +558,8 @@ in a transient unit with the same hardening, and none of the backup unit's envir
 the `backup-env` credential). The value is read from root's verified tree, never the checkout, and
 must name an existing user. Two constraints follow from the producer staying in root's tree, which
 that user cannot read: it is handed over on stdin and run by bash (with its own stdin on
-`/dev/null`), so it must be a bash script, and it cannot read other files from the tree. If the
+`/dev/null`), so it must be a bash script of at most 128 KiB (it reaches bash as one argument),
+and it cannot read other files from the tree. If the
 run is killed (its `TimeoutStartSec`), `backup.sh` stops the producer's transient unit on the way
 out, so a slow dump cannot run on into the next day's run. `pg_dump` over the local socket needs neither.
 
