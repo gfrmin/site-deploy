@@ -179,6 +179,7 @@ tailwindcss_version = "4.3.3"      # apps with static/src.css: pin the compiler 
 # converge      = true                    # apply deploy/ to the box each tick (see below)
 # probe_external = "<healthchecks check name or slug>"  # probed off-box; no on-box probe (see Monitoring)
 # backup_timeout = "2h"                  # site-backup@<app>'s TimeoutStartSec, <N>min or <N>h, max 23h (see Off-box backup)
+# backup_user   = "postgres"             # run backup-producer.sh as this user, not root (see Off-box backup)
 ```
 
 `service` and `build_inputs` exist for workspace mode (Phase D item 14: several apps served from
@@ -548,8 +549,19 @@ up. `age` and `rclone` are not in the fleet's base `host/packages.txt` (most app
 app that opts in adds them to its own `deploy/packages.txt`, the same mechanism an app already uses
 for a native library dependency.
 
+**A producer that must BE another user sets `backup_user`** in its own `deploy/site.toml`
+(issue #44). Root can read any file, but not state guarded by identity: PostgreSQL peer auth
+admits only the `postgres` OS user, and `site-backup@`'s `NoNewPrivileges=yes` forbids the producer
+switching user itself (`runuser`/`setpriv` fail with EPERM). With `backup_user = "postgres"`,
+`backup.sh` has systemd do the switch: the producer runs through `systemd-run --uid=postgres --pipe`
+in a transient unit with the same hardening, and none of the backup unit's environment (so never
+the `backup-env` credential). The value is read from root's verified tree, never the checkout, and
+must name an existing user. Two constraints follow from the producer staying in root's tree, which
+that user cannot read: it is fed to `bash -s`, so it must be a bash script, and it cannot read
+other files from the tree. `pg_dump` over the local socket needs neither.
+
 **A large producer sets `backup_timeout`** in its own `deploy/site.toml` (issue #42). The unit's
-default `TimeoutStartSec=20min` covers a small database; a 77 GB `pg_dump` at idle priority takes
+default `TimeoutStartSec=20min` covers a small database; a large `pg_dump` at idle priority can take
 that long on its own, before the encrypt, upload and full round-trip download. `host-converge.sh`
 renders the value into `site-backup@<app>.service.d/timeout.conf`, and removes the drop-in when the
 key goes. It accepts `<N>min` or `<N>h`, from 1min to 23h (a daily backup allowed to outlast its own

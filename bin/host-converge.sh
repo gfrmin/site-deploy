@@ -191,7 +191,7 @@ app_probe_external() {   # <app>
     | sed -n "s/^export PROBE_EXTERNAL=//p" | tail -1 | tr -d "'\""
 }
 # <app>'s `backup_timeout` (site.toml): site-backup@<app>'s TimeoutStartSec,
-# for a producer the unit's default cannot fit (issue #42: a 77 GB pg_dump).
+# for a producer the unit's default cannot fit (issue #42: a large pg_dump).
 # Read exactly, not sed-extracted like the helpers above: a line-oriented
 # extraction would quietly accept the first line of a multi-line value.
 # Validated at the point of use (valid_backup_timeout). No site.toml is no
