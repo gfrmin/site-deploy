@@ -100,6 +100,8 @@ run_producer() {
   # The same hardening as site-backup@.service. The script arrives on stdin
   # and is read ONCE; it then runs with stdin on /dev/null, so a command in
   # it that reads stdin sees EOF instead of eating the rest of the script.
+  # As one argv string it is capped at 128 KiB (MAX_ARG_STRLEN) -- far above
+  # any real producer -- and visible in ps, which is fine for repo code.
   systemd-run --quiet --wait --pipe --collect --unit="$producer_unit" \
     --uid="$producer_user" --gid="$(id -g "$producer_user")" \
     -p Nice=19 -p OOMScoreAdjust=500 \
