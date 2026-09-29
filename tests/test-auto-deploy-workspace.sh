@@ -78,7 +78,9 @@ exit 0
 STUB
 cat > "$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-echo "curl $*" >> "$STUB_LOG"
+# hc_ping posts its body on stdin (@-); fold it onto the call's own line.
+body=""; case " $* " in *" @- "*) body=" [body=$(tr '\n' ' ')]" ;; esac
+echo "curl$body $*" >> "$STUB_LOG"
 case "$*" in
   *purge_cache*) printf '{"success":true}\n200\n'; exit 0 ;;
   *hc.example*) exit 0 ;;

@@ -66,9 +66,27 @@ case "$1" in
 esac
 STUB
 
+# systemd-run: records its arguments and runs the command it was given, with
+# its stdin, the way `--pipe --wait` does -- minus the uid switch itself,
+# which only a real systemd can do (the arguments are asserted instead).
+cat > "$T/bin/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+echo "systemd-run $*" >> "$STUB_LOG"
+while [ $# -gt 0 ]; do
+  case $1 in -p) shift 2 ;; -*) shift ;; *) break ;; esac
+done
+exec "$@"
+STUB
+
+cat > "$T/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$STUB_LOG"
+STUB
+
 cat > "$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
+case " $* " in *" @- "*) echo "curl body: $(cat)" >> "$STUB_LOG" ;; esac
 exit 0
 STUB
 chmod +x "$T/bin"/*
@@ -83,7 +101,9 @@ mkdir -p "$TREE/deploy"; ln -sfn "${TREE##*/}" "${TREE%/*}/current"
 printf '[deploy]\nconverge = true\n' > "$TREE/deploy/site.toml"   # a converging site: `use` answers `current`
 cat > "$TREE/deploy/backup-producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
-[ -n "${STUB_PRODUCER_FAIL:-}" ] && exit 1
+[ -n "${STUB_PRODUCER_FAIL:-}" ] && { echo "pg_dump: error: the-producer-reason" >&2; exit 1; }
+[ -n "${STUB_PRODUCER_SLOW:-}" ] && { touch "$T/producer-started"; sleep 30; }
+[ -n "${STUB_PRODUCER_WARN:-}" ] && echo "pg_dump: warning: the-producer-warning" >&2
 [ -n "${STUB_PRODUCER_EMPTY:-}" ] && exit 0
 printf 'the-backup-content'
 PRODUCER
@@ -204,6 +224,93 @@ check "not /fail"              not_called "/b1/fail"
 echo "13. HEALTHCHECKS_BACKUP_URL set, a failure: pinged /fail with the reason"
 reset_log; run HEALTHCHECKS_BACKUP_URL=https://hc.example/b1 STUB_RCAT_FAIL=1
 check "pinged /fail"           called "https://hc.example/b1/fail"
+
+echo "14. backup_user (issue #44): the producer runs as that user via systemd-run, not as root"
+rm -rf "${STUB_REMOTE:?}"/*; rm -f "$MARKER"
+cp "$TREE/deploy/site.toml" "$T/tree-site.toml.bak"
+printf '[deploy]\nconverge = true\nbackup_user = "nobody"\n' > "$TREE/deploy/site.toml"
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "through systemd-run"             called "systemd-run"
+check "as that user"                    grep -qE "systemd-run .*--uid=nobody( |$)" "$STUB_LOG"
+check "in a sandbox"                    grep -qE "systemd-run .*-p NoNewPrivileges=yes" "$STUB_LOG"
+check "never handed root's environment" bash -c '! grep -qE "systemd-run .*(-E|--setenv|BACKUP_)" "$STUB_LOG"'
+check "the producer's content shipped"  bash -c 'f=$(find "$STUB_REMOTE" -name "app-*.age" | head -1); [ "$(cat "$f")" = the-backup-content ]'
+reset_log; run STUB_PRODUCER_FAIL=1
+check "its failure is the run's"        [ "$(rc)" = 1 ]
+check "said the producer failed"        grep -q "backup-producer.sh failed" "$T/out.txt"
+check "with its own stderr, via a file" grep -q "backup-producer.sh failed: .*the-producer-reason" "$T/out.txt"
+reset_log; run STUB_PRODUCER_FAIL=1 HEALTHCHECKS_BACKUP_URL=https://hc.example/b1
+check "the reason reaches the /fail ping" grep -q "curl body: .*the-producer-reason" "$STUB_LOG"
+reset_log; run STUB_PRODUCER_WARN=1
+check "a warning on success is logged"  grep -q "producer: pg_dump: warning: the-producer-warning" "$T/out.txt"
+check "and kept out of the backup"      bash -c 'f=$(find "$STUB_REMOTE" -name "app-*.age" | sort | tail -1); [ "$(cat "$f")" = the-backup-content ]'
+
+echo "14b. the producer's transient unit is named, and stopped when this run is killed (a timeout)"
+check "named after the app"             grep -qE "systemd-run .*--unit=site-backup-producer-app-[0-9]+" "$STUB_LOG"
+rm -f "$T/producer-started"; reset_log
+( export T; exec setsid env HOST_ROOT="$HR" BACKUP_AGE_RECIPIENT=age1recipient BACKUP_RCLONE_DEST=fakeremote:bucket/backups \
+    STUB_PRODUCER_SLOW=1 bash "$ROOT/bin/backup.sh" app > "$T/out.txt" 2>&1 ) &
+bpid=$!
+for _ in $(seq 50); do [ -e "$T/producer-started" ] && break; sleep 0.1; done
+kill -TERM -- "-$bpid" 2>/dev/null   # the whole group, as systemd kills the unit's cgroup
+wait "$bpid" 2>/dev/null
+unit=$(sed -n 's/.*--unit=\(site-backup-producer-app-[0-9]*\).*/\1/p' "$STUB_LOG" | head -1)
+check "the unit was stopped"            grep -qx "systemctl stop $unit" "$STUB_LOG"
+reset_log; run
+check "a clean run leaves no stop behind it to race" not_called "systemctl stop"
+
+echo "14c. a producer command that reads stdin cannot eat the rest of the producer"
+cp "$TREE/deploy/backup-producer.sh" "$T/tree-producer.bak2"
+printf '#!/usr/bin/env bash\ncat > /dev/null\nprintf the-backup-content\n' > "$TREE/deploy/backup-producer.sh"
+rm -rf "${STUB_REMOTE:?}"/*
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "the lines after it ran"          bash -c 'f=$(find "$STUB_REMOTE" -name "app-*.age" | head -1); [ "$(cat "$f")" = the-backup-content ]'
+cp "$T/tree-producer.bak2" "$TREE/deploy/backup-producer.sh"
+
+echo "15. no backup_user: the producer runs directly, as today"
+cp "$T/tree-site.toml.bak" "$TREE/deploy/site.toml"
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "no systemd-run"                  not_called "systemd-run"
+
+echo "16. backup_user is read from the verified tree, never the checkout"
+printf '[deploy]\nbackup_user = "nobody"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "the checkout's knob is ignored"  not_called "systemd-run"
+rm -f "$HR/srv/app/deploy/site.toml"
+
+echo "17. a backup_user that is not a plain name of a user on this box is refused"
+for bad in "no-such-user-4x2q" "-u" "root x" "../x" ""$'\n'"nobody"; do
+  printf '[deploy]\nconverge = true\nbackup_user = %s\n' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$bad")" > "$TREE/deploy/site.toml"
+  rm -rf "${STUB_REMOTE:?}"/*
+  reset_log; run
+  check "refused $(printf %q "$bad"): exit 1"     [ "$(rc)" = 1 ]
+  check "refused $(printf %q "$bad"): said so"    grep -q "REFUSED backup_user" "$T/out.txt"
+  check "refused $(printf %q "$bad"): no run"     not_called "systemd-run"
+  check "refused $(printf %q "$bad"): nothing shipped" [ -z "$(remote_files)" ]
+done
+
+echo "18. an unreadable site.toml in the tree fails loudly, never falls back to root"
+printf '[deploy]\nbackup_user = "nobody\n' > "$TREE/deploy/site.toml"
+rm -rf "${STUB_REMOTE:?}"/*
+reset_log; run
+check "exit 1"                          [ "$(rc)" = 1 ]
+check "the producer never ran as root"  not_called "age "
+check "nothing shipped"                 [ -z "$(remote_files)" ]
+
+echo "19. a producer run as backup_user must be a bash script (it is fed to bash on stdin)"
+printf '[deploy]\nconverge = true\nbackup_user = "nobody"\n' > "$TREE/deploy/site.toml"
+cp "$TREE/deploy/backup-producer.sh" "$T/tree-producer.bak"
+printf '#!/usr/bin/env python3\nprint("x")\n' > "$TREE/deploy/backup-producer.sh"
+reset_log; run
+check "exit 1"                          [ "$(rc)" = 1 ]
+check "said why"                        grep -q "bash" "$T/out.txt"
+check "no run"                          not_called "systemd-run"
+cp "$T/tree-producer.bak" "$TREE/deploy/backup-producer.sh"
+cp "$T/tree-site.toml.bak" "$TREE/deploy/site.toml"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi

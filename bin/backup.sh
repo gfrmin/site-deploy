@@ -17,6 +17,14 @@
 # is what lets it read state it does not own by construction (a WAL database
 # under another user's directory, for instance) without a bespoke grant.
 #
+# UNLESS the app's site.toml sets `backup_user` (issue #44): state guarded by
+# IDENTITY rather than file permissions -- PostgreSQL peer auth, which only
+# the `postgres` OS user passes -- is out of root's reach, and this unit's
+# NoNewPrivileges=yes forbids the producer switching user itself. systemd
+# does the switch instead: the producer runs in a transient unit as that
+# user, in its own sandbox, with none of this unit's environment (so not the
+# backup-env credential either).
+#
 # WHY A ROUND TRIP, ported from renavon-monorepo's dataguru-backup-state.py:
 # an upload that returned success is not a backup that can be read back. Its
 # whole reason for existing was an off-box tarball that went 13 days stale
@@ -62,6 +70,51 @@ cat "$tree_why" >&2
 PRODUCER="$tree/deploy/backup-producer.sh"
 [ -x "$PRODUCER" ] || { log "no deploy/backup-producer.sh in the deployed tree; nothing to back up"; exit 0; }
 
+# From the TREE's site.toml, the same verified copy the producer comes from.
+# No site.toml is no knob; an unreadable one is a failure, never "run as root".
+producer_user=$(python3 -c 'import os, sys, tomllib
+if not os.path.exists(sys.argv[1]): sys.exit(0)
+deploy = tomllib.load(open(sys.argv[1], "rb")).get("deploy", {})
+if not isinstance(deploy, dict): sys.exit(1)
+sys.stdout.write(str(deploy.get("backup_user", "")))' "$tree/deploy/site.toml" 2>/dev/null) \
+  || fail "deploy/site.toml in the deployed tree is unreadable"
+if [ -n "$producer_user" ]; then
+  { [[ $producer_user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && id -u "$producer_user" >/dev/null 2>&1; } \
+    || fail "REFUSED backup_user $(printf '%q' "$producer_user"): not the plain name of a user on this box"
+  # Handed over on stdin: the tree is root's, so the user cannot open the file.
+  [[ $(head -1 "$PRODUCER") =~ ^#!(/usr)?/bin/(env\ )?bash([[:space:]]|$) ]] \
+    || fail "backup_user is set, so deploy/backup-producer.sh must be a bash script (#!/usr/bin/env bash): bash runs it as $producer_user"
+fi
+# The producer's transient unit outlives this run unless stopped: killing
+# systemd-run does not stop the unit it started, and the producer's stdout
+# is a file, not a pipe that would close under it. So a run killed by its
+# TimeoutStartSec stops the unit on the way out rather than leaving it
+# running as the target user into the next run.
+producer_unit=""
+stop_producer() { [ -z "$producer_unit" ] || systemctl stop "$producer_unit" 2>/dev/null || true; }
+trap 'exit 143' TERM INT
+run_producer() {
+  if [ -z "$producer_user" ]; then "$PRODUCER"; return; fi
+  local rc
+  producer_unit="site-backup-producer-$APP-$$"
+  # The same hardening as site-backup@.service. The script arrives on stdin
+  # and is read ONCE; it then runs with stdin on /dev/null, so a command in
+  # it that reads stdin sees EOF instead of eating the rest of the script.
+  systemd-run --quiet --wait --pipe --collect --unit="$producer_unit" \
+    --uid="$producer_user" --gid="$(id -g "$producer_user")" \
+    -p Nice=19 -p OOMScoreAdjust=500 \
+    -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes \
+    -p PrivateTmp=yes -p PrivateDevices=yes -p ProtectKernelTunables=yes \
+    -p ProtectKernelModules=yes -p ProtectControlGroups=yes \
+    -p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" -p RestrictNamespaces=yes \
+    -p LockPersonality=yes -p SystemCallArchitectures=native -p ProtectClock=yes \
+    /bin/bash -c 'script=$(cat) && exec /bin/bash -c "$script" backup-producer.sh </dev/null' \
+    < "$PRODUCER"
+  rc=$?
+  producer_unit=""   # finished (and --collect'ed): nothing left to stop
+  return $rc
+}
+
 for var in BACKUP_AGE_RECIPIENT BACKUP_RCLONE_DEST; do
   [ -n "${!var:-}" ] || fail "deploy/backup-producer.sh exists but $var is not set in /etc/$APP/backup-env"
 done
@@ -77,11 +130,18 @@ dest="$destdir/$APP-$stamp.age"
 keep="${BACKUP_KEEP_LAST:-14}"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$tree_why"' EXIT
+trap 'stop_producer; rm -rf "$WORK" "$tree_why"' EXIT
 plain="$WORK/plain"
 cipher="$WORK/backup.age"
 
-"$PRODUCER" > "$plain" || fail "deploy/backup-producer.sh failed"
+# The producer's stderr goes to a FILE, then into the log and the /fail ping:
+# nested under systemd-run --pipe, its output to the unit's journal stream
+# was seen to stop after the first line (issue #44), which would leave a
+# failed pg_dump as a bare "failed" with its reason lost.
+perr="$WORK/producer.err"
+run_producer > "$plain" 2> "$perr" \
+  || fail "deploy/backup-producer.sh failed: $(tail -c 1000 "$perr" | tr '\n' ' ')"
+[ -s "$perr" ] && sed 's/^/producer: /' "$perr" >&2
 [ -s "$plain" ] || fail "deploy/backup-producer.sh produced no output"
 
 age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" --output "$cipher" "$plain" \
