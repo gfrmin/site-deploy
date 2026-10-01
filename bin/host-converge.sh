@@ -654,6 +654,7 @@ done
 #       time + up to 30m, not Ubuntu's 06:00 + 60m box-local (14:00-15:00 HKT:
 #       the middle of a HK site's day).
 #   defer_restart = ["postgresql"]  units whose name starts with one of these
+#       (each must be in host/deferrable-restart.txt, local data services only)
 #       are NOT restarted by needrestart; site-deferred-restart@<site>.timer
 #       restarts them once a week (Sunday, 45m into the window), and only if
 #       they still map a replaced library. A security fix in a library a
@@ -696,12 +697,13 @@ timer_calendars() {   # <timer name>
        END { for (i = 1; i <= n; i++) print specs[i] }' "${files[@]}"
 }
 # The distinct UTC minutes-of-day a calendar spec fires at, over its next 8
-# firings; nothing for a spec firing at more than 4 distinct times a day (an
+# firings (the "(in UTC):" lines, or, on a box whose own zone is UTC and
+# which therefore prints none, the elapse lines themselves); nothing for a spec firing at more than 4 distinct times a day (an
 # every-5-minutes job overlaps any window, and no window can fix that).
 utc_minutes() {   # <OnCalendar spec>
   local m
   m=$(systemd-analyze calendar --iterations=8 "$1" 2>/dev/null \
-        | sed -n 's/.*(in UTC): .* \([0-9][0-9]\):\([0-9][0-9]\):[0-9][0-9] UTC$/\1 \2/p' \
+        | sed -n 's/^.*: .* \([0-9][0-9]\):\([0-9][0-9]\):[0-9][0-9] UTC$/\1 \2/p' \
         | awk '{ print ($1 * 60 + $2) }' | sort -un)
   [ "$(printf '%s\n' "$m" | grep -c .)" -le 4 ] && printf '%s\n' "$m"
 }
@@ -753,10 +755,12 @@ if [ "$uw" != KEEP ]; then
   if [ -n "$dr_ok" ]; then
     while IFS= read -r p; do
       [ -n "$p" ] || continue
-      # A unit-name PREFIX, written into a Perl regex: letters, digits, '_'
-      # and '-' only (no '.', '$', '@', ')' or '\'), at least 3 characters.
-      if [[ $p =~ ^[a-z][a-z0-9_-]{2,63}$ ]]; then dr+=("$p")
-      else note_failure "REFUSED [host] defer_restart entry $(printf '%q' "$p"): must be a unit-name prefix matching ^[a-z][a-z0-9_-]{2,63}\$"; dr_ok=""; fi
+      # Only a prefix the toolkit allows (host/deferrable-restart.txt): the
+      # declaration is untrusted, and a free-form prefix would let it keep
+      # sshd on an unpatched libssl or have root restart dbus weekly. The
+      # allowed entries are plain [a-z0-9-] names, safe inside the Perl regex.
+      if grep -vE '^\s*(#|$)' "$SELF/host/deferrable-restart.txt" 2>/dev/null | grep -qxF -e "$p"; then dr+=("$p")
+      else note_failure "REFUSED [host] defer_restart entry $(printf '%q' "$p"): not in the toolkit's host/deferrable-restart.txt"; dr_ok=""; fi
     done <<< "$dr_raw"
   fi
   if [ -n "$dr_ok" ] && [ ${#dr[@]} -gt 0 ] && [ -z "$uw_start" ]; then
@@ -827,9 +831,10 @@ if [ "$units_changed" = 1 ]; then
   systemctl daemon-reload && say "systemd daemon-reloaded"
   # A timer whose unit changed keeps its old schedule until restarted. Gated on
   # is-active as well as is-enabled: a timer an operator stopped stays stopped
-  # rather than being resurrected by an unrelated unit change. (None of these
-  # is Persistent=true, so a restart is a pure reschedule — but the gate costs
-  # nothing and the rule is worth keeping uniform.)
+  # rather than being resurrected by an unrelated unit change. Most of these
+  # are not Persistent=true, so a restart is a pure reschedule. The exception
+  # is apt-daily-upgrade.timer (section 9b): moved to a time already passed
+  # since its last run, it may run one catch-up upgrade at once.
   for t in "${changed_timers[@]}"; do
     case $t in *@.timer) t="${t%@.timer}@$APP.timer" ;; esac
     if systemctl is-enabled --quiet "$t" 2>/dev/null && systemctl is-active --quiet "$t" 2>/dev/null; then

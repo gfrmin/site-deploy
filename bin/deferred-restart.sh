@@ -22,9 +22,10 @@ LIST="$ROOT/etc/site-deploy/deferred-restart/$SITE"
 
 say() { echo "deferred-restart[$SITE]: $*"; }
 [ -r "$LIST" ] || { say "no $LIST — nothing is deferred"; exit 0; }
-# The list is root-owned and host-converge validated it; re-checked anyway,
-# since it decides what root restarts.
-mapfile -t prefixes < <(grep -xE '[a-z][a-z0-9_-]{2,63}' "$LIST")
+# The list is root-owned and host-converge validated it; re-checked against
+# the toolkit's allow-list anyway, since it decides what root restarts.
+ALLOWED="$(dirname "${BASH_SOURCE[0]}")/../host/deferrable-restart.txt"
+mapfile -t prefixes < <(grep -xFf <(grep -vE '^\s*(#|$)' "$ALLOWED") "$LIST")
 [ ${#prefixes[@]} -gt 0 ] || { say "$LIST names no units — nothing is deferred"; exit 0; }
 
 deferred() { local p; for p in "${prefixes[@]}"; do case $1 in "$p"*) return 0 ;; esac; done; return 1; }

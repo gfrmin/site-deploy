@@ -314,14 +314,18 @@ defer_restart      = ["postgresql"] # needs upgrade_window_utc
   running matching unit **whose main process still maps a replaced binary or library** (`(deleted)`
   in `/proc/<pid>/maps`; shared memory never counts), and nothing else. So the database restarts at
   most once a week, at night, instead of on every upgrade that touches libssl, libxml2, glib or
-  anything else it maps. The cost is that a library fix reaches it up to a week late. Defer only a unit
-  that is not reachable from the network (a Postgres on the local socket or loopback), never the
-  app's own public server. The restarter is armed before the needrestart rule is written, and the
+  anything else it maps. The cost is that a library fix reaches it up to a week late, so only the
+  local data services in the toolkit's `host/deferrable-restart.txt` can be named (`postgresql`,
+  `mysql`, `mariadb`, `redis-server`, `valkey-server`, `memcached`). `site.toml` is written by the
+  service user, so the allow-list, not the declaration, decides what needrestart leaves alone and what
+  root restarts. A free-form prefix could keep sshd on an unpatched libssl, or make root restart
+  dbus weekly. `deferred-restart.sh` checks the allow-list again. Run such a service on the local
+  socket or loopback, not exposed to the network. The restarter is armed before the needrestart rule is written, and the
   rule is removed before the restarter is disarmed, so a deferral without a restarter never exists.
   It is refused without `upgrade_window_utc`. An upgrade of the database **package itself** still
   restarts it from the package's own maintainer scripts. That cannot be deferred here, but it is rare.
 
-Both are validated (`HH:MM`; prefixes `^[a-z][a-z0-9_-]{2,63}$`, written into a Perl regex) and a
+Both are validated (`HH:MM`; prefixes from the allow-list, written into a Perl regex) and a
 bad value is a counted failure that leaves the last good files in place. Removing a key removes
 what it installed. Each site writes its own drop-in, so two sites on one box never fight over a file;
 if they declare different windows, the lexically last drop-in wins and host-converge says so every tick.

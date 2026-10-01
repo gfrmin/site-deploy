@@ -552,7 +552,7 @@ check "restarter: Sunday, 45m into the window (wraps midnight)" \
 rm -f "$STUB_UNITS/site-deferred-restart@app.timer.active"
 reset_log; run
 check "a stopped restarter is re-armed" [ -e "$STUB_UNITS/site-deferred-restart@app.timer.active" ]
-for bad in '["pg"]' '["postgresql.service"]' '["x)} = 1; system(\"id\"); #"]' '["post$gres"]' '"postgresql"' '[1]'; do
+for bad in '["ssh"]' '["dbus"]' '["postgres"]' '["pg"]' '["postgresql.service"]' '["x)} = 1; system(\"id\"); #"]' '["post$gres"]' '"postgresql"' '[1]'; do
   printf '[host]\nupgrade_window_utc = "23:30"\ndefer_restart = %s\n' "$bad" > "$HR/srv/app/deploy/site.toml"
   reset_log; run
   check "refused defer_restart $bad: exit 1"   [ "$(rc)" = 1 ]

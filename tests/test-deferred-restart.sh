@@ -71,8 +71,10 @@ check "exit 1"                    [ "$(rc)" = 1 ]
 check "the other one still restarted" restarted postgresql@17-main.service
 check "said so"                   grep -q "restart FAILED" "$T/out.txt"
 
-echo "5. a tampered list is re-validated: no prefix shorter than 3, no glob"
-printf 'pg\n*\n' > "$HR/etc/site-deploy/deferred-restart/app"
+echo "5. a tampered list is re-checked against the toolkit's allow-list"
+echo 104 > "$STUB_UNITS/ssh.service"
+maps 104 "7f00-7f01 r-xp 00000000 fd:01 123 /usr/lib/x86_64-linux-gnu/libssl.so.3 (deleted)"
+printf 'pg\n*\nssh\npostgres\n' > "$HR/etc/site-deploy/deferred-restart/app"
 : > "$STUB_LOG"; run
 check "exit 0"                    [ "$(rc)" = 0 ]
 check "nothing restarted"         bash -c '! grep -q restart "$1"' _ "$STUB_LOG"
