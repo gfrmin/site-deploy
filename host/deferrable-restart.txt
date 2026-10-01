@@ -1,0 +1,14 @@
+# Units [host] defer_restart may name (issue #49): one unit-name PREFIX per
+# line. Read by bin/host-converge.sh (which refuses anything else) and again by
+# bin/deferred-restart.sh (which restarts nothing else). site.toml is written
+# by the service user, so this list -- not the declaration -- decides what
+# needrestart leaves alone and what root restarts weekly. Only local data
+# services belong here: never sshd, dbus, user@, systemd-*, a container
+# runtime, or anything else needrestart deliberately never restarts, and never
+# a public-facing server, which must get a libssl fix the day it lands.
+postgresql
+mysql
+mariadb
+redis-server
+valkey-server
+memcached

@@ -1,0 +1,14 @@
+# Weekly. The schedule here is a placeholder: host-converge replaces it with a
+# drop-in (site-deferred-restart@<site>.timer.d/window.conf) at Sunday,
+# 45 minutes into the site's [host] upgrade_window_utc, and arms the timer
+# only when the site declares [host] defer_restart. Persistent=false: a box
+# that was down over the slot booted onto the new libraries anyway.
+[Unit]
+Description=Weekly deferred restart for %i
+
+[Timer]
+OnCalendar=Sun *-*-* 17:45:00 UTC
+Persistent=false
+
+[Install]
+WantedBy=timers.target

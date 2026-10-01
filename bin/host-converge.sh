@@ -644,14 +644,197 @@ for a in "${APPS[@]}"; do
   fi
 done
 
+# --- 9b. the unattended-upgrade window and deferred restarts (issue #49) ---------------------
+# needrestart, from unattended-upgrades' apt hook, restarts every long-lived
+# unit mapping an upgraded library -- Postgres onto a patched libssl
+# included, which is right. Two things about it are this site's to declare,
+# in the [host] table of the SITE's own deploy/site.toml:
+#
+#   upgrade_window_utc = "HH:MM"  apt-daily-upgrade.timer fires at that UTC
+#       time + up to 30m, not Ubuntu's 06:00 + 60m box-local (14:00-15:00 HKT:
+#       the middle of a HK site's day).
+#   defer_restart = ["postgresql"]  units whose name starts with one of these
+#       (each must be in host/deferrable-restart.txt, local data services only)
+#       are NOT restarted by needrestart; site-deferred-restart@<site>.timer
+#       restarts them once a week (Sunday, 45m into the window), and only if
+#       they still map a replaced library. A security fix in a library a
+#       local-only Postgres maps waits at most a week, and the database
+#       restarts at most once a week instead of on every upgrade that touches
+#       libssl, libxml2, glib, ... Requires upgrade_window_utc: a deferral
+#       with no restarter would be a deferral forever, so it is refused.
+#
+# Read exactly and validated, like backup_timeout: values are written into
+# unit files root's systemd reads and a Perl file needrestart evaluates. One
+# file per site, so two sites on one box never flap a shared file; for the
+# upgrade timer the lexically last drop-in wins, and a disagreement is nagged.
+UPGRADE_SPREAD_MIN=30
+DEFERRED_RESTART_OFFSET_MIN=45
+site_host_key() {   # <key> [list] -> its value (a list newline-joined); status 1 if unreadable or ill-typed
+  python3 -c 'import os, sys, tomllib
+if not os.path.exists(sys.argv[1]): sys.exit(0)
+host = tomllib.load(open(sys.argv[1], "rb")).get("host", {})
+if not isinstance(host, dict): sys.exit(1)
+v = host.get(sys.argv[2], [] if sys.argv[3:] == ["list"] else "")
+if sys.argv[3:] == ["list"] and not isinstance(v, list): sys.exit(1)
+if isinstance(v, list):
+    if not all(isinstance(x, str) for x in v): sys.exit(1)
+    v = "\n".join(v)
+sys.stdout.write(str(v))' \
+    "$SRV/deploy/site.toml" "$@" 2>/dev/null
+}
+# Effective OnCalendar= specs of a timer: its unit file, then drop-ins in name
+# order (the template's, then the instance's); an empty OnCalendar= resets.
+timer_calendars() {   # <timer name>
+  local t=$1 tpl="" f files=()
+  case $t in *@*.timer) tpl="${t%%@*}@.timer" ;; esac
+  if [ -f "$ETC/systemd/system/$t" ]; then files+=("$ETC/systemd/system/$t")
+  elif [ -n "$tpl" ] && [ -f "$ETC/systemd/system/$tpl" ]; then files+=("$ETC/systemd/system/$tpl"); fi
+  if [ -n "$tpl" ]; then for f in "$ETC/systemd/system/$tpl.d"/*.conf; do [ -f "$f" ] && files+=("$f"); done; fi
+  for f in "$ETC/systemd/system/$t.d"/*.conf; do [ -f "$f" ] && files+=("$f"); done
+  [ ${#files[@]} -gt 0 ] || return 0
+  awk '/^[[:space:]]*OnCalendar[[:space:]]*=/ { v = substr($0, index($0, "=") + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+         if (v == "") n = 0; else specs[++n] = v }
+       END { for (i = 1; i <= n; i++) print specs[i] }' "${files[@]}"
+}
+# The distinct UTC minutes-of-day a calendar spec fires at, over its next 8
+# firings (the "(in UTC):" lines, or, on a box whose own zone is UTC and
+# which therefore prints none, the elapse lines themselves); nothing for a spec firing at more than 4 distinct times a day (an
+# every-5-minutes job overlaps any window, and no window can fix that).
+utc_minutes() {   # <OnCalendar spec>
+  local m
+  m=$(systemd-analyze calendar --iterations=8 "$1" 2>/dev/null \
+        | sed -n 's/^.*: .* \([0-9][0-9]\):\([0-9][0-9]\):[0-9][0-9] UTC$/\1 \2/p' \
+        | awk '{ print ($1 * 60 + $2) }' | sort -un)
+  [ "$(printf '%s\n' "$m" | grep -c .)" -le 4 ] && printf '%s\n' "$m"
+}
+hhmm() { printf '%02d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+# Remove a file this section manages; returns 0 when it removed one.
+drop_managed() {   # <file> <why>
+  [ -e "$1" ] || return 1
+  rm -f "$1"; rmdir "${1%/*}" 2>/dev/null || true
+  say "removed $1 ($2)"
+}
+
+uw_file="$ETC/systemd/system/apt-daily-upgrade.timer.d/site-deploy-$APP.conf"
+dr_list="$ETC/site-deploy/deferred-restart/$APP"
+dr_nr="$ETC/needrestart/conf.d/site-deploy-defer-$APP.conf"
+dr_timer="site-deferred-restart@$APP.timer"
+dr_dropin="$ETC/systemd/system/$dr_timer.d/window.conf"
+uw_start=""
+if ! uw=$(site_host_key upgrade_window_utc); then
+  note_failure "deploy/site.toml is unreadable or its [host] table is malformed — upgrade window and deferred restarts left as they were"
+  uw=KEEP
+elif [ -z "$uw" ]; then
+  drop_managed "$uw_file" "no [host] upgrade_window_utc in site.toml" \
+    && { units_changed=1; changed_timers+=(apt-daily-upgrade.timer); }
+elif ! [[ $uw =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+  # The last good drop-in stays: a typo must not hand the box back to the
+  # daytime window.
+  note_failure "REFUSED [host] upgrade_window_utc $(printf '%q' "$uw"): must be HH:MM (UTC, 24-hour)"
+  uw=KEEP
+else
+  uw_start=$(( 10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]} ))
+  tmp_uw=$(mktemp)
+  printf '# Managed by site-deploy host-converge: [host] upgrade_window_utc in %s'"'"'s site.toml.\n[Timer]\nOnCalendar=\nOnCalendar=*-*-* %s:00 UTC\nRandomizedDelaySec=%dm\n' \
+    "$APP" "$uw" "$UPGRADE_SPREAD_MIN" > "$tmp_uw"
+  if sync_file "$tmp_uw" "$uw_file"; then units_changed=1; changed_timers+=(apt-daily-upgrade.timer); fi
+  rm -f "$tmp_uw"
+  for f in "${uw_file%/*}"/site-deploy-*.conf; do
+    [ -f "$f" ] && [ "$f" != "$uw_file" ] && ! cmp -s "$f" "$uw_file" \
+      && say "another site's upgrade window ${f##*/} is also installed and differs; the lexically last drop-in wins — declare one window per box"
+  done
+fi
+
+if [ "$uw" != KEEP ]; then
+  dr_ok=1
+  if ! dr_raw=$(site_host_key defer_restart list); then
+    note_failure "[host] defer_restart must be a list of strings — deferred restarts left as they were"
+    dr_ok=""
+  fi
+  dr=()
+  if [ -n "$dr_ok" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      # Only a prefix the toolkit allows (host/deferrable-restart.txt): the
+      # declaration is untrusted, and a free-form prefix would let it keep
+      # sshd on an unpatched libssl or have root restart dbus weekly. The
+      # allowed entries are plain [a-z0-9-] names, safe inside the Perl regex.
+      if grep -vE '^\s*(#|$)' "$SELF/host/deferrable-restart.txt" 2>/dev/null | grep -qxF -e "$p"; then dr+=("$p")
+      else note_failure "REFUSED [host] defer_restart entry $(printf '%q' "$p"): not in the toolkit's host/deferrable-restart.txt"; dr_ok=""; fi
+    done <<< "$dr_raw"
+  fi
+  if [ -n "$dr_ok" ] && [ ${#dr[@]} -gt 0 ] && [ -z "$uw_start" ]; then
+    note_failure "REFUSED [host] defer_restart: needs [host] upgrade_window_utc (the deferred restart runs in that window; without it the deferral would be forever)"
+    dr_ok=""; dr=()
+  fi
+  if [ -n "$dr_ok" ] && [ ${#dr[@]} -gt 0 ]; then
+    # The restarter first, the needrestart rule last: never a deferral
+    # without something that ends it.
+    tmp_dr=$(mktemp)
+    printf '%s\n' "${dr[@]}" > "$tmp_dr"
+    sync_file "$tmp_dr" "$dr_list" || true
+    dr_at=$(( (uw_start + DEFERRED_RESTART_OFFSET_MIN) % 1440 ))
+    printf '# Managed by site-deploy host-converge: [host] upgrade_window_utc + %dm.\n[Timer]\nOnCalendar=\nOnCalendar=Sun *-*-* %s:00 UTC\n' \
+      "$DEFERRED_RESTART_OFFSET_MIN" "$(hhmm "$dr_at")" > "$tmp_dr"
+    if sync_file "$tmp_dr" "$dr_dropin"; then units_changed=1; changed_timers+=("$dr_timer"); fi
+    # Re-armed like an alarm: a stopped restarter is a deferral forever.
+    arm "$dr_timer" "[host] defer_restart: ${dr[*]}" rearm
+    if systemctl is-enabled --quiet "$dr_timer" 2>/dev/null; then
+      {
+        echo "# Managed by site-deploy host-converge: [host] defer_restart in $APP's site.toml."
+        echo "# Restarted instead weekly by $dr_timer, and only when stale (bin/deferred-restart.sh)."
+        for p in "${dr[@]}"; do echo "\$nrconf{override_rc}{qr(^$p)} = 0;"; done
+      } > "$tmp_dr"
+      sync_file "$tmp_dr" "$dr_nr" || true
+    else
+      note_failure "could not arm $dr_timer — NOT deferring restarts of ${dr[*]}"
+      drop_managed "$dr_nr" "its restarter is not armed" || true
+    fi
+    rm -f "$tmp_dr"
+  elif [ -n "$dr_ok" ]; then
+    # Nothing deferred: the rule goes FIRST, so needrestart is never left
+    # deferring with the restarter already gone.
+    drop_managed "$dr_nr" "no [host] defer_restart in site.toml" || true
+    disarm "$dr_timer" "no [host] defer_restart in site.toml"
+    drop_managed "$dr_dropin" "no [host] defer_restart in site.toml" && units_changed=1
+    drop_managed "$dr_list" "no [host] defer_restart in site.toml" || true
+  fi
+fi
+
+# A restart of what a job depends on, mid-job, is the same outage somewhere
+# else. Nag (never fail) when one of this site's own scheduled jobs starts
+# within an hour either side of the window's opening -- durations are
+# unknown, so the hour before is the margin for a job still running when the
+# window opens, and the hour after covers the spread and the deferred restart.
+if [ -n "$uw_start" ] && command -v systemd-analyze >/dev/null 2>&1; then
+  for a in "${APPS[@]}"; do
+    timers=()
+    for f in "$ETC/systemd/system/$a"-*.timer; do [ -f "$f" ] && timers+=("${f##*/}"); done
+    systemctl is-enabled --quiet "site-backup@$a.timer" 2>/dev/null && timers+=("site-backup@$a.timer")
+    for t in "${timers[@]}"; do
+      while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        while IFS= read -r m; do
+          [ -n "$m" ] || continue
+          d=$(( (m - uw_start + 1440) % 1440 ))
+          if [ "$d" -le 60 ] || [ "$d" -ge $(( 1440 - 60 )) ]; then
+            say "$a: $t fires at $(hhmm "$m") UTC, within an hour of the upgrade window opening ($uw UTC) — an upgrade can restart what it depends on mid-run; move one of them"
+          fi
+        done < <(utc_minutes "$spec")
+      done < <(timer_calendars "$t")
+    done
+  done
+fi
+
 # --- 10. apply ------------------------------------------------------------------------------
 if [ "$units_changed" = 1 ]; then
   systemctl daemon-reload && say "systemd daemon-reloaded"
   # A timer whose unit changed keeps its old schedule until restarted. Gated on
   # is-active as well as is-enabled: a timer an operator stopped stays stopped
-  # rather than being resurrected by an unrelated unit change. (None of these
-  # is Persistent=true, so a restart is a pure reschedule — but the gate costs
-  # nothing and the rule is worth keeping uniform.)
+  # rather than being resurrected by an unrelated unit change. Most of these
+  # are not Persistent=true, so a restart is a pure reschedule. The exception
+  # is apt-daily-upgrade.timer (section 9b): moved to a time already passed
+  # since its last run, it may run one catch-up upgrade at once.
   for t in "${changed_timers[@]}"; do
     case $t in *@.timer) t="${t%@.timer}@$APP.timer" ;; esac
     if systemctl is-enabled --quiet "$t" 2>/dev/null && systemctl is-active --quiet "$t" 2>/dev/null; then
