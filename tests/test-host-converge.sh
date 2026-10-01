@@ -505,6 +505,85 @@ reset_log; run
 check "knob removed: drop-in removed"   [ ! -e "$HR/etc/systemd/system/site-backup@app.service.d" ]
 check "and daemon-reloaded"             called "daemon-reload"
 
+echo "26. [host] upgrade_window_utc + defer_restart (issue #49): night window, Postgres restarted weekly"
+uwf="$HR/etc/systemd/system/apt-daily-upgrade.timer.d/site-deploy-app.conf"
+nrf="$HR/etc/needrestart/conf.d/site-deploy-defer-app.conf"
+drl="$HR/etc/site-deploy/deferred-restart/app"
+drd="$HR/etc/systemd/system/site-deferred-restart@app.timer.d/window.conf"
+touch "$STUB_UNITS/apt-daily-upgrade.timer.enabled" "$STUB_UNITS/apt-daily-upgrade.timer.active"
+reset_log; run
+check "no knob: no window drop-in"      [ ! -e "$uwf" ]
+check "no knob: nothing deferred"       [ ! -e "$nrf" ]
+check "no knob: restarter not armed"    [ ! -e "$STUB_UNITS/site-deferred-restart@app.timer.enabled" ]
+printf '[host]\nupgrade_window_utc = "17:00"\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "window drop-in resets the default" grep -qx "OnCalendar=" "$uwf"
+check "window drop-in: 17:00 UTC"       grep -qx "OnCalendar=\*-\*-\* 17:00:00 UTC" "$uwf"
+check "window drop-in: 30m spread"      grep -qx "RandomizedDelaySec=30m" "$uwf"
+check "upgrade timer rescheduled"       called "systemctl restart apt-daily-upgrade.timer"
+check "window alone defers nothing"     [ ! -e "$nrf" ]
+reset_log; run
+check "idempotent"                      not_called "daemon-reload"
+for bad in 24:00 7:00 17:60 "17:00 UTC" "17:00\nExecStart=/bin/evil" "" ; do
+  [ -z "$bad" ] && continue
+  printf '[host]\nupgrade_window_utc = "%s"\n' "$bad" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "refused $(printf %q "$bad"): exit 1"  [ "$(rc)" = 1 ]
+  check "refused $(printf %q "$bad"): last good window kept" grep -qx "OnCalendar=\*-\*-\* 17:00:00 UTC" "$uwf"
+done
+check "never an injected directive"     bash -c '! grep -q ExecStart "$1"' _ "$uwf"
+
+printf '[host]\ndefer_restart = ["postgresql"]\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "defer without a window: refused" grep -q "REFUSED \[host\] defer_restart: needs" "$T/out.txt"
+check "defer without a window: exit 1"  [ "$(rc)" = 1 ]
+check "defer without a window: no needrestart rule" [ ! -e "$nrf" ]
+check "window removed with the knob"    [ ! -e "$uwf" ]
+
+printf '[host]\nupgrade_window_utc = "23:30"\ndefer_restart = ["postgresql"]\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "exit 0"                          [ "$(rc)" = 0 ]
+check "needrestart leaves postgresql alone" grep -qxF '$nrconf{override_rc}{qr(^postgresql)} = 0;' "$nrf"
+check "root-owned list of prefixes"     grep -qx postgresql "$drl"
+check "restarter armed"                 [ -e "$STUB_UNITS/site-deferred-restart@app.timer.enabled" ]
+check "restarter: Sunday, 45m into the window (wraps midnight)" \
+  grep -qx "OnCalendar=Sun \*-\*-\* 00:15:00 UTC" "$drd"
+rm -f "$STUB_UNITS/site-deferred-restart@app.timer.active"
+reset_log; run
+check "a stopped restarter is re-armed" [ -e "$STUB_UNITS/site-deferred-restart@app.timer.active" ]
+for bad in '["pg"]' '["postgresql.service"]' '["x)} = 1; system(\"id\"); #"]' '["post$gres"]' '"postgresql"' '[1]'; do
+  printf '[host]\nupgrade_window_utc = "23:30"\ndefer_restart = %s\n' "$bad" > "$HR/srv/app/deploy/site.toml"
+  reset_log; run
+  check "refused defer_restart $bad: exit 1"   [ "$(rc)" = 1 ]
+  check "refused defer_restart $bad: rule kept" grep -qxF '$nrconf{override_rc}{qr(^postgresql)} = 0;' "$nrf"
+done
+check "never an injected rule"          bash -c '! grep -q system "$1"' _ "$nrf"
+
+# The overlap nag: an app timer at 22:45 UTC is within the hour before 23:30.
+printf '[Timer]\nOnCalendar=*-*-* 22:45:00 UTC\n' > "$HR/etc/systemd/system/app-refresh.timer"
+printf '[Timer]\nOnCalendar=*-*-* 04:30:00 UTC\n' > "$HR/etc/systemd/system/app-invariants.timer"
+printf '[Timer]\nOnCalendar=*:0/5\n' > "$HR/etc/systemd/system/app-tick.timer"
+printf '[host]\nupgrade_window_utc = "23:30"\ndefer_restart = ["postgresql"]\n' > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "overlap nagged"                  grep -q "app-refresh.timer fires at 22:45 UTC, within an hour" "$T/out.txt"
+check "a clear timer is not nagged"     bash -c '! grep -q app-invariants "$1"' _ "$T/out.txt"
+check "an every-5-min timer is not nagged" bash -c '! grep -q app-tick "$1"' _ "$T/out.txt"
+check "the nag is not a failure"        [ "$(rc)" = 0 ]
+mkdir -p "$HR/etc/systemd/system/app-refresh.timer.d"
+printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 06:45:00 UTC\n' > "$HR/etc/systemd/system/app-refresh.timer.d/later.conf"
+reset_log; run
+check "a drop-in that moves the timer clears the nag" bash -c '! grep -q app-refresh "$1"' _ "$T/out.txt"
+rm -rf "$HR/etc/systemd/system/app-"*.timer "$HR/etc/systemd/system/app-refresh.timer.d"
+
+: > "$HR/srv/app/deploy/site.toml"
+reset_log; run
+check "knobs removed: needrestart rule gone" [ ! -e "$nrf" ]
+check "knobs removed: restarter disarmed" [ ! -e "$STUB_UNITS/site-deferred-restart@app.timer.enabled" ]
+check "knobs removed: list gone"         [ ! -e "$drl" ]
+check "knobs removed: window gone"       [ ! -e "$uwf" ]
+check "knobs removed: exit 0"            [ "$(rc)" = 0 ]
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; else echo "all checks passed"; fi
 exit $((fails > 0))

@@ -1,0 +1,17 @@
+# Restart the units %i deferred from needrestart ([host] defer_restart in its
+# site.toml, issue #49) — only those still running on a replaced library.
+# Root: it restarts system units such as postgresql@17-main. The list it acts
+# on is root-owned (/etc/site-deploy/deferred-restart/%i, written by
+# host-converge), never read from the checkout.
+[Unit]
+Description=Deferred restart of %i's long-lived units onto upgraded libraries
+# If an upgrade is still running when this fires, restart after it, not into
+# the middle of it.
+After=apt-daily-upgrade.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/srv/site-deploy/bin/deferred-restart.sh %i
+TimeoutStartSec=15min

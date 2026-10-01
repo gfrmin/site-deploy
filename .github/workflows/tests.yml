@@ -40,6 +40,7 @@ jobs:
           ./tests/test-env-check.sh
           ./tests/test-checks-armed.sh
           ./tests/test-host-converge.sh
+          ./tests/test-deferred-restart.sh
           ./tests/test-ufw-cloudflare-sync.sh
           ./tests/test-cf-converge.sh
           ./tests/test-cf-converge-run.sh

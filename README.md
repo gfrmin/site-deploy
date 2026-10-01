@@ -86,6 +86,7 @@ lib/workspace.sh     ws_apps/ws_apps_dir/ws_site_of: which apps a site hosts, an
 bin/ufw-cloudflare-sync.sh diff-apply ufw's 80/443 allow-list to Cloudflare's current ranges (root)
 bin/cf-converge.py   converge one zone's Cloudflare config (SSL/DNS/cache/WAF/rate-limit) to deploy/cloudflare.json
 bin/cf-converge-run.sh root wrapper: derives the domain + the box's public IP, calls cf-converge.py
+bin/deferred-restart.sh restart [host] defer_restart units still on a replaced library, weekly in the upgrade window (root)
 bin/backup.sh        encrypt deploy/backup-producer.sh's stdout, ship off-box, verify by round trip, prune (root)
 bin/site-tree.sh     root's verified export of the deployed commit: the only source of app content root runs (root)
 bin/converge.sh       generic [converge]-table engine: install/validate/reload-with-rollback/prune, template-unit restart queue (root)
@@ -98,6 +99,7 @@ systemd/ufw-cloudflare-sync.service , ufw-cloudflare-sync.timer   daily Cloudfla
 systemd/cf-converge@.service   applies deploy/cloudflare.json, dispatched by the poller on change (root)
 systemd/cf-drift@.service , cf-drift@.timer   daily dry-run drift report for cloudflare.json (root)
 systemd/site-backup@.service , site-backup@.timer   daily off-box backup, dispatched iff deploy/backup-producer.sh exists (root)
+systemd/site-deferred-restart@.service , site-deferred-restart@.timer   weekly deferred restart, armed iff [host] defer_restart (root)
 systemd/app@.service   reference gunicorn unit for an app (copy, do not converge — see below)
 systemd/site-build@.service   reference build unit: reload -> /fail -> purge, ordering pinned by tests
 host/                provisioning: cloud-init, provision.sh, harden.sh, packages.txt, and the files host-converge installs
@@ -269,6 +271,8 @@ owns, every tick:
 - a journald cap (`SystemMaxUse=1G`, a month of retention), unattended security upgrades, and a
   `needrestart` rule so an upgrade never restarts a running `<app>-*` batch unit mid-run (the
   app's own long-lived unit stays eligible on purpose)
+- the unattended-upgrade window and deferred restarts, when the site's `site.toml` declares a
+  `[host]` table (see below)
 - `host/packages.txt` plus the app's `deploy/packages.txt`, installed on diff only
 - a 4G swapfile and `vm.swappiness=10` (moved here from `provision.sh`)
 - wherever Caddy is installed, a drop-in with `Restart=always` and a memory ceiling, so an OOM
@@ -280,6 +284,47 @@ owns, every tick:
   env names are set (the probe never when site.toml declares `probe_external`), disarmed when they
   are removed. A stopped alarm timer is re-armed: to stand
   a probe down, blank its env pair and pause the check. Missing monitoring is nagged every tick.
+
+### When upgrades restart things: `[host]` in `site.toml`
+
+needrestart, run from unattended-upgrades' apt hook, restarts every long-lived unit still mapping a
+library the upgrade replaced. That is correct (a server should not keep running on the unpatched
+libssl), but Ubuntu runs `apt-daily-upgrade.timer` at 06:00 box-local time plus up to an hour. That
+is somebody's afternoon, and a database restart then empties every in-flight request. Two knobs, in
+the **site's** own `deploy/site.toml` (one box, one decision; never in a workspace app's file):
+
+```toml
+[host]
+upgrade_window_utc = "17:00"        # apt-daily-upgrade.timer at 17:00 UTC + up to 30m
+defer_restart      = ["postgresql"] # needs upgrade_window_utc
+```
+
+- **`upgrade_window_utc = "HH:MM"`** (UTC, 24-hour) becomes a drop-in,
+  `apt-daily-upgrade.timer.d/site-deploy-<site>.conf`, at that time with a 30-minute spread. Patches
+  and restarts still happen every day, at the quiet hour instead. host-converge **nags** (it does not
+  fail) when one of the site's own `<app>-*` timers, or its armed `site-backup@`, fires within an
+  hour either side of the window opening: a database restart in the middle of a refresh or a dump is
+  the same outage in a different place. Durations are unknown, so the hour is a heuristic margin. A
+  timer that fires more than four times a day is never nagged, since no window can avoid it. If the
+  new time has already passed today since the last upgrade, systemd may run one catch-up upgrade as
+  soon as the window moves.
+- **`defer_restart = ["<unit-name prefix>", ...]`** takes those units away from needrestart
+  (`needrestart/conf.d/site-deploy-defer-<site>.conf`) and arms `site-deferred-restart@<site>.timer`
+  instead. Every **Sunday, 45 minutes into the window**, `bin/deferred-restart.sh` restarts each
+  running matching unit **whose main process still maps a replaced binary or library** (`(deleted)`
+  in `/proc/<pid>/maps`; shared memory never counts), and nothing else. So the database restarts at
+  most once a week, at night, instead of on every upgrade that touches libssl, libxml2, glib or
+  anything else it maps. The cost is that a library fix reaches it up to a week late. Defer only a unit
+  that is not reachable from the network (a Postgres on the local socket or loopback), never the
+  app's own public server. The restarter is armed before the needrestart rule is written, and the
+  rule is removed before the restarter is disarmed, so a deferral without a restarter never exists.
+  It is refused without `upgrade_window_utc`. An upgrade of the database **package itself** still
+  restarts it from the package's own maintainer scripts. That cannot be deferred here, but it is rare.
+
+Both are validated (`HH:MM`; prefixes `^[a-z][a-z0-9_-]{2,63}$`, written into a Perl regex) and a
+bad value is a counted failure that leaves the last good files in place. Removing a key removes
+what it installed. Each site writes its own drop-in, so two sites on one box never fight over a file;
+if they declare different windows, the lexically last drop-in wins and host-converge says so every tick.
 
 ### The reference `reverse_proxy` block
 
